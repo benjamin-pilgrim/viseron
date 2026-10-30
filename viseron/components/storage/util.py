@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
@@ -23,6 +24,46 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_TIMELAPSE,
 )
 from viseron.events import EventData
+
+# Files with this prefix are private, incomplete tier-move copies.
+TIER_MOVE_TEMP_PREFIX = ".viseron-tier-move-"
+
+
+def is_tier_move_temp_file(path: str) -> bool:
+    """Return whether a path is an unpublished tier-move temporary file."""
+    return os.path.basename(path).startswith(TIER_MOVE_TEMP_PREFIX)
+
+
+def tier_markers_available(path: str, markers: dict[str, str]) -> bool:
+    """Check every configured marker protecting an absolute path.
+
+    A missing or inaccessible marker is a failed check, even if the directory
+    still exists underneath an unmounted share.
+    """
+    path = os.path.abspath(path)
+    for root, marker in markers.items():
+        if os.path.commonpath((root, path)) != root:
+            continue
+        try:
+            if not stat.S_ISREG(os.lstat(os.path.join(root, marker)).st_mode):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def is_tier_marker(path: str, markers: dict[str, str]) -> bool:
+    """Return whether path is a configured marker that must never be cleaned up."""
+    return os.path.abspath(path) in {
+        os.path.join(root, marker) for root, marker in markers.items()
+    }
+
+
+def require_tier_markers(path: str, markers: dict[str, str]) -> None:
+    """Fail closed if a configured marker protecting path is unavailable."""
+    if not tier_markers_available(path, markers):
+        raise OSError(f"Required storage marker unavailable for {path}")
+
 
 if TYPE_CHECKING:
     from types import TracebackType

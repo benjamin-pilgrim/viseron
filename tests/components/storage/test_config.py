@@ -104,6 +104,7 @@ def create_tier_snapshots(
 
 DEFAULT_CONFIG = {
     "storage": {
+        "tier_markers": {},
         "tier_check_cpu_limit": DEFAULT_TIER_CHECK_CPU_LIMIT,
         "tier_check_batch_size": DEFAULT_TIER_CHECK_BATCH_SIZE,
         "tier_check_sleep_between_batches": DEFAULT_TIER_CHECK_SLEEP_BETWEEN_BATCHES,
@@ -139,7 +140,8 @@ DEFAULT_CONFIG = {
 )
 def test_config_schema(config) -> None:
     """Test config schema."""
-    assert CONFIG_SCHEMA(config) == DEFAULT_CONFIG
+    with patch("viseron.components.storage.config._check_path_exists"):
+        assert CONFIG_SCHEMA(config) == DEFAULT_CONFIG
 
 
 TEST_CASES = [

@@ -18,6 +18,7 @@ from watchdog.events import (
     FileCreatedEvent,
     FileDeletedEvent,
     FileModifiedEvent,
+    FileMovedEvent,
     FileSystemEvent,
     FileSystemEventHandler,
 )
@@ -42,6 +43,7 @@ from viseron.components.storage.const import (
     CONFIG_PATH,
     CONFIG_POLL,
     CONFIG_SECONDS,
+    CONFIG_TIER_MARKERS,
     EVENT_CHECK_TIER,
     EVENT_FILE_CREATED,
     EVENT_FILE_DELETED,
@@ -82,6 +84,8 @@ from viseron.components.storage.util import (
     get_segments_path,
     get_thumbnails_path,
     get_timelapse_path,
+    is_tier_marker,
+    is_tier_move_temp_file,
 )
 from viseron.components.webserver.const import COMPONENT as WEBSERVER_COMPONENT
 from viseron.const import VISERON_SIGNAL_LAST_WRITE, VISERON_SIGNAL_STOPPING
@@ -184,18 +188,58 @@ class TierHandler(FileSystemEventHandler):
         self._time_of_last_call = utcnow() - self._throttle_period
 
         self._logger.debug("Tier %s monitoring path: %s", tier_id, self._path)
-        os.makedirs(self._path, exist_ok=True)
+        self._observer_lock = threading.Lock()
+        self._observer_stopping = False
         self._observer = (
+            self._start_observer() if self._storage.tier_available(self._path) else None
+        )
+
+    def _start_observer(self):
+        """Create a fresh observer for the current directory mount."""
+        os.makedirs(self._path, exist_ok=True)
+        observer = (
             PollingObserverVFS(stat=os.stat, listdir=os.scandir, polling_interval=1)
-            if tier[CONFIG_POLL]
+            if self._tier[CONFIG_POLL]
             else Observer()
         )
-        self._observer.schedule(
+        observer.schedule(
             self,
             self._path,
             recursive=True,
         )
-        self._observer.start()
+        observer.start()
+        return observer
+
+    @staticmethod
+    def _dispose_observer(observer) -> None:
+        """Stop an old observer without blocking recovery on a stalled mount."""
+        observer.stop()
+        observer.join()
+
+    def restart_for_tier(self, root: str) -> bool:
+        """Reattach this watcher if its directory is under a recovered tier."""
+        if os.path.commonpath((root, os.path.abspath(self._path))) != root:
+            return True
+        with self._observer_lock:
+            if self._observer_stopping:
+                return True
+            if not self._storage.tier_available(self._path):
+                return False
+            try:
+                observer = self._start_observer()
+            except OSError:
+                self._logger.exception("Could not restart watcher for %s", self._path)
+                return False
+            previous_observer = self._observer
+            self._observer = observer
+        if previous_observer is not None:
+            threading.Thread(
+                target=self._dispose_observer,
+                args=(previous_observer,),
+                name="tier-observer-dispose",
+                daemon=True,
+            ).start()
+        return True
 
     @property
     def tier(self) -> dict[str, Any]:
@@ -269,17 +313,17 @@ class TierHandler(FileSystemEventHandler):
         self._storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_FILES)
         self.check_tier()
 
-    def check_tier(self) -> None:
+    def check_tier(self, *, force: bool = False) -> bool:
         """Check if file should be moved to next tier."""
         with self._check_tier_lock:
             if self._tier_check_in_progress:
-                return
+                return False
             # Throttling is also done in the worker process, but we do the same here
             # in order to not spam the workers with unneeded requests.
             now = utcnow()
             time_since_last_call = now - self._time_of_last_call
-            if time_since_last_call < self._throttle_period:
-                return
+            if not force and time_since_last_call < self._throttle_period:
+                return False
             # Claim the in-flight slot before sending. The reply can take tens of
             # seconds, and every file event in that window would otherwise pass
             # the guard above and send a duplicate request, each one registering
@@ -290,10 +334,13 @@ class TierHandler(FileSystemEventHandler):
             self._tier_check_in_progress = True
 
         try:
+            item = self._create_dataitem()
+            if force:
+                item.throttle_period = timedelta(0)
             self._storage.tier_check_worker_send_command(
-                self._create_dataitem(),
-                self.on_check_tier_result,
+                item, self.on_check_tier_result
             )
+            return True
         except Exception:
             # Release the slot if the command never made it out, otherwise this
             # tier would never be checked again.
@@ -384,7 +431,21 @@ class TierHandler(FileSystemEventHandler):
             if event is None:
                 self._logger.debug("Stopping event handler")
                 break
+            if not self._storage.tier_available(_src_path(event)):
+                self._logger.debug("Ignoring event on unavailable tier: %s", event)
+                continue
             if isinstance(event, FileDeletedEvent):
+                try:
+                    os.stat(_src_path(event))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    self._logger.debug("Cannot confirm deletion: %s", event)
+                    continue
+                else:
+                    # Events queued before a remount may describe the old mount.
+                    self._logger.debug("Ignoring stale deletion event: %s", event)
+                    continue
                 self._on_deleted(event)
             elif isinstance(event, FileCreatedEvent):
                 self._on_created(event)
@@ -394,6 +455,18 @@ class TierHandler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         """Handle file system events."""
         src_path = _src_path(event)
+
+        if is_tier_marker(src_path, self._storage.config.get(CONFIG_TIER_MARKERS, {})):
+            return
+
+        if is_tier_move_temp_file(src_path):
+            if isinstance(event, FileMovedEvent):
+                destination = cast("str", event.dest_path)
+                if not is_tier_move_temp_file(destination) and os.path.commonpath(
+                    (self._path, destination)
+                ) == os.path.normpath(self._path):
+                    self._event_queue.put(FileCreatedEvent(destination))
+            return
 
         if os.path.basename(src_path) in self._storage.ignored_files:
             return
@@ -536,12 +609,16 @@ class TierHandler(FileSystemEventHandler):
     def _stop_observer(self) -> None:
         """Stop the observer."""
         self._logger.debug("Stopping observer")
+        with self._observer_lock:
+            self._observer_stopping = True
+            observer = self._observer
         for pending_update in self._pending_updates.copy().values():
             pending_update.join()
         self._event_queue.put(None)
         self._event_thread.join()
-        self._observer.stop()
-        self._observer.join()
+        if observer is not None:
+            observer.stop()
+            observer.join()
 
 
 class SegmentsTierHandler(TierHandler):
@@ -973,8 +1050,9 @@ class ThumbnailTierHandler(TierHandler):
         self.add_file_handler(self._path, rf"{self._path}/(.*.jpg$)")
         self._storage.ignore_file("latest_thumbnail.jpg")
 
-    def check_tier(self) -> None:
+    def check_tier(self, *, force: bool = False) -> bool:  # noqa: ARG002
         """Do nothing, as we don't want to move thumbnails."""
+        return True
 
     def _on_created(self, event: FileCreatedEvent) -> None:
         src_path = _src_path(event)
@@ -1038,8 +1116,9 @@ class EventClipTierHandler(TierHandler):
             self._path, rf"{self._path}/(.*.{self._camera.identifier}$)"
         )
 
-    def check_tier(self) -> None:
+    def check_tier(self, *, force: bool = False) -> bool:  # noqa: ARG002
         """Do nothing, as we move event clips manually."""
+        return True
 
     def _update_clip_path(self, event: FileCreatedEvent) -> None:
         src_path = _src_path(event)
@@ -1138,6 +1217,14 @@ def handle_file(
     force_delete: bool = False,
 ) -> None:
     """Move file if there is a succeeding tier, else delete the file."""
+    if not storage.tier_available(path):
+        logger.debug("Skipping operation on unavailable tier for %s", path)
+        return
+    if next_tier is not None and not storage.tier_available(next_tier[CONFIG_PATH]):
+        logger.debug(
+            "Skipping operation to unavailable tier %s", next_tier[CONFIG_PATH]
+        )
+        return
     if path in storage.camera_requested_files_count[camera_identifier].filenames:
         logger.debug("File %s is recently requested, skipping", path)
         return

@@ -22,6 +22,7 @@ from viseron.components.go2rtc.const import COMPONENT as GO2RTC_COMPONENT
 from viseron.components.storage.config import validate_tiers
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
+    CONFIG_TIER_MARKERS,
     TIER_CATEGORY_RECORDER,
     TIER_CATEGORY_SNAPSHOTS,
     TIER_SUBCATEGORY_SEGMENTS,
@@ -132,7 +133,9 @@ class AbstractCamera(AbstractDomain):
         self._logger = logging.getLogger(f"{self.__module__}.{self.identifier}")
 
         if self._config[CONFIG_STORAGE]:
-            validate_tiers(self._config)
+            storage = vis.data.get(STORAGE_COMPONENT)
+            markers = storage.config.get(CONFIG_TIER_MARKERS, {}) if storage else {}
+            validate_tiers(self._config, tier_markers=markers)
 
         self._connected: bool = False
         self._still_image_available: bool = False

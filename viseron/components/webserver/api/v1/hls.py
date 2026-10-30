@@ -24,6 +24,7 @@ from viseron.const import CAMERA_SEGMENT_DURATION, HLS_SKIP_BOUNDARY_TARGET_DURA
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.fragmenter import (
     Fragment,
+    gap_in_fragments,
     generate_playlist,
     get_available_timespans,
 )
@@ -68,6 +69,27 @@ def count_matching_fragments(
     return count
 
 
+def count_removed_discontinuities(
+    previous: list[Fragment], current: list[Fragment], removed: int
+) -> int:
+    """Count gap boundaries that have moved before the new playlist window."""
+    if not previous or not removed:
+        return 0
+    last_previous_index = min(removed, len(previous) - 1)
+    count = sum(
+        gap_in_fragments(previous[index - 1], previous[index])
+        for index in range(1, last_previous_index + 1)
+    )
+    if (
+        removed == len(previous)
+        and current
+        and current[0].creation_time > previous[-1].creation_time
+        and gap_in_fragments(previous[-1], current[0])
+    ):
+        count += 1
+    return count
+
+
 @dataclass
 class HlsClient:
     """Dataclass for HLS client to keep track of removed files in live playlists."""
@@ -75,6 +97,7 @@ class HlsClient:
     client_id: str
     fragments: list[Fragment]
     media_sequence: int
+    discontinuity_sequence: int
     target_duration: int
 
 
@@ -298,6 +321,9 @@ def update_hls_client(
     hls_client = HlsAPIHandler.hls_client_ids.get(hls_client_id, None)
     if hls_client:
         removed = count_files_removed(hls_client.fragments, fragments)
+        hls_client.discontinuity_sequence += count_removed_discontinuities(
+            hls_client.fragments, fragments, removed
+        )
         received = count_matching_fragments(hls_client.fragments[removed:], fragments)
         hls_client.fragments = fragments
         hls_client.media_sequence += removed
@@ -307,6 +333,7 @@ def update_hls_client(
         client_id=hls_client_id,
         fragments=fragments,
         media_sequence=0,
+        discontinuity_sequence=0,
         target_duration=get_target_duration(fragments),
     )
     HlsAPIHandler.hls_client_ids[hls_client_id] = hls_client
@@ -348,6 +375,7 @@ def _render_client_playlist(
         fragments,
         init_file,
         media_sequence=hls_client.media_sequence,
+        discontinuity_sequence=hls_client.discontinuity_sequence,
         target_duration=hls_client.target_duration,
         end=end,
         file_directive=False,

@@ -38,6 +38,7 @@ from viseron.components.storage.const import (
     CONFIG_TIER_CHECK_CPU_LIMIT,
     CONFIG_TIER_CHECK_SLEEP_BETWEEN_BATCHES,
     CONFIG_TIER_CHECK_WORKERS,
+    CONFIG_TIER_MARKERS,
     CONFIG_TIERS,
     CONFIG_TIMELAPSE,
     DEFAULT_CHECK_INTERVAL,
@@ -119,6 +120,7 @@ from viseron.components.storage.const import (
     DESC_TIER_CHECK_CPU_LIMIT,
     DESC_TIER_CHECK_SLEEP_BETWEEN_BATCHES,
     DESC_TIER_CHECK_WORKERS,
+    DESC_TIER_MARKERS,
     DESC_TIMELAPSE,
     DESC_TIMELAPSE_TIERS,
     TIER_CATEGORY_RECORDER,
@@ -128,7 +130,11 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     TIER_SUBCATEGORY_THUMBNAILS,
 )
-from viseron.components.storage.util import calculate_age, calculate_bytes
+from viseron.components.storage.util import (
+    calculate_age,
+    calculate_bytes,
+    tier_markers_available,
+)
 from viseron.config import UNSUPPORTED
 from viseron.const import TEMP_DIR
 from viseron.helpers.validators import UNDEFINED, CoerceNoneToDict, Maybe
@@ -477,8 +483,22 @@ def get_timelapse_schema():
 
 TIMELAPSE_SCHEMA = get_timelapse_schema()
 
+
+def validate_tier_markers(markers: dict[str, str]) -> dict[str, str]:
+    """Validate marker names and their protected, absolute directory paths."""
+    for path, marker in markers.items():
+        if not os.path.isabs(path):
+            raise vol.Invalid("Tier marker paths must be absolute")
+        if marker in ("", ".", "..") or os.path.basename(marker) != marker:
+            raise vol.Invalid("Tier markers must be simple filenames")
+    return {os.path.normpath(path): marker for path, marker in markers.items()}
+
+
 STORAGE_SCHEMA = vol.Schema(
     {
+        vol.Optional(
+            CONFIG_TIER_MARKERS, default={}, description=DESC_TIER_MARKERS
+        ): vol.All({str: str}, validate_tier_markers),
         vol.Optional(
             CONFIG_TIER_CHECK_CPU_LIMIT,
             default=DEFAULT_TIER_CHECK_CPU_LIMIT,
@@ -518,8 +538,18 @@ STORAGE_SCHEMA = vol.Schema(
 )
 
 
-def _check_path_exists(tier: Tier, category: str):
+def _check_path_exists(
+    tier: Tier,
+    category: str,
+    markers: dict[str, str] | None = None,
+    *,
+    allow_unavailable: bool = False,
+):
     """Check if path exists."""
+    if allow_unavailable and not tier_markers_available(
+        tier[CONFIG_PATH], markers or {}
+    ):
+        return
     if category == TIER_CATEGORY_RECORDER and tier[CONFIG_PATH] == "/":
         for subcategory in [
             TIER_SUBCATEGORY_SEGMENTS,
@@ -561,6 +591,7 @@ def _check_tier(
     previous_tier: Tier | None,
     paths: list[str],
     category: str,
+    markers: dict[str, str],
 ):
     """Check tier config."""
     if tier[CONFIG_PATH] in ["/tmp", TEMP_DIR]:
@@ -572,7 +603,9 @@ def _check_tier(
         raise vol.Invalid(f"Tier {tier[CONFIG_PATH]} is defined multiple times")
     paths.append(tier[CONFIG_PATH])
 
-    _check_path_exists(tier, category)
+    _check_path_exists(
+        tier, category, markers, allow_unavailable=previous_tier is not None
+    )
 
     if previous_tier is None:
         return
@@ -644,7 +677,13 @@ def _validate_recorder_tiers(
             _tier = Tier(
                 path=tier[CONFIG_PATH], max_age=tier[CONFIG_EVENTS][CONFIG_MAX_AGE]
             )
-            _check_tier(_tier, previous_tier, paths, CONFIG_RECORDER)
+            _check_tier(
+                _tier,
+                previous_tier,
+                paths,
+                CONFIG_RECORDER,
+                component_config.get(CONFIG_TIER_MARKERS, {}),
+            )
             previous_tier = _tier
 
     # Check continuous config
@@ -655,7 +694,13 @@ def _validate_recorder_tiers(
             _tier = Tier(
                 path=tier[CONFIG_PATH], max_age=tier[CONFIG_CONTINUOUS][CONFIG_MAX_AGE]
             )
-            _check_tier(_tier, previous_tier, paths, CONFIG_RECORDER)
+            _check_tier(
+                _tier,
+                previous_tier,
+                paths,
+                CONFIG_RECORDER,
+                component_config.get(CONFIG_TIER_MARKERS, {}),
+            )
             previous_tier = _tier
 
 
@@ -667,7 +712,13 @@ def _validate_snapshots_tiers(
     paths: list[str] = []
     for tier in component_config.get(CONFIG_SNAPSHOTS, {}).get(CONFIG_TIERS, []):
         _tier = Tier(path=tier[CONFIG_PATH], max_age=tier[CONFIG_MAX_AGE])
-        _check_tier(_tier, previous_tier, paths, CONFIG_SNAPSHOTS)
+        _check_tier(
+            _tier,
+            previous_tier,
+            paths,
+            CONFIG_SNAPSHOTS,
+            component_config.get(CONFIG_TIER_MARKERS, {}),
+        )
         previous_tier = _tier
 
     # Check snapshots domain config
@@ -684,7 +735,13 @@ def _validate_snapshots_tiers(
         paths = []
         for tier in component_config[CONFIG_SNAPSHOTS][domain][CONFIG_TIERS]:
             _tier = Tier(path=tier[CONFIG_PATH], max_age=tier[CONFIG_MAX_AGE])
-            _check_tier(_tier, previous_tier, paths, CONFIG_SNAPSHOTS)
+            _check_tier(
+                _tier,
+                previous_tier,
+                paths,
+                CONFIG_SNAPSHOTS,
+                component_config.get(CONFIG_TIER_MARKERS, {}),
+            )
             previous_tier = _tier
 
 
@@ -700,11 +757,19 @@ def _validate_timelapse_tiers(
     paths: list[str] = []
     for tier in timelapse_config.get(CONFIG_TIERS, []):
         _tier = Tier(path=tier[CONFIG_PATH], max_age=tier[CONFIG_MAX_AGE])
-        _check_tier(_tier, previous_tier, paths, CONFIG_TIMELAPSE)
+        _check_tier(
+            _tier,
+            previous_tier,
+            paths,
+            CONFIG_TIMELAPSE,
+            component_config.get(CONFIG_TIER_MARKERS, {}),
+        )
         previous_tier = _tier
 
 
-def validate_tiers(config: dict[str, Any]) -> dict[str, Any]:
+def validate_tiers(
+    config: dict[str, Any], *, tier_markers: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Validate tiers.
 
     Rules:
@@ -715,6 +780,8 @@ def validate_tiers(config: dict[str, Any]) -> dict[str, Any]:
       it can't be defined in any other tier.
     """
     component_config: dict[str, Any] = config[COMPONENT]
+    if tier_markers is not None:
+        component_config = {**component_config, CONFIG_TIER_MARKERS: tier_markers}
     if component_config.get(CONFIG_RECORDER, None):
         _validate_recorder_tiers(component_config)
 

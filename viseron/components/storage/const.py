@@ -9,6 +9,11 @@ from typing import Any, Final
 from sqlalchemy import create_engine, make_url
 
 COMPONENT: Final = "storage"
+CONFIG_TIER_MARKERS: Final = "tier_markers"
+DESC_TIER_MARKERS = (
+    "Map protected storage directory paths to marker filenames that must exist "
+    "on the mounted share before storage operations are allowed."
+)
 
 
 def _database_url(url: str) -> str:

@@ -28,6 +28,7 @@ from viseron.components.storage.const import (
     CONFIG_PATH,
     CONFIG_RECORDER,
     CONFIG_SNAPSHOTS,
+    CONFIG_TIER_MARKERS,
     CONFIG_TIERS,
     CONFIG_TIMELAPSE,
     TIER_CATEGORY_SNAPSHOTS,
@@ -44,6 +45,7 @@ from viseron.components.storage.models import (
     PostProcessorResults,
     Recordings,
 )
+from viseron.components.storage.util import tier_markers_available
 from viseron.const import FAILED, LOADING
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.viseron_types import SnapshotDomain
@@ -273,7 +275,6 @@ def get_orphaned_cameras(vis: Viseron, storage: Storage) -> list[OrphanedCamera]
 
     configured = _configured_identifiers(vis)
     tier_paths = get_configured_tier_paths(storage.config)
-
     with storage.get_session() as session:
         identifiers = _database_identifiers(session) | _scan_tier_paths(tier_paths)
         orphaned = []
@@ -326,6 +327,10 @@ def delete_orphaned_camera(
         )
 
     tier_paths = get_configured_tier_paths(storage.config)
+    markers = storage.config.get(CONFIG_TIER_MARKERS, {})
+    for root in markers:
+        if not tier_markers_available(root, markers):
+            raise OrphanedCameraError(f"Storage tier unavailable: {root}")
     with storage.get_session() as session:
         deleted = _build_orphaned_camera(session, tier_paths, camera_identifier)
 

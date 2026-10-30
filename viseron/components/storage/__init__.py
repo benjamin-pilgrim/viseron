@@ -6,6 +6,7 @@ import copy
 import logging
 import os
 import pathlib
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, overload
 
@@ -13,6 +14,7 @@ import voluptuous as vol
 from alembic import command, script
 from alembic.config import Config
 from alembic.migration import MigrationContext
+from apscheduler.jobstores.base import JobLookupError
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
@@ -35,6 +37,7 @@ from viseron.components.storage.const import (
     CONFIG_TIER_CHECK_CPU_LIMIT,
     CONFIG_TIER_CHECK_SLEEP_BETWEEN_BATCHES,
     CONFIG_TIER_CHECK_WORKERS,
+    CONFIG_TIER_MARKERS,
     CONFIG_TIERS,
     CONFIG_TIMELAPSE,
     DEFAULT_COMPONENT,
@@ -65,7 +68,11 @@ from viseron.components.storage.models import (
     PendingMove,
     Recordings,
 )
-from viseron.components.storage.storage_subprocess import TierCheckWorker
+from viseron.components.storage.storage_subprocess import (
+    DataItemDeleteFile,
+    DataItemMoveFile,
+    TierCheckWorker,
+)
 from viseron.components.storage.tier_handler import (
     EventClipTierHandler,
     SegmentsTierHandler,
@@ -82,6 +89,7 @@ from viseron.components.storage.util import (
     get_snapshots_path,
     get_thumbnails_path,
     get_timelapse_path,
+    tier_markers_available,
 )
 from viseron.const import EVENT_DOMAIN_REGISTERED, VISERON_SIGNAL_STOPPING
 from viseron.domains.camera.const import CONFIG_STORAGE
@@ -97,8 +105,6 @@ if TYPE_CHECKING:
     from viseron import Event, Viseron
     from viseron.components.storage.storage_subprocess import (
         DataItem,
-        DataItemDeleteFile,
-        DataItemMoveFile,
     )
     from viseron.domain_registry import EventDomainRegisteredData
     from viseron.domains.camera import AbstractCamera
@@ -262,6 +268,12 @@ class Storage:
     def __init__(self, vis: Viseron, config: dict[str, Any]) -> None:
         self._vis = vis
         self._config = config
+        self._tier_marker_states: dict[str, bool] = {}
+        self._tier_marker_lock = threading.Lock()
+        self._tier_markers_need_retry = False
+        self._tier_markers_recovered_roots: set[str] = set()
+        for root in config.get(CONFIG_TIER_MARKERS, {}):
+            self.tier_available(root)
         self._recordings_tiers = config[CONFIG_RECORDER][CONFIG_TIERS]
         self._snapshots_tiers = config[CONFIG_SNAPSHOTS][CONFIG_TIERS]
         self._timelapse_tiers = (
@@ -299,6 +311,16 @@ class Storage:
         self.tier_check_worker = TierCheckWorker(
             vis, config[CONFIG_TIER_CHECK_CPU_LIMIT], config[CONFIG_TIER_CHECK_WORKERS]
         )
+        self._tier_marker_job = None
+        if config.get(CONFIG_TIER_MARKERS):
+            self._tier_marker_job = vis.background_scheduler.add_job(
+                self._poll_tier_markers,
+                "interval",
+                seconds=30,
+                id=f"storage_tier_markers_{id(self)}",
+                max_instances=1,
+                coalesce=True,
+            )
 
         self._timelapse_segment_encoder = TimelapseSegmentEncoder(
             TIMELAPSE_SEGMENT_CACHE_PATH
@@ -313,6 +335,69 @@ class Storage:
     def config(self) -> dict[str, Any]:
         """Return the storage configuration."""
         return self._config
+
+    def tier_available(self, path: str) -> bool:
+        """Report marker state transitions and check protected storage paths."""
+        path = os.path.abspath(path)
+        available = True
+        for root, marker in self._config.get(CONFIG_TIER_MARKERS, {}).items():
+            if os.path.commonpath((root, path)) != root:
+                continue
+            healthy = tier_markers_available(path, {root: marker})
+            with self._tier_marker_lock:
+                previous = self._tier_marker_states.get(root)
+                self._tier_marker_states[root] = healthy
+                if healthy and previous is False:
+                    self._tier_markers_need_retry = True
+                    self._tier_markers_recovered_roots.add(root)
+            if not healthy and previous is not False:
+                LOGGER.warning("Storage tier %s is unavailable: marker missing", root)
+            elif healthy and previous is False:
+                LOGGER.info("Storage tier %s is available again", root)
+            available = available and healthy
+        return available
+
+    def _poll_tier_markers(self) -> None:
+        """Retry tier checks after a configured share becomes available again."""
+        for root in self._config.get(CONFIG_TIER_MARKERS, {}):
+            self.tier_available(root)
+        with self._tier_marker_lock:
+            retry = self._tier_markers_need_retry
+            self._tier_markers_need_retry = False
+            recovered_roots = self._tier_markers_recovered_roots.copy()
+            self._tier_markers_recovered_roots.clear()
+        if not retry:
+            return
+        handlers = [
+            handler
+            for camera_tiers in list(self._camera_tier_handlers.values())
+            for category in list(camera_tiers.values())
+            for tier in list(category)
+            for handler in list(tier.values())
+        ]
+        failed_roots: set[str] = set()
+        for root in recovered_roots:
+            for handler in handlers:
+                try:
+                    if not handler.restart_for_tier(root):
+                        failed_roots.add(root)
+                except Exception:  # pylint: disable=broad-except # noqa: BLE001
+                    LOGGER.exception("Failed to restart a tier watcher")
+                    failed_roots.add(root)
+        if failed_roots:
+            with self._tier_marker_lock:
+                self._tier_markers_need_retry = True
+                self._tier_markers_recovered_roots.update(failed_roots)
+            return
+        for handler in handlers:
+            try:
+                if not handler.check_tier(force=True):
+                    with self._tier_marker_lock:
+                        self._tier_markers_need_retry = True
+            except Exception:  # pylint: disable=broad-except # noqa: BLE001
+                LOGGER.exception("Failed to retry a tier check after recovery")
+                with self._tier_marker_lock:
+                    self._tier_markers_need_retry = True
 
     @property
     def camera_tier_handlers(self):
@@ -750,10 +835,17 @@ class Storage:
         callback: Callable[[Any], None] | None = None,
     ) -> None:
         """Send command to tier check worker."""
+        if isinstance(item, (DataItemMoveFile, DataItemDeleteFile)):
+            item.tier_markers = dict(self._config.get(CONFIG_TIER_MARKERS, {}))
         self.tier_check_worker.send_command(item, callback)
 
     def _shutdown(self) -> None:
         """Shutdown."""
+        if self._tier_marker_job is not None:
+            try:
+                self._tier_marker_job.remove()
+            except JobLookupError:
+                pass
         self._timelapse_render_manager.stop()
         self._timelapse_segment_encoder.stop()
         if self.engine:

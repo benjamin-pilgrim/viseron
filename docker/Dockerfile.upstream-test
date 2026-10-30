@@ -1,0 +1,10 @@
+# Test-only overlay on the published amd64 dev image built from dbc12197.
+# Reassess the pinned base whenever the upstream worktree is updated.
+FROM docker.io/roflcoopter/viseron@sha256:12c3bbd00b6104647d31d0316ec7ee23918e666f6c2d6649d303260d976c87c2
+
+COPY viseron/components/storage /src/viseron/components/storage
+COPY viseron/components/webserver/api/v1/hls.py /src/viseron/components/webserver/api/v1/hls.py
+COPY viseron/domains/camera/__init__.py /src/viseron/domains/camera/__init__.py
+COPY viseron/domains/camera/fragmenter.py /src/viseron/domains/camera/fragmenter.py
+
+ENV VISERON_GIT_COMMIT=dbc12197073d420e64a63c1633aaa605e2a07ea2-local-wip

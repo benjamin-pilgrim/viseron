@@ -507,6 +507,11 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
 class TestCheckTierCallbackLifecycle:
     """Test that every check_tier request is matched by exactly one release."""
 
+    @pytest.fixture(autouse=True)
+    def use_temporary_tier(self, tmp_path: Path) -> None:
+        """Keep watcher directories in the test's writable temporary directory."""
+        self._tier_path = str(tmp_path)
+
     def _make_tier_handler(self, vis: MockViseron) -> SegmentsTierHandler:
         mock_camera = Mock()
         mock_camera.identifier = "test"
@@ -521,6 +526,7 @@ class TestCheckTierCallbackLifecycle:
         # _create_dataitem reads CONFIG_DRAIN, which _get_tier_config omits.
         tier_config = _get_tier_config(events=True, continuous=True)
         tier_config[CONFIG_DRAIN] = False
+        tier_config[CONFIG_PATH] = self._tier_path
 
         tier_handler = SegmentsTierHandler(
             vis,
@@ -536,6 +542,16 @@ class TestCheckTierCallbackLifecycle:
         tier_handler._throttle_period = datetime.timedelta(0)
         tier_handler._time_of_last_call = utcnow() - datetime.timedelta(hours=1)
         return tier_handler
+
+    def test_forced_check_bypasses_both_throttles(self, vis: MockViseron) -> None:
+        """A recovered tier is checked even during its normal throttle period."""
+        tier_handler = self._make_tier_handler(vis)
+        tier_handler._throttle_period = datetime.timedelta(minutes=5)
+        tier_handler._time_of_last_call = utcnow()
+        send = cast("Mock", tier_handler._storage.tier_check_worker_send_command)
+        tier_handler.check_tier(force=True)
+        assert send.call_count == 1
+        assert send.call_args.args[0].throttle_period == datetime.timedelta(0)
 
     def test_check_tier_sends_once_while_in_flight(self, vis: MockViseron) -> None:
         """Only one request is sent until the reply releases the slot."""

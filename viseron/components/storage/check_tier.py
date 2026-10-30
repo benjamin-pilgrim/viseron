@@ -6,6 +6,8 @@ import datetime
 import logging
 import os
 import shutil
+import stat
+import tempfile
 import threading
 from typing import TYPE_CHECKING, cast
 
@@ -15,6 +17,11 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.util import (
+    TIER_MOVE_TEMP_PREFIX,
+    is_tier_marker,
+    require_tier_markers,
+)
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_state_changes
 from viseron.helpers import utcnow
@@ -317,6 +324,7 @@ class Worker:
             item.src,
             item.dst,
             LOGGER,
+            tier_markers=item.tier_markers,
         )
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
@@ -325,6 +333,7 @@ class Worker:
             self._get_session,
             item.src,
             LOGGER,
+            tier_markers=item.tier_markers,
         )
 
     def work_input(self, item: DataItem | DataItemMoveFile | DataItemDeleteFile):
@@ -879,26 +888,33 @@ def delete_file(
     get_session: Callable[..., Session],
     path: str,
     logger: logging.Logger,
+    *,
+    tier_markers: dict[str, str] | None = None,
 ) -> None:
     """Delete file."""
     logger.debug("Deleting file %s", path)
-    with get_session() as session:
-        stmt = delete(Files).where(Files.path == path)
-        session.execute(stmt)
-        session.commit()
-
+    if is_tier_marker(path, tier_markers or {}):
+        raise OSError(f"Refusing to delete storage marker {path}")
+    require_tier_markers(path, tier_markers or {})
     try:
         os.remove(path)
     except FileNotFoundError as error:
         logger.debug(f"Failed to delete file {path}: {error}")
         raise error
+    require_tier_markers(path, tier_markers or {})
+    with get_session() as session:
+        stmt = delete(Files).where(Files.path == path)
+        session.execute(stmt)
+        session.commit()
 
 
 def move_file(
-    get_session: Callable[..., Session],
+    _get_session: Callable[..., Session],
     src: str,
     dst: str,
     logger: logging.Logger,
+    *,
+    tier_markers: dict[str, str] | None = None,
 ) -> None:
     """Move file from src to dst.
 
@@ -907,25 +923,46 @@ def move_file(
     delete the old one.
     """
     logger.debug("Moving file from %s to %s", src, dst)
+    if is_tier_marker(src, tier_markers or {}) or is_tier_marker(
+        dst, tier_markers or {}
+    ):
+        raise OSError("Refusing to move a storage marker")
+    require_tier_markers(src, tier_markers or {})
+    require_tier_markers(dst, tier_markers or {})
+    temp_path: str | None = None
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy(src, dst)
+        with open(src, "rb") as source:
+            source_stat = os.fstat(source.fileno())
+            source_size = source_stat.st_size
+            fd, temp_path = tempfile.mkstemp(
+                prefix=TIER_MOVE_TEMP_PREFIX, dir=os.path.dirname(dst)
+            )
+            with os.fdopen(fd, "wb") as target:
+                os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+                if (
+                    os.fstat(target.fileno()).st_size != source_size
+                    or os.fstat(source.fileno()).st_size != source_size
+                ):
+                    raise OSError(f"Incomplete copy of {src}")  # noqa: TRY301
+        os.replace(temp_path, dst)
+        temp_path = None
+        require_tier_markers(src, tier_markers or {})
+        require_tier_markers(dst, tier_markers or {})
         os.remove(src)
-    except FileNotFoundError as error:
-        logger.debug(f"Failed to move file {src} to {dst}: {error}")
-        with get_session() as session:
-            stmt = delete(Files).where(Files.path == src)
-            session.execute(stmt)
-            session.commit()
-        raise error
     except OSError as error:
-        logger.debug(f"Failed to move file {src} to {dst}: {error}")
-        with get_session() as session:
-            stmt = delete(Files).where(Files.path == src)
-            session.execute(stmt)
-            session.commit()
-        try:
-            os.remove(src)
-        except FileNotFoundError as _error:
-            logger.debug(f"Failed to delete file {src}: {_error}")
-        raise error
+        logger.debug("Failed to move file %s to %s: %s", src, dst, error)
+        # A destination or network failure says nothing about whether the source
+        # is safe to discard. Leave both the source and its record for retry.
+        raise
+    finally:
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Could not remove temporary file %s", temp_path)

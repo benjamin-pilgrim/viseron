@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 
 from viseron.components.storage.const import (
     ENGINE,
+    CONFIG_TIER_MARKERS,
     TIER_CATEGORY_RECORDER,
     TIER_SUBCATEGORY_SEGMENTS,
     CleanupJobNames,
@@ -29,6 +30,11 @@ from viseron.components.storage.models import (
     Objects,
     PostProcessorResults,
     Recordings,
+)
+from viseron.components.storage.util import (
+    is_tier_marker,
+    is_tier_move_temp_file,
+    tier_markers_available,
 )
 from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
@@ -61,6 +67,21 @@ LOG_THROTTLE_SECONDS = 5
 BATCH_SIZE = 100
 
 
+def file_is_missing(path: str) -> bool:
+    """Return true only when stat reports that a file does not exist.
+
+    Other filesystem errors can indicate an unavailable remote tier and must not
+    be used as evidence that its database records are orphaned.
+    """
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        LOGGER.debug("Skipping inaccessible file %s: %s", path, error)
+    return False
+
+
 @dataclass(frozen=True)
 class CleanupJobConfig:
     """Everything a cleanup job child process needs, as plain picklable data."""
@@ -70,6 +91,7 @@ class CleanupJobConfig:
     ignored_files: frozenset[str]
     sensitive_strings: tuple[str, ...]
     log_level: int
+    tier_markers: dict[str, str] | None = None
 
 
 class CleanupJobRunner:
@@ -80,6 +102,7 @@ class CleanupJobRunner:
         self.paths = config.paths
         self.ignored_files = config.ignored_files
         self.kill_event = kill_event
+        self.tier_markers = config.tier_markers or {}
         self._session_maker = sessionmaker(bind=ENGINE)
         self._last_log_time = 0.0
 
@@ -184,6 +207,7 @@ class BaseCleanupJob(ABC):
             ignored_files=frozenset(self._storage.ignored_files),
             sensitive_strings=tuple(SensitiveInformationFilter.sensitive_strings),
             log_level=logging.getLogger().level,
+            tier_markers=dict(self._storage.config.get(CONFIG_TIER_MARKERS, {})),
         )
         process = RestartableProcess(
             name=self.name,
@@ -304,6 +328,9 @@ class OrphanedFilesCleanup(BaseCleanupJob):
             for path in runner.paths:
                 if runner.kill_event.is_set():
                     break
+                if not tier_markers_available(path, runner.tier_markers):
+                    LOGGER.warning("Skipping cleanup of unavailable tier %s", path)
+                    continue
                 LOGGER.debug("%s checking %s", runner.name, path)
                 for root, _, files in os.walk(path):
                     if runner.kill_event.is_set():
@@ -316,9 +343,13 @@ class OrphanedFilesCleanup(BaseCleanupJob):
 
                         total_files_processed += 1
                         files_processed += 1
-                        if file in runner.ignored_files:
+                        if file in runner.ignored_files or is_tier_move_temp_file(file):
                             continue
                         file_path = os.path.join(root, file)
+                        if is_tier_marker(file_path, runner.tier_markers):
+                            continue
+                        if not tier_markers_available(file_path, runner.tier_markers):
+                            continue
                         file_exists = session.execute(
                             select(Files).where(Files.path == file_path)
                         ).first()
@@ -393,7 +424,8 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                 to_delete = [
                     file_id
                     for file_id, file_path in files
-                    if not os.path.exists(file_path)
+                    if tier_markers_available(file_path, runner.tier_markers)
+                    and file_is_missing(file_path)
                 ]
 
                 if to_delete:
@@ -477,17 +509,23 @@ class ZeroSizeFilesCleanup(BaseCleanupJob):
                         break
                     processed += 1
                     path = file_row.path
+                    if not tier_markers_available(path, runner.tier_markers):
+                        continue
                     try:
                         stat_size = os.path.getsize(path)
-                    except OSError:
-                        stat_size = 0
+                    except OSError as error:
+                        LOGGER.debug("Skipping inaccessible file %s: %s", path, error)
+                        continue
 
                     if stat_size > 0:
                         file_row.size = stat_size
                         updated += 1
                     else:
-                        if os.path.exists(path):
+                        try:
                             os.remove(path)
+                        except OSError as error:
+                            LOGGER.warning("Could not remove %s: %s", path, error)
+                            continue
                         to_delete_ids.append(file_row.id)
                         deleted += 1
 
@@ -534,8 +572,13 @@ class EmptyFoldersCleanup(BaseCleanupJob):
             return
 
         for path in runner.paths:
+            if not tier_markers_available(path, runner.tier_markers):
+                LOGGER.warning("Skipping cleanup of unavailable tier %s", path)
+                continue
             time.sleep(1)
             for root, dirs, files in os.walk(path, topdown=False):
+                if not tier_markers_available(root, runner.tier_markers):
+                    continue
                 processed_count += 1
                 runner.log_progress(
                     f"{runner.name} processed {processed_count} folders"
@@ -585,6 +628,9 @@ class OrphanedThumbnailsCleanup(BaseCleanupJob):
         with runner.get_session() as session:
             for thumbnails_path in runner.paths:
                 files_processed = 0
+                if not tier_markers_available(thumbnails_path, runner.tier_markers):
+                    LOGGER.warning("Skipping unavailable tier %s", thumbnails_path)
+                    continue
                 if not os.path.exists(thumbnails_path):
                     continue
 
@@ -594,6 +640,7 @@ class OrphanedThumbnailsCleanup(BaseCleanupJob):
                         os.path.join(root, f)
                         for f in files
                         if f not in runner.ignored_files
+                        and not is_tier_move_temp_file(f)
                     )
 
                 # Process files in batches
@@ -613,6 +660,10 @@ class OrphanedThumbnailsCleanup(BaseCleanupJob):
 
                     # Delete files that don't exist in database
                     for file_path in batch:
+                        if is_tier_marker(file_path, runner.tier_markers):
+                            continue
+                        if not tier_markers_available(file_path, runner.tier_markers):
+                            continue
                         if file_path not in existing_thumbnails and os.path.exists(
                             file_path
                         ):
@@ -672,6 +723,9 @@ class OrphanedEventClipsCleanup(BaseCleanupJob):
         with runner.get_session() as session:
             for event_clips_path in runner.paths:
                 files_processed = 0
+                if not tier_markers_available(event_clips_path, runner.tier_markers):
+                    LOGGER.warning("Skipping unavailable tier %s", event_clips_path)
+                    continue
                 if not os.path.exists(event_clips_path):
                     continue
 
@@ -682,6 +736,7 @@ class OrphanedEventClipsCleanup(BaseCleanupJob):
                         os.path.join(root, f)
                         for f in files
                         if f not in runner.ignored_files
+                        and not is_tier_move_temp_file(f)
                     )
 
                 # Process files in batches
@@ -701,6 +756,10 @@ class OrphanedEventClipsCleanup(BaseCleanupJob):
 
                     # Delete files that don't exist in database
                     for file_path in batch:
+                        if is_tier_marker(file_path, runner.tier_markers):
+                            continue
+                        if not tier_markers_available(file_path, runner.tier_markers):
+                            continue
                         if file_path not in existing_clips and os.path.exists(
                             file_path
                         ):

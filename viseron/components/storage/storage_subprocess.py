@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Literal
 
@@ -89,6 +89,7 @@ class DataItemMoveFile:
     dst: str
     callback_id: str | None = None
     error: str | None = None
+    tier_markers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +100,7 @@ class DataItemDeleteFile:
     src: str
     callback_id: str | None = None
     error: str | None = None
+    tier_markers: dict[str, str] = field(default_factory=dict)
 
 
 class DedupCheckQueue:
