@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import fcntl
 import subprocess as sp
 from datetime import datetime, timezone
@@ -71,6 +72,7 @@ class FFmpegPipe:
         decoder_command: list[str] | None = None,
         segment_command: list[str] | None = None,
         dedicated_rawvideo_fd: bool = False,
+        run_marker=None,
     ) -> None:
         self._camera_identifier = camera_identifier
         self._logger = logger
@@ -78,11 +80,27 @@ class FFmpegPipe:
         self._decoder_command = decoder_command
         self._segment_command = segment_command
         self._dedicated_rawvideo_fd = dedicated_rawvideo_fd
+        self._run_marker = run_marker
 
         self._pipe: RestartablePopen | None = None
         self._log_pipe: LogPipe | None = None
         self._rawvideo_pipe: BinaryIO | None = None
         self.segment_process: RestartablePopen | None = None
+
+    def _record_run_launch(self, command: list[str]) -> None:
+        """Publish the run ID after its recorder process has actually started."""
+        writer_command = self._segment_command or self._decoder_command
+        if (
+            self._run_marker is None
+            or not writer_command
+            or not any(RUN_TOKEN in argument for argument in writer_command)
+        ):
+            return
+        for argument in command:
+            for component in argument.split(os.sep):
+                if re.fullmatch(r"\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}", component):
+                    self._run_marker.value = component.encode("ascii")
+                    return
 
     def _close_log_pipe(self) -> None:
         try:
@@ -122,6 +140,9 @@ class FFmpegPipe:
             process = RestartablePopen(
                 command,
                 command_factory=lambda: _leased_command_for_run(command),
+                launch_callback=self._record_run_launch
+                if not self._segment_command
+                else None,
                 name=f"viseron.camera.{self._camera_identifier}.pipe",
                 register=False,
                 stdin=sp.DEVNULL,
@@ -161,6 +182,7 @@ class FFmpegPipe:
                         self._segment_command
                     ),
                     name=f"viseron.camera.{self._camera_identifier}.segments",
+                    launch_callback=self._record_run_launch,
                     stdin=sp.DEVNULL,
                     stdout=sp.PIPE,
                     stderr=self._log_pipe,
@@ -180,6 +202,9 @@ class FFmpegPipe:
                             self._decoder_command
                         ),
                         name=f"viseron.camera.{self._camera_identifier}.pipe",
+                        launch_callback=self._record_run_launch
+                        if not self._segment_command
+                        else None,
                         register=False,
                         stdin=sp.DEVNULL,
                         stdout=sp.PIPE,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import sys
 import subprocess as sp
 from unittest.mock import patch
 
@@ -128,3 +130,56 @@ def test_close_terminates_and_kills_on_timeout() -> None:
 
     process.terminate.assert_called_once()
     process.kill.assert_called_once()
+
+
+def test_recorder_launch_reports_new_run_after_restart(tmp_path):
+    """Each actual recording process launch exposes its new run to the parent."""
+    marker = multiprocessing.get_context("fork").Array("c", 64)
+    command = [
+        sys.executable,
+        "-c",
+        "import time; time.sleep(60)",
+        str(tmp_path / "__VISERON_RUN__" / "index.m3u8"),
+    ]
+    pipe = FFmpegPipe("test", LOGGER, 10, decoder_command=command, run_marker=marker)
+    try:
+        pipe.start()
+        first = marker.value.decode("ascii")
+        assert (tmp_path / first).is_dir()
+        pipe.close()
+        pipe.start()
+        second = marker.value.decode("ascii")
+        assert (tmp_path / second).is_dir()
+        assert first != second
+    finally:
+        pipe.close()
+
+
+def test_segment_writer_watchdog_restart_publishes_new_run(tmp_path):
+    """A separate segment writer updates the parent even if decoding continues."""
+    marker = multiprocessing.get_context("fork").Array("c", 64)
+    segment = [
+        sys.executable,
+        "-c",
+        "import time; time.sleep(60)",
+        str(tmp_path / "__VISERON_RUN__" / "index.m3u8"),
+    ]
+    decoder = [sys.executable, "-c", "import time; time.sleep(60)"]
+    pipe = FFmpegPipe(
+        "test",
+        LOGGER,
+        10,
+        decoder_command=decoder,
+        segment_command=segment,
+        run_marker=marker,
+    )
+    try:
+        pipe.start()
+        first = marker.value.decode("ascii")
+        assert (tmp_path / first).is_dir()
+        pipe.segment_process.restart()
+        second = marker.value.decode("ascii")
+        assert first != second
+        assert (tmp_path / second).is_dir()
+    finally:
+        pipe.close()

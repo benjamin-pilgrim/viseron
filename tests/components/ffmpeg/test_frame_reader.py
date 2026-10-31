@@ -127,7 +127,8 @@ def test_sets_decode_error_after_max_empty_frames() -> None:
 def test_decode_error_restarts_the_same_pipe() -> None:
     """The frame reader remains the sole owner of decode-error retries."""
     capture_frames = MagicMock()
-    capture_frames.is_set.side_effect = [True, False]
+    # The retry checks for shutdown throughout its backoff and around restart.
+    capture_frames.is_set.side_effect = [True] * 54 + [False]
     decode_error = MagicMock()
     decode_error.is_set.return_value = True
     frame_queue = _FakeQueue(maxsize=2)

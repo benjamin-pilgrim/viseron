@@ -39,10 +39,12 @@ class RestartablePopen(_Base):
         start_new_session: bool = True,
         command_factory: Callable[[], list[str] | tuple[list[str], int | None]]
         | None = None,
+        launch_callback: Callable[[list[str]], None] | None = None,
         **kwargs,
     ) -> None:
         self._args = args
         self._command_factory = command_factory
+        self._launch_callback = launch_callback
         self._name = name
         self._grace_period = grace_period
         self._kwargs = kwargs
@@ -111,6 +113,8 @@ class RestartablePopen(_Base):
         finally:
             if lease_fd is not None:
                 os.close(lease_fd)
+        if self._launch_callback is not None and launch is not None:
+            self._launch_callback(launch)
         self._start_time = utcnow().timestamp()
         self._started = True
 

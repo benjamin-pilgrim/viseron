@@ -361,6 +361,11 @@ class AbstractCamera(AbstractDomain):
         """Stop camera recorder."""
 
     @property
+    def recording_run_id(self) -> str | None:
+        """Return the active recorder run when supported by this camera."""
+        return None
+
+    @property
     def name(self) -> str:
         """Return camera name."""
         return self._config[CONFIG_NAME] or self.identifier

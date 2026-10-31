@@ -350,6 +350,7 @@ class AbstractRecorder(ABC, RecorderBase):
         self._logger.info("Starting recorder")
         self.is_recording = True
         start_time = utcnow()
+        run_id = self._camera.recording_run_id
 
         with self._storage.get_session() as session:
             stmt = (
@@ -357,6 +358,7 @@ class AbstractRecorder(ABC, RecorderBase):
                 .values(
                     camera_identifier=self._camera.identifier,
                     trigger_type=trigger_type,
+                    recorder_run_id=run_id if isinstance(run_id, str) else None,
                     start_time=start_time,
                     adjusted_start_time=start_time
                     - datetime.timedelta(seconds=self.lookback)

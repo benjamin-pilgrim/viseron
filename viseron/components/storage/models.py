@@ -222,6 +222,7 @@ class Recordings(Base):
         UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
     )
 
+    recorder_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     trigger_type: Mapped[TriggerTypes | None] = mapped_column(nullable=True)
     trigger_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     thumbnail_path: Mapped[str] = mapped_column(String, nullable=True)

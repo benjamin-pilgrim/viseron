@@ -54,6 +54,12 @@ def get_recording_fragments(
         .add_columns(row_number)
         .join(Recordings, Files.camera_identifier == Recordings.camera_identifier)
         .where(Recordings.id == recording_id)
+        .where(
+            or_(
+                Recordings.recorder_run_id.is_(None),
+                Files.directory.endswith("/" + Recordings.recorder_run_id),
+            )
+        )
         .where(Files.category == TIER_CATEGORY_RECORDER)
         .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
         .where(Files.duration.isnot(None))
