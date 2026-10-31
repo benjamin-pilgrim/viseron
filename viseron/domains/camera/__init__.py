@@ -80,6 +80,7 @@ from .shared_frames import SharedFrames
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     import numpy as np
 
@@ -87,7 +88,7 @@ if TYPE_CHECKING:
     from viseron.components.nvr.nvr import FrameIntervalCalculator
     from viseron.domains.object_detector.detected_object import DetectedObject
 
-    from .recorder import AbstractRecorder
+    from .recorder import AbstractRecorder, Recording
     from .shared_frames import SharedFrame
 
 
@@ -362,6 +363,13 @@ class AbstractCamera(AbstractDomain):
     @abstractmethod
     def stop_recorder(self) -> None:
         """Stop camera recorder."""
+
+    def stop_recording_at(
+        self, recording: Recording, end_time: datetime | None
+    ) -> None:
+        """Stop this exact recording, capped at its requested deadline."""
+        with self._camera_state_lock:
+            self.recorder.stop(recording, end_time=end_time)
 
     @property
     def recording_run_id(self) -> str | None:

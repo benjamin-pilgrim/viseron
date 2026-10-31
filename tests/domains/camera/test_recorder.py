@@ -600,8 +600,8 @@ def test_stop_waits_for_inflight_recording_start(recorder, vis):
         assert dispatched.call_count == 2
 
 
-def test_event_preroll_does_not_extend_before_its_run(recorder, get_db_session):
-    """Retention must not claim pre-roll from an earlier recorder run."""
+def test_event_preroll_may_extend_before_run_wallclock(recorder, get_db_session):
+    """Source timestamps can precede the wall clock when the run launched."""
     run_start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
     now = run_start + datetime.timedelta(seconds=2)
     recorder._camera.recording_run_id = "20260101T000000.000000Z-aaaaaaaaaaaa"
@@ -620,4 +620,26 @@ def test_event_preroll_does_not_extend_before_its_run(recorder, get_db_session):
     with get_db_session() as session:
         stored = session.get(Recordings, recording.id)
         assert stored.recorder_run_id == "20260101T000000.000000Z-aaaaaaaaaaaa"
-        assert stored.adjusted_start_time == run_start
+        assert stored.adjusted_start_time < run_start
+
+
+def test_manual_stop_persists_original_deadline(recorder, get_db_session):
+    """A stalled frame processor cannot extend a timed manual recording."""
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    deadline = start + datetime.timedelta(seconds=5)
+    recorder._config = {
+        CONFIG_RECORDER: {
+            CONFIG_THUMBNAIL: {CONFIG_SAVE_TO_DISK: False},
+            CONFIG_CREATE_EVENT_CLIP: False,
+        }
+    }
+    with (
+        patch.object(recorder._storage, "get_session", side_effect=get_db_session),
+        patch.object(recorder, "create_thumbnail", return_value=(None, None)),
+        patch("viseron.domains.camera.recorder.utcnow", return_value=start) as clock,
+    ):
+        recording = recorder.start(None, [], TriggerTypes.MANUAL)
+        clock.return_value = start + datetime.timedelta(seconds=9)
+        recorder.stop(recording, end_time=deadline)
+    with get_db_session() as session:
+        assert session.get(Recordings, recording.id).end_time == deadline

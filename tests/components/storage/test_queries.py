@@ -423,10 +423,38 @@ def test_recording_fragments_stay_within_recorders_run(get_db_session):
                     path=f"{directory}/segment.m4s",
                     size=8,
                     duration=5,
-                    orig_ctime=base + datetime.timedelta(seconds=10 * index),
+                    orig_ctime=base + datetime.timedelta(seconds=10 * index - 2),
                 )
             )
         session.commit()
     files = get_recording_fragments(recording_id, 5, get_db_session)
     assert len(files) == 1
     assert runs[0] in files[0].directory
+
+
+def test_recording_deadline_excludes_later_fragments(get_db_session):
+    """A late worker stop does not extend the recording's fragment interval."""
+    base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    run_id = "20260101T000000.000000Z-aaaaaaaaaaaa"
+    directory = f"/segments/run_camera/{run_id}"
+    with get_db_session() as session:
+        event = Recordings(
+            camera_identifier="run_camera", start_time=base,
+            adjusted_start_time=base, end_time=base + datetime.timedelta(seconds=5),
+            recorder_run_id=run_id,
+        )
+        session.add(event)
+        session.flush()
+        recording_id = event.id
+        for index in (0, 5, 10):
+            session.add(Files(
+                tier_id=0, tier_path="/", camera_identifier="run_camera",
+                category="recorder", subcategory="segments", directory=directory,
+                filename=f"{index}.m4s", path=f"{directory}/{index}.m4s",
+                size=8, duration=10,
+                orig_ctime=base + datetime.timedelta(seconds=index),
+            ))
+        session.commit()
+    files = get_recording_fragments(recording_id, 0, get_db_session)
+    assert [file.filename for file in files] == ["0.m4s"]
+    assert files[0].duration == 10  # Final included fragment is not trimmed.

@@ -869,18 +869,9 @@ class NVR(AbstractNVR):
         ):
             self._logger.info("Max recording time exceeded, stopping recorder")
             self.stop_recorder(force=True)
-        elif (
-            self._camera.is_recording
-            and self._camera.recorder.active_recording
-            and self._camera.recorder.active_recording.trigger_type
-            == TriggerTypes.MANUAL
-        ):
-            # Nested if in order to not end up in the block below
-            if self.manual_recording_ended:
-                self._logger.info("Manual recording stopped or time exceeded")
-                self.stop_manual_recording()
-                self.stop_recorder(force=True)
-                return
+        elif self._camera.is_recording and self._manual_is_active():
+            self._stop_manual_if_ended()
+            return
         elif self._camera.is_recording and self.event_over():
             self.stop_recorder()
         else:
@@ -922,20 +913,31 @@ class NVR(AbstractNVR):
             else:
                 self._start_manual_recording = True
 
+    def _manual_is_active(self) -> bool:
+        """Inspect the current recording using a single snapshot."""
+        recording = self._camera.recorder.active_recording
+        return recording is not None and recording.trigger_type == TriggerTypes.MANUAL
+
+    def _stop_manual_if_ended(self) -> bool:
+        """Stop only the observed manual recording, capped at its deadline."""
+        recording = self._camera.recorder.active_recording
+        if recording is None or recording.trigger_type != TriggerTypes.MANUAL:
+            return False
+        deadline = self._manual_recording_deadline
+        if self._manual_recording is not None and (
+            deadline is None or utcnow() < deadline
+        ):
+            return False
+        self._logger.info("Manual recording stopped or time exceeded")
+        self.stop_manual_recording()
+        self._stop_recorder_at = None
+        self._seconds_left = 0
+        self._camera.stop_recording_at(recording, deadline)
+        return True
+
     def _run(self) -> None:
         """Process frames from camera."""
-        if (
-            self._camera.is_recording
-            and self._camera.recorder.active_recording
-            and (
-                self._camera.recorder.active_recording.trigger_type
-                == TriggerTypes.MANUAL
-            )
-            and self.manual_recording_ended
-        ):
-            self._logger.info("Manual recording stopped or time exceeded")
-            self.stop_manual_recording()
-            self.stop_recorder(force=True)
+        if self._stop_manual_if_ended():
             return
         self._check_recording_run()
         self.update_operation_state()

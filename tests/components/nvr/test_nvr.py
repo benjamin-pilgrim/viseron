@@ -94,6 +94,12 @@ def configure_camera_for_recording_tests(
     camera.start_recorder.side_effect = start_recorder_side_effect
     camera.stop_recorder.side_effect = stop_recorder_side_effect
 
+    def stop_recording_at_side_effect(recording, _end_time):
+        if camera.recorder.active_recording is recording:
+            stop_recorder_side_effect()
+
+    camera.stop_recording_at.side_effect = stop_recording_at_side_effect
+
 
 def safe_put(queue, item) -> None:
     """Put item into queue, removing oldest if full."""
@@ -1048,7 +1054,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(2)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_overrides_object_event(self, vis, monkeypatch, caplog):
@@ -1084,7 +1090,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_overrides_motion_event(self, vis, monkeypatch, caplog):
@@ -1118,7 +1124,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_does_not_restart_each_frame(
@@ -1148,7 +1154,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration(self, vis, monkeypatch, caplog):
@@ -1175,7 +1181,7 @@ class TestNVRRunManualRecording:
         feed_frame_to_nvr(nvr)
         nvr._run()
         assert "Received request to stop manual recording" in caplog.text
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration_max_recording_time_exceeded(
@@ -1428,7 +1434,10 @@ def test_timed_manual_recording_stops_without_another_frame(vis, monkeypatch):
     feed_frame_to_nvr(nvr)
     nvr._run()
     assert camera.is_recording
+    deadline = nvr._manual_recording_deadline
+    recording = camera.recorder.active_recording
     fake_time.advance(6)
     with patch.object(nvr._frame_queue, "get", side_effect=Empty):
         nvr._run()
+    camera.stop_recording_at.assert_called_once_with(recording, deadline)
     assert not camera.is_recording

@@ -22,7 +22,7 @@ from viseron.components.storage.models import Recordings
 from viseron.components.storage.queries import get_recording_fragments
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX
 from viseron.const import CAMERA_SEGMENT_DURATION
-from viseron.domains.camera.fragmenter import RUN_DIRECTORY_RE, fragment_from_file
+from viseron.domains.camera.fragmenter import fragment_from_file
 from viseron.domains.camera.schedule import resolve_timezone
 from viseron.events import EventData
 from viseron.helpers import create_directory, draw_objects, get_utc_offset, utcnow
@@ -367,14 +367,6 @@ class AbstractRecorder(ABC, RecorderBase):
         adjusted_start = start_time - datetime.timedelta(
             seconds=self.lookback + CAMERA_SEGMENT_DURATION
         )
-        if isinstance(run_id, str) and RUN_DIRECTORY_RE.fullmatch(run_id):
-            try:
-                run_start = datetime.datetime.strptime(
-                    run_id[:23], "%Y%m%dT%H%M%S.%fZ"
-                ).replace(tzinfo=datetime.timezone.utc)
-                adjusted_start = max(adjusted_start, min(run_start, start_time))
-            except ValueError:
-                self._logger.warning("Invalid recorder run timestamp: %s", run_id)
 
         with self._storage.get_session() as session:
             stmt = (
@@ -448,21 +440,25 @@ class AbstractRecorder(ABC, RecorderBase):
         with self._recording_lock:
             self.stop(self._active_recording)
 
-    def stop(self, recording: Recording | None) -> None:
+    def stop(
+        self, recording: Recording | None, *, end_time: datetime.datetime | None = None
+    ) -> None:
         """Stop a recording only if it is still active."""
         with self._recording_lock:
             if recording is not None and recording is not self._active_recording:
                 self._logger.debug("Ignoring stop for an inactive recording")
                 return
-            self._stop_recording(recording)
+            self._stop_recording(recording, end_time=end_time)
 
-    def _stop_recording(self, recording: Recording | None) -> None:
+    def _stop_recording(
+        self, recording: Recording | None, *, end_time: datetime.datetime | None = None
+    ) -> None:
         self._logger.info("Stopping recorder")
         if recording is None:
             self._logger.error("No active recording to stop")
             return
 
-        end_time = utcnow()
+        end_time = min(end_time, utcnow()) if end_time else utcnow()
         recording.end_time = end_time
         recording.end_timestamp = end_time.timestamp()
 

@@ -39,7 +39,8 @@ def get_recording_fragments(
 
     Only the latest row for each logical file key is selected. A file may have
     multiple rows while a tier move is in flight; filenames are not unique across
-    cameras or recorder runs.
+    cameras or recorder runs. The end is exclusive for fragment start times;
+    the final included fragment is not trimmed and may extend past the end.
     """
     row_number = (
         func.row_number()
@@ -66,9 +67,11 @@ def get_recording_fragments(
         .where(
             or_(
                 # Fetch all files that start within the recording
-                Files.orig_ctime.between(
-                    Recordings.start_time - datetime.timedelta(seconds=lookback),
-                    coalesce(Recordings.end_time, now if now else utcnow()),
+                and_(
+                    Files.orig_ctime
+                    >= Recordings.start_time - datetime.timedelta(seconds=lookback),
+                    Files.orig_ctime
+                    < coalesce(Recordings.end_time, now if now else utcnow()),
                 ),
                 # Fetch the first file that starts before the recording but
                 # ends during the recording
