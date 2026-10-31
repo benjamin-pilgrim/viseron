@@ -1,5 +1,5 @@
 import { Dayjs } from "dayjs";
-import Hls from "hls.js";
+import Hls, { ErrorData, Events } from "hls.js";
 import { useCallback, useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
@@ -57,6 +57,7 @@ function SyncManager({ children }: SyncManagerProps) {
   });
   const lastCorrection = useRef(new WeakMap<Hls, number>());
   const bufferingSince = useRef(new WeakMap<Hls, number>());
+  const lastBufferCorrection = useRef(new WeakMap<Hls, number>());
 
   const seekSafely = useCallback((player: Hls, referenceDate: Dayjs) => {
     if (!player.levels || player.levels.length === 0 || !player.media) {
@@ -194,9 +195,12 @@ function SyncManager({ children }: SyncManagerProps) {
           return;
         }
         if (drift <= MAX_DRIFT && !media.paused && !buffering) return;
-        const last = lastCorrection.current.get(player.current) ?? -Infinity;
+        const correctionTimes = buffering
+          ? lastBufferCorrection
+          : lastCorrection;
+        const last = correctionTimes.current.get(player.current) ?? -Infinity;
         if (now - last < (buffering ? BUFFER_RETRY_MS : SEEK_SETTLE_MS)) return;
-        lastCorrection.current.set(player.current, now);
+        correctionTimes.current.set(player.current, now);
         // A paused but aligned player only needs play, not a discontinuous seek.
         const aligned =
           playerDate && Math.abs(drift) <= MAX_DRIFT && !buffering;
@@ -205,10 +209,8 @@ function SyncManager({ children }: SyncManagerProps) {
             .play()
             .then(() => {
               const latest = useReferencePlayerStore.getState();
-              if (
-                latest.isPlaying &&
-                latest.requestedTimestamp === state.requestedTimestamp
-              ) {
+              if (!latest.isPlaying) media.pause();
+              else if (latest.requestedTimestamp === state.requestedTimestamp) {
                 setHlsRefsError(player, null);
               }
             })
@@ -224,21 +226,23 @@ function SyncManager({ children }: SyncManagerProps) {
       setReferencePlayer(null);
     }
 
-    // If there are no players with time, play the first player
-    if (playersWithTime.length === 0) {
-      if (
-        hlsRefs.length > 0 &&
-        hlsRefs[0].current &&
-        hlsRefs[0].current.media
-      ) {
-        hlsRefs[0].current.media
+    // If there are no players with time, start one without flooding play promises.
+    if (playersWithTime.length === 0 && players.length > 0) {
+      const first = players[0];
+      const media = first.current.media;
+      const last = lastCorrection.current.get(first.current) ?? -Infinity;
+      if (media && now - last >= SEEK_SETTLE_MS) {
+        lastCorrection.current.set(first.current, now);
+        media
           .play()
           .then(() => {
-            setHlsRefsError(hlsRefs[0], null);
+            const latest = useReferencePlayerStore.getState();
+            if (!latest.isPlaying) media.pause();
+            else if (latest.requestedTimestamp === state.requestedTimestamp) {
+              setHlsRefsError(first, null);
+            }
           })
-          .catch(() => {
-            // Ignore play errors
-          });
+          .catch(() => {});
       }
     }
 
@@ -259,16 +263,16 @@ function SyncManager({ children }: SyncManagerProps) {
           return;
         }
 
-        const closestFragment = findClosestFragment(
-          fragments,
-          playingDateMillis,
-        );
+        const closestFragment =
+          findFragmentByTimestamp(fragments, playingDateMillis) ??
+          findClosestFragment(fragments, playingDateMillis);
         if (!closestFragment || !closestFragment.programDateTime) {
           return;
         }
 
-        const difference = Math.abs(
-          playingDateMillis - closestFragment.programDateTime,
+        const difference = Math.max(
+          0,
+          closestFragment.programDateTime - playingDateMillis,
         );
         if (difference < smallestDifference) {
           smallestDifference = difference;
@@ -284,26 +288,39 @@ function SyncManager({ children }: SyncManagerProps) {
         if (!fragments || fragments.length === 0) {
           return;
         }
-        const closestFragment = findClosestFragment(
-          fragments,
-          playingDateMillis,
-        );
+        const closestFragment =
+          findFragmentByTimestamp(fragments, playingDateMillis) ??
+          findClosestFragment(fragments, playingDateMillis);
+        const media = playerToPlay.current.media;
+        const last =
+          lastCorrection.current.get(playerToPlay.current) ?? -Infinity;
         if (
-          closestFragment &&
-          closestFragment.programDateTime &&
-          playerToPlay.current.media
+          media &&
+          closestFragment?.programDateTime &&
+          now - last >= SEEK_SETTLE_MS
         ) {
-          playerToPlay.current.media.currentTime = closestFragment.start;
-        }
-        if (playerToPlay.current.media) {
-          playerToPlay.current.media
+          lastCorrection.current.set(playerToPlay.current, now);
+          const currentDate = playerToPlay.current.playingDate;
+          const aligned =
+            currentDate &&
+            Math.abs(currentDate.getTime() - playingDateMillis) <=
+              MAX_DRIFT * 1000;
+          if (!aligned) {
+            const target = getSeekTarget(closestFragment, playingDateMillis);
+            // A gap resolves to the first later fragment, while a timestamp
+            // inside a fragment retains its exact position.
+            media.currentTime = target;
+          }
+          media
             .play()
             .then(() => {
-              setHlsRefsError(playerToPlay, null);
+              const latest = useReferencePlayerStore.getState();
+              if (!latest.isPlaying) media.pause();
+              else if (latest.requestedTimestamp === state.requestedTimestamp) {
+                setHlsRefsError(playerToPlay, null);
+              }
             })
-            .catch(() => {
-              // Ignore play errors
-            });
+            .catch(() => {});
         }
       }
     }
@@ -321,9 +338,16 @@ function SyncManager({ children }: SyncManagerProps) {
   useControlledInterval(syncPlayers, SYNC_INTERVAL, true);
 
   useEffect(() => {
+    const bindings: {
+      player: Hls;
+      handler: (event: Events.ERROR, data: ErrorData) => void;
+    }[] = [];
     hlsRefs.forEach((player) => {
       if (player.current) {
-        player.current.on(Hls.Events.ERROR, (_event, data) => {
+        const instance = player.current;
+        const handler = (_event: Events.ERROR, data: ErrorData) => {
+          // A delayed HLS error must not undo an explicit user pause.
+          if (!useReferencePlayerStore.getState().isPlaying) return;
           // Dont pause if this is the only playing player
           // console.warn("SyncManager: Error event", data);
           if (
@@ -332,9 +356,14 @@ function SyncManager({ children }: SyncManagerProps) {
             ).length === 1
           ) {
             if (player.current!.media) {
-              player.current!.media.play().catch(() => {
-                // Ignore play errors
-              });
+              const media = player.current!.media;
+              media
+                .play()
+                .then(() => {
+                  if (!useReferencePlayerStore.getState().isPlaying)
+                    media.pause();
+                })
+                .catch(() => {});
             }
             return;
           }
@@ -346,9 +375,14 @@ function SyncManager({ children }: SyncManagerProps) {
             data.details === Hls.ErrorDetails.LEVEL_PARSING_ERROR
           ) {
             if (player.current!.media) {
-              player.current!.media.play().catch(() => {
-                // Ignore play errors
-              });
+              const media = player.current!.media;
+              media
+                .play()
+                .then(() => {
+                  if (!useReferencePlayerStore.getState().isPlaying)
+                    media.pause();
+                })
+                .catch(() => {});
             }
             return;
           }
@@ -356,16 +390,16 @@ function SyncManager({ children }: SyncManagerProps) {
           if (player.current!.media) {
             player.current!.media.pause();
           }
-        });
+        };
+        instance.on(Hls.Events.ERROR, handler);
+        bindings.push({ player: instance, handler });
       }
     });
 
     return () => {
-      hlsRefs.forEach((player) => {
-        if (player.current) {
-          player.current.off(Hls.Events.ERROR);
-        }
-      });
+      bindings.forEach(({ player, handler }) =>
+        player.off(Hls.Events.ERROR, handler),
+      );
     };
   }, [hlsRefs]);
 

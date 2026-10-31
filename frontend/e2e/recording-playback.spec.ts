@@ -97,4 +97,37 @@ test("two actual HLS players converge smoothly and seek large drift", async ({
   await expect
     .poll(async () => Math.abs((await readDrift()).drift))
     .toBeLessThan(0.6);
+  // Simulate a media element reporting buffered data exhaustion while the
+  // other real HLS player continues. Recovery waits before seeking.
+  await page.evaluate(() => {
+    const state = window as unknown as { playbackVideos: HTMLVideoElement[] };
+    Object.defineProperty(state.playbackVideos[1], "readyState", {
+      configurable: true,
+      value: 2,
+    });
+  });
+  await setDrift(3);
+  await page.waitForTimeout(500);
+  expect((await readDrift()).drift).toBeGreaterThan(2);
+  await expect
+    .poll(async () => Math.abs((await readDrift()).drift), { timeout: 4000 })
+    .toBeLessThan(0.6);
+  await page.evaluate(() => {
+    const state = window as unknown as { playbackVideos: HTMLVideoElement[] };
+    Reflect.deleteProperty(state.playbackVideos[1], "readyState");
+  });
+
+  await page.evaluate(() => {
+    const state = window as unknown as {
+      setPlaybackSpeed: (speed: number) => void;
+    };
+    state.setPlaybackSpeed(10);
+  });
+  await setDrift(1.2);
+  await page.waitForTimeout(120);
+  const fastBefore = await readDrift();
+  await page.waitForTimeout(500);
+  const fastAfter = await readDrift();
+  expect(fastBefore.rate).toBeGreaterThan(10);
+  expect(fastAfter.drift).toBeLessThan(fastBefore.drift - 0.1);
 });

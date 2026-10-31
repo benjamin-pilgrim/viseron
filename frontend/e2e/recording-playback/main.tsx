@@ -18,7 +18,12 @@ const players = videos.map((video) => {
   player.loadSource("/playback-fixture/index.m3u8");
   return player;
 });
-Object.assign(window, { playbackVideos: videos, playbackPlayers: players });
+Object.assign(window, {
+  playbackVideos: videos,
+  playbackPlayers: players,
+  setPlaybackSpeed: (speed: number) =>
+    useReferencePlayerStore.getState().setPlaybackSpeed(speed),
+});
 createRoot(document.getElementById("root")!).render(
   <SyncManager>
     <div>Camera playback</div>

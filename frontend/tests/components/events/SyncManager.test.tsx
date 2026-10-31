@@ -267,4 +267,142 @@ describe("multi-camera playback", () => {
     });
     expect(buffering.current.media!.currentTime).toBe(20);
   });
+  it("does not resume a user-paused player on HLS errors", async () => {
+    vi.useFakeTimers();
+    const player = makePlayer(1_700_000_020_000);
+    useHlsStore.setState({ hlsRefs: [player] });
+    useReferencePlayerStore.setState({
+      isPlaying: false,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    const callback = vi
+      .mocked(player.current.on)
+      .mock.calls.find(
+        ([event]) => event === Hls.Events.ERROR,
+      )![1] as unknown as (event: string, data: { details: string }) => void;
+    act(() =>
+      callback(Hls.Events.ERROR, {
+        details: Hls.ErrorDetails.BUFFER_STALLED_ERROR,
+      }),
+    );
+    expect(player.current.media!.play).not.toHaveBeenCalled();
+  });
+
+  it("resumes an aligned player without rewinding to the fragment start", async () => {
+    vi.useFakeTimers();
+    const player = makePlayer(1_700_000_020_000);
+    Object.defineProperty(player.current.media!, "paused", { value: true });
+    player.current.media!.currentTime = 20;
+    useHlsStore.setState({ hlsRefs: [player] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_020 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(player.current.media!.play).toHaveBeenCalled();
+    expect(player.current.media!.currentTime).toBe(20);
+  });
+
+  it("does not clear a new playback error when a previous play completes after pause", async () => {
+    vi.useFakeTimers();
+    const player = makePlayer(1_700_000_020_000);
+    Object.defineProperty(player.current, "playingDate", { value: null });
+    let resolvePlay!: () => void;
+    vi.mocked(player.current.media!.play).mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolvePlay = resolve;
+      }),
+    );
+    useHlsStore.setState({
+      hlsRefs: [player],
+      hlsRefsError: new Map([[player, "unavailable"]]),
+    });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    await act(async () => {
+      useReferencePlayerStore.setState({ isPlaying: false });
+      resolvePlay();
+      await Promise.resolve();
+    });
+    expect(useHlsStore.getState().hlsRefsError.get(player)).toBe("unavailable");
+    expect(player.current.media!.pause).toHaveBeenCalled();
+  });
+  it("removes only its own error listener when a player is removed", () => {
+    const player = makePlayer(1_700_000_020_000);
+    useHlsStore.setState({ hlsRefs: [player] });
+    const view = render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    const handler = vi
+      .mocked(player.current.on)
+      .mock.calls.find(([event]) => event === Hls.Events.ERROR)![1];
+    view.unmount();
+    expect(player.current.off).toHaveBeenCalledWith(Hls.Events.ERROR, handler);
+  });
+  it("honors a pause made while an error recovery play is pending", async () => {
+    vi.useFakeTimers();
+    const player = makePlayer(1_700_000_020_000);
+    let resolvePlay!: () => void;
+    vi.mocked(player.current.media!.play).mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolvePlay = resolve;
+      }),
+    );
+    useHlsStore.setState({ hlsRefs: [player] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    const handler = vi
+      .mocked(player.current.on)
+      .mock.calls.find(
+        ([event]) => event === Hls.Events.ERROR,
+      )![1] as unknown as (event: string, data: { details: string }) => void;
+    await act(async () => {
+      handler(Hls.Events.ERROR, {
+        details: Hls.ErrorDetails.BUFFER_STALLED_ERROR,
+      });
+      useReferencePlayerStore.setState({ isPlaying: false });
+      resolvePlay();
+      await Promise.resolve();
+    });
+    expect(player.current.media!.pause).toHaveBeenCalled();
+  });
 });
