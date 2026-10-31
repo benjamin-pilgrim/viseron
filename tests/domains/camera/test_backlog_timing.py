@@ -9,6 +9,10 @@ import time
 
 from viseron.domains.camera.fragmenter_process import FragmenterWork
 from viseron.domains.camera.playlist_timing import capture_playlist_times
+from viseron.helpers.recording_timing_contract import (
+    TIMING_CONTRACT_CONTENT,
+    TIMING_CONTRACT_FILE,
+)
 
 
 def test_unmatched_playlist_filename_does_not_publish_staged_fragment(tmp_path, caplog):
@@ -17,6 +21,7 @@ def test_unmatched_playlist_filename_does_not_publish_staged_fragment(tmp_path, 
     run_id = "20261031T143215.482000Z-a7c93e12ab34"
     run = stage / run_id
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     (run / name).write_bytes(b"fragment")
     (run / "init.mp4").write_bytes(b"init")
@@ -44,6 +49,7 @@ def test_captured_playlist_timing_survives_rollover_and_worker_restart(tmp_path)
     run_id = "20261031T143215.482000Z-a7c93e12ab34"
     run = stage / run_id
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     (run / name).write_bytes(b"fragment")
     (run / "init.mp4").write_bytes(b"init")
@@ -74,6 +80,7 @@ def test_changed_staged_fragment_is_not_replayed_with_old_timing(tmp_path, caplo
     run_id = "20261031T143215.482000Z-a7c93e12ab34"
     run = stage / run_id
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
     fragment.write_bytes(b"old fragment")
@@ -107,6 +114,7 @@ def test_replacement_after_replay_decision_is_not_published(tmp_path):
     run_id = "20261031T143215.482000Z-a7c93e12ab34"
     run = stage / run_id
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
     fragment.write_bytes(b"old fragment")
@@ -141,6 +149,7 @@ def test_finished_spool_reclaims_orphaned_timing_files(tmp_path):
     stage = tmp_path / "stage"
     run = stage / "20261031T143215.482000Z-a7c93e12ab34"
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     (run / ".viseron-writer-lease").write_bytes(b"")
     (run / "init.mp4").write_bytes(b"init")
     (run / "index.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
@@ -161,6 +170,7 @@ def test_captured_timing_is_pruned_after_source_is_acknowledged(tmp_path):
     stage = tmp_path / "stage"
     run = stage / "20261031T143215.482000Z-a7c93e12ab34"
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
     fragment.write_bytes(b"fragment")
@@ -188,6 +198,7 @@ def test_killed_timing_capture_leaves_no_partial_record(tmp_path):
     stage = tmp_path / "stage"
     run = stage / "20261031T143215.482000Z-a7c93e12ab34"
     run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
     fragment.write_bytes(b"fragment")
@@ -227,3 +238,237 @@ playlist_timing.capture_playlist_times(Path(sys.argv[1]))
     assert list(run.glob(".viseron-timing-tmp-*"))
     capture_playlist_times(stage)
     assert (run / f".viseron-timing-{name}.json").exists()
+
+
+def test_replacement_after_live_playlist_decision_is_not_published(tmp_path):
+    """Replacing a fragment during metadata acknowledgement fails closed."""
+    stage = tmp_path / "stage"
+    run_id = "20261031T143215.482000Z-a7c93e12ab34"
+    run = stage / run_id
+    run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
+    name = "000000001-1760000000-0000001000000.m4s"
+    fragment = run / name
+    fragment.write_bytes(b"old fragment")
+    (run / "init.mp4").write_bytes(b"init")
+    playlist = run / "index.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:1.000000,\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
+        f"{name}\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "segments" / "cam"
+    ready = threading.Event()
+    work = FragmenterWork("cam", str(stage), str(destination), None, None, ready)
+    work.output_queue = queue.Queue()
+    worker = threading.Thread(target=work.work_input, args=({"cmd": "fragment"},))
+    worker.start()
+    work.output_queue.get(timeout=3)
+    fragment.unlink()
+    fragment.write_bytes(b"replacement")
+    ready.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert fragment.exists()
+    assert not (destination / run_id / name).exists()
+
+
+def test_unmarked_run_does_not_capture_or_replay_timing(tmp_path):
+    """An old or custom-command run cannot acquire an assumed contract."""
+    stage = tmp_path / "stage"
+    run = stage / "20261031T143215.482000Z-a7c93e12ab34"
+    run.mkdir(parents=True)
+    name = "000000001-1760000000-0000001000000.m4s"
+    (run / name).write_bytes(b"fragment")
+    (run / "index.m3u8").write_text(
+        "#EXTM3U\n#EXTINF:1.000000,\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
+        f"{name}\n",
+        encoding="utf-8",
+    )
+    capture_playlist_times(stage)
+    assert not list(run.glob(".viseron-timing-*.json"))
+
+
+def test_replacement_does_not_create_timelapse_frame(tmp_path):
+    """An unpublished replacement must not create a misleading timelapse frame."""
+    stage = tmp_path / "stage"
+    run = stage / "20261031T143215.482000Z-a7c93e12ab34"
+    run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
+    for color in ("red", "blue"):
+        output = tmp_path / color
+        output.mkdir()
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={color}:s=96x96:r=10",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-g",
+                "10",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_segment_filename",
+                str(output / "%05d.m4s"),
+                str(output / "index.m3u8"),
+            ],
+            check=True,
+        )
+    name = "000000001-1760000000-0000001000000.m4s"
+    fragment = run / name
+    fragment.write_bytes((tmp_path / "red" / "00000.m4s").read_bytes())
+    (run / "init.mp4").write_bytes((tmp_path / "red" / "init.mp4").read_bytes())
+    playlist = run / "index.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:1.000000,\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
+        f"{name}\n",
+        encoding="utf-8",
+    )
+    capture_playlist_times(stage)
+    playlist.write_text("#EXTM3U\n", encoding="utf-8")
+    frames = tmp_path / "frames"
+    temporary_frames = tmp_path / "temporary_frames"
+    frames.mkdir()
+    temporary_frames.mkdir()
+    ready = threading.Event()
+    work = FragmenterWork(
+        "cam",
+        str(stage),
+        str(tmp_path / "segments"),
+        str(frames),
+        str(temporary_frames),
+        ready,
+    )
+    work.output_queue = queue.Queue()
+    worker = threading.Thread(target=work.work_input, args=({"cmd": "fragment"},))
+    worker.start()
+    work.output_queue.get(timeout=3)
+    fragment.unlink()
+    fragment.write_bytes((tmp_path / "blue" / "00000.m4s").read_bytes())
+    ready.set()
+    worker.join(timeout=15)
+    assert not worker.is_alive()
+    assert not list(frames.glob("*.jpg"))
+
+
+def test_valid_published_fragment_creates_timelapse_frame(tmp_path):
+    """A successfully published fragment still produces a timelapse frame."""
+    stage = tmp_path / "stage"
+    run = stage / "20261031T143215.482000Z-a7c93e12ab34"
+    run.mkdir(parents=True)
+    (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
+    for color in ("red", "blue"):
+        output = tmp_path / color
+        output.mkdir()
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={color}:s=96x96:r=10",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-g",
+                "10",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_segment_filename",
+                str(output / "%05d.m4s"),
+                str(output / "index.m3u8"),
+            ],
+            check=True,
+        )
+    name = "000000001-1760000000-0000001000000.m4s"
+    fragment = run / name
+    fragment.write_bytes((tmp_path / "red" / "00000.m4s").read_bytes())
+    (run / "init.mp4").write_bytes((tmp_path / "red" / "init.mp4").read_bytes())
+    playlist = run / "index.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:1.000000,\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
+        f"{name}\n",
+        encoding="utf-8",
+    )
+    capture_playlist_times(stage)
+    playlist.write_text("#EXTM3U\n", encoding="utf-8")
+    frames = tmp_path / "frames"
+    temporary_frames = tmp_path / "temporary_frames"
+    frames.mkdir()
+    temporary_frames.mkdir()
+    ready = threading.Event()
+    work = FragmenterWork(
+        "cam",
+        str(stage),
+        str(tmp_path / "segments"),
+        str(frames),
+        str(temporary_frames),
+        ready,
+    )
+    work.output_queue = queue.Queue()
+    worker = threading.Thread(target=work.work_input, args=({"cmd": "fragment"},))
+    worker.start()
+    work.output_queue.get(timeout=3)
+    ready.set()
+    work.output_queue.get(timeout=15)
+    ready.set()
+    worker.join(timeout=15)
+    assert not worker.is_alive()
+    assert len(list(frames.glob("*.jpg"))) == 1
+    assert (tmp_path / "segments" / run.name / name).exists()
+
+
+def test_timing_sidecar_without_contract_is_not_replayed(tmp_path, caplog):
+    """An orphaned sidecar alone cannot authorize automatic indexing."""
+    stage = tmp_path / "stage"
+    run = stage / "20261031T143215.482000Z-a7c93e12ab34"
+    run.mkdir(parents=True)
+    marker = run / TIMING_CONTRACT_FILE
+    marker.write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
+    name = "000000001-1760000000-0000001000000.m4s"
+    fragment = run / name
+    fragment.write_bytes(b"fragment")
+    (run / "init.mp4").write_bytes(b"init")
+    playlist = run / "index.m3u8"
+    playlist.write_text(
+        "#EXTM3U\n#EXTINF:1.000000,\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
+        f"{name}\n",
+        encoding="utf-8",
+    )
+    capture_playlist_times(stage)
+    assert (run / f".viseron-timing-{name}.json").exists()
+    marker.unlink()
+    playlist.write_text("#EXTM3U\n", encoding="utf-8")
+    destination = tmp_path / "segments"
+    work = FragmenterWork(
+        "cam", str(stage), str(destination), None, None, threading.Event()
+    )
+    work.output_queue = queue.Queue()
+    with caplog.at_level("WARNING"):
+        work.work_input({"cmd": "fragment"})
+    assert fragment.exists()
+    assert not (destination / run.name / name).exists()
+    assert "retaining them and init unindexed" in caplog.text

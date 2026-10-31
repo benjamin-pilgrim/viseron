@@ -379,7 +379,14 @@ class FragmenterWork(ChildProcessWork):
             init_path, segment_path, tmp_frame_path, frame_path, orig_ctime
         )
 
-    def _segment_hook(self, file: str, orig_ctime: datetime.datetime) -> None:
+    def _segment_hook(
+        self,
+        file: str,
+        orig_ctime: datetime.datetime,
+        *,
+        init_path: str | None = None,
+        segment_path: str | None = None,
+    ) -> None:
         """Perform per fragment tasks before moving fragment to storage.
 
         Currently only used for extracting timelapse frames from fragments.
@@ -390,10 +397,10 @@ class FragmenterWork(ChildProcessWork):
         frame_filename = os.path.splitext(os.path.basename(file))[0] + ".jpg"
         tmp_frame_path = os.path.join(self._temp_timelapse_folder, frame_filename)
         frame_path = os.path.join(self._timelapse_folder, frame_filename)
-        init_path = os.path.join(
+        init_path = init_path or os.path.join(
             self.temp_segments_folder, os.path.dirname(file), "init.mp4"
         )
-        segment_path = os.path.join(self.temp_segments_folder, file)
+        segment_path = segment_path or os.path.join(self.temp_segments_folder, file)
 
         self._extract_timelapse_frame(
             init_path, segment_path, tmp_frame_path, frame_path, orig_ctime
@@ -486,12 +493,13 @@ class FragmenterWork(ChildProcessWork):
         expected_identity: list[int] | None = None,
     ) -> None:
         """Move fragmented mp4 created by encoder to segments folder."""
-        self._segment_hook(file, orig_ctime)
+        run = os.path.dirname(file)
+        is_run = is_run_directory(run)
+        if not is_run:
+            self._segment_hook(file, orig_ctime)
         try:
-            run = os.path.dirname(file)
             destination_dir = os.path.join(self.segments_folder, run)
             require_tier_markers(destination_dir, self._tier_markers)
-            is_run = is_run_directory(run)
             lock = (
                 camera_lock(
                     "/tmp/viseron-run-locks", os.path.abspath(self.segments_folder)
@@ -599,6 +607,14 @@ class FragmenterWork(ChildProcessWork):
                         )
                         protected_temp = True
                         publish_or_verify(marker)
+                        # Use the validated published copy, never an unchecked
+                        # staged path that may have changed after timing capture.
+                        self._segment_hook(
+                            file,
+                            orig_ctime,
+                            init_path=init_dest,
+                            segment_path=destination,
+                        )
                         # Keep staged source and durable hold until DB acknowledgement.
                     finally:
                         if not protected_temp and os.path.exists(temporary):
@@ -698,18 +714,34 @@ class FragmenterWork(ChildProcessWork):
     def _handle_m4s(self, file: str) -> None:
         """Handle completed fragments; preserve media with uncertain timing."""
         try:
+            name = os.path.basename(file)
+            expected_identity = None
+            if _RUN_SEGMENT_NAME.fullmatch(name):
+                try:
+                    snapshot = os.stat(
+                        os.path.join(self.temp_segments_folder, file),
+                        follow_symlinks=False,
+                    )
+                    expected_identity = [
+                        snapshot.st_dev,
+                        snapshot.st_ino,
+                        snapshot.st_size,
+                        snapshot.st_mtime_ns,
+                    ]
+                except FileNotFoundError:
+                    pass
             try:
                 m3u8 = self._read_m3u8(file)
             except FileNotFoundError:
                 m3u8 = ""
-            name = os.path.basename(file)
-            expected_identity = None
             extinf = _extract_extinf_number(m3u8, name)
             program_date_time = _extract_program_date_time(m3u8, name)
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 timing = read_playlist_time(Path(self.temp_segments_folder) / file)
                 if timing is not None:
                     program_date_time, extinf, expected_identity = timing
+            if _RUN_SEGMENT_NAME.fullmatch(name) and expected_identity is None:
+                program_date_time = None
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 now = time.monotonic()
                 if (

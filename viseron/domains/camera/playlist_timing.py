@@ -17,6 +17,10 @@ import tempfile
 from pathlib import Path
 
 from viseron.components.storage.source_move_intent import source_move_pending
+from viseron.helpers.recording_timing_contract import (
+    TIMING_CONTRACT_CONTENT,
+    TIMING_CONTRACT_FILE,
+)
 from viseron.components.storage.run_lifecycle import (
     CameraLockBusy,
     camera_lock,
@@ -83,6 +87,10 @@ def capture_playlist_times(stage: Path) -> None:
             continue
         try:
             with camera_lock("/tmp/viseron-run-locks", os.path.abspath(stage)):
+                if (run / TIMING_CONTRACT_FILE).read_text(
+                    encoding="utf-8"
+                ) != TIMING_CONTRACT_CONTENT:
+                    continue
                 contents = (run / "index.m3u8").read_text(encoding="utf-8")
                 _capture_run(run, contents)
                 _prune_released_records(run)
@@ -158,6 +166,10 @@ def read_playlist_time(
     if not _SEGMENT.fullmatch(fragment.name):
         return None
     try:
+        if (fragment.parent / TIMING_CONTRACT_FILE).read_text(
+            encoding="utf-8"
+        ) != TIMING_CONTRACT_CONTENT:
+            return None
         record = json.loads(
             (fragment.parent / f"{_PREFIX}{fragment.name}.json").read_text()
         )
