@@ -170,11 +170,12 @@ echo "Runs after FFmpeg restart:"; printf '%s\n' "${runs[@]}"
 sha256sum -c "$root/pre-restart.sha256"
 # Pause the camera publisher and terminate its FFmpeg child, so Viseron sees
 # an actual RTSP outage rather than only a killed recorder process.
+runs_before_outage=$(list_runs | wc -l)
 kill -STOP "$publisher"
 pkill -P "$publisher" 2>/dev/null || true
 sleep 10
 kill -CONT "$publisher"
-wait_runs 3
+wait_runs "$((runs_before_outage + 1))"
 echo "Camera publisher reconnected and recording resumed."
 # Restart Viseron against the same persisted storage and database, then stop it.
 podman stop -t 60 "$app" >/dev/null
