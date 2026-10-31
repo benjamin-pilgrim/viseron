@@ -12,7 +12,7 @@ app=$suffix-app
 mtx=$suffix-mtx
 pod=$suffix-pod
 cleanup() {
-  for pid in ${healthy_publisher:-} ${offline_publisher:-}; do
+  for pid in ${healthy_publisher:-} ${offline_publisher:-} ${removed_publisher:-}; do
     pkill -P "$pid" 2>/dev/null || true
     kill "$pid" 2>/dev/null || true
   done
@@ -50,6 +50,13 @@ ffmpeg:
       path: /offline
       recorder:
         continuous_recording: true
+    removed:
+      name: Removed
+      host: 127.0.0.1
+      port: 8554
+      path: /removed
+      recorder:
+        continuous_recording: true
 CONFIG
 podman pod create --name "$pod" -p "127.0.0.1:$port:8554/tcp" >/dev/null
 podman run -d --pod "$pod" --name "$mtx" -e MTX_HLS=no "$rtsp_image" >/dev/null
@@ -81,6 +88,7 @@ wait_recording() {
 wait_recording healthy
 podman logs "$app" > "$root/app-initial.log" 2>&1
 grep -q 'Domain camera with identifier offline .* is not ready' "$root/app-initial.log"
+grep -q 'Domain camera with identifier removed .* is not ready' "$root/app-initial.log"
 grep -q 'NVR for camera Healthy initialized' "$root/app-initial.log"
 echo 'Healthy camera recorded while the second camera was unavailable.'
 publish offline >"$root/offline.log" 2>&1 &
@@ -89,3 +97,62 @@ wait_recording offline
 echo 'Unavailable camera recovered and recorded without an app restart.'
 podman logs "$app" > "$root/app.log" 2>&1
 grep -q 'NVR for camera Offline initialized' "$root/app.log"
+# Remove a still-offline camera, reload through the public websocket API, then
+# bring the stream online. A cancelled retry must not recreate its NVR.
+python3 - "$root/config/config.yaml" <<'PYTHON'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+assert '    removed:\n' in text
+path.write_text(text.split('    removed:\n', 1)[0])
+PYTHON
+podman exec -i "$app" python3 - <<'PYTHON'
+import asyncio
+import json
+from tornado.websocket import websocket_connect
+
+async def main():
+    conn = await websocket_connect('ws://127.0.0.1:8888/websocket')
+    greeting = json.loads(await asyncio.wait_for(conn.read_message(), 10))
+    assert greeting['type'] == 'auth_not_required', greeting
+    await conn.write_message(json.dumps({'command_id': 1, 'type': 'reload_config'}))
+    response = json.loads(await asyncio.wait_for(conn.read_message(), 60))
+    assert response['success'] and response['result']['success'], response
+    assert not response['result']['restart_required'], response
+    conn.close()
+    print('Configuration reload succeeded.')
+
+asyncio.run(main())
+PYTHON
+publish removed >"$root/removed.log" 2>&1 &
+removed_publisher=$!
+# Existing backoff has reached at most 30 seconds by this point. Wait long
+# enough for the obsolete timer to fire if cancellation did not take effect.
+sleep 40
+podman logs "$app" > "$root/app-after-reload.log" 2>&1
+podman logs "$mtx" > "$root/rtsp.log" 2>&1
+grep -q "is publishing to path 'removed'" "$root/rtsp.log"
+if grep -q 'NVR for camera Removed initialized' "$root/app-after-reload.log" ||
+   find "$root/segments/removed" -name '*.m4s' -print -quit 2>/dev/null | grep -q .; then
+  echo 'Removed camera restarted after reload' >&2
+  exit 1
+fi
+echo 'Removed offline camera did not restart after reload.'
+
+# Disconnect both active streams immediately before requesting shutdown.
+for pid in "$healthy_publisher" "$offline_publisher"; do
+  pkill -P "$pid" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+done
+healthy_publisher=
+offline_publisher=
+podman stop -t 60 "$app" >/dev/null
+test "$(podman inspect -f '{{.State.ExitCode}}' "$app")" = 0
+podman logs "$app" > "$root/app-shutdown.log" 2>&1
+grep -q 'Shutdown complete' "$root/app-shutdown.log"
+if sed -n '/Initiating shutdown/,$p' "$root/app-shutdown.log" | grep -q 'Restarting frame pipe'; then
+  echo 'Frame reader restarted during shutdown' >&2
+  exit 1
+fi
+echo 'Viseron stopped cleanly during camera disconnect.'
