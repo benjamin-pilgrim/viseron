@@ -74,3 +74,130 @@ def test_watcher_ignores_init_marker_temporary(tmp_path):
         handler.on_any_event(FileCreatedEvent(name))
         handler.on_any_event(FileMovedEvent(name, str(run/MARKER)))
     assert handler._event_queue.empty()
+
+
+def test_init_remains_usable_when_storage_changes_mtime_during_rename(tmp_path, monkeypatch):
+    """A share that rewrites metadata on rename can still publish the init."""
+    import os
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init bytes")
+    run = tmp_path / "run"
+    publish = mod._publish
+
+    def rename_with_metadata_change(src, dst):
+        publish(src, dst)
+        if dst.name == "init.mp4":
+            st = dst.stat()
+            os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+    monkeypatch.setattr(mod, "_publish", rename_with_metadata_change)
+    mod.ensure_init(source, run)
+    assert (run / "init.mp4").read_bytes() == source.read_bytes()
+    mod.ensure_init(source, run)
+
+
+def test_tier_promotion_reuses_verified_init_without_routine_readback(tmp_path, monkeypatch):
+    """Repeated fragment promotion does not repeatedly read the network init."""
+    import builtins
+    from viseron.components.storage.check_tier import publish_run_init
+
+    run_id = "20261031T143215.482000Z-a7c93e12ab34"
+    source = tmp_path / "local" / run_id
+    destination = tmp_path / "remote" / run_id
+    source.mkdir(parents=True)
+    (source / "init.mp4").write_bytes(b"camera init bytes")
+    publish_run_init(str(source / "000.m4s"), str(destination / "000.m4s"), {})
+    open_file = builtins.open
+
+    def no_destination_read(path, mode="r", *args, **kwargs):
+        if str(path) == str(destination / "init.mp4") and "r" in mode:
+            pytest.fail("unchanged destination init was read back")
+        return open_file(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", no_destination_read)
+    publish_run_init(str(source / "001.m4s"), str(destination / "001.m4s"), {})
+
+
+def test_existing_tier_init_is_adopted_only_when_contents_match(tmp_path):
+    from viseron.components.storage.check_tier import publish_run_init
+
+    run_id = "20261031T143215.482000Z-a7c93e12ab34"
+    source = tmp_path / "local" / run_id
+    destination = tmp_path / "remote" / run_id
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "init.mp4").write_bytes(b"correct")
+    target = destination / "init.mp4"
+    target.write_bytes(b"wrong!!")
+    with pytest.raises(ValueError, match="conflicting existing"):
+        publish_run_init(str(source / "000.m4s"), str(destination / "000.m4s"), {})
+    assert target.read_bytes() == b"wrong!!"
+    target.write_bytes(b"correct")
+    publish_run_init(str(source / "000.m4s"), str(destination / "000.m4s"), {})
+    assert (destination / MARKER).exists()
+
+
+def test_tier_promotion_accepts_recreated_matching_source_init(tmp_path):
+    """A drained first-tier run may later be recreated from the recorder spool."""
+    from viseron.components.storage.check_tier import publish_run_init
+
+    run_id = "20261031T143215.482000Z-a7c93e12ab34"
+    source = tmp_path / "local" / run_id
+    destination = tmp_path / "remote" / run_id
+    source.mkdir(parents=True)
+    init = source / "init.mp4"
+    init.write_bytes(b"correct run init")
+    publish_run_init(str(source / "000.m4s"), str(destination / "000.m4s"), {})
+    replacement = source / "replacement"
+    replacement.write_bytes(b"correct run init")
+    replacement.replace(init)
+    publish_run_init(str(source / "001.m4s"), str(destination / "001.m4s"), {})
+
+    replacement.write_bytes(b"different format")
+    replacement.replace(init)
+    with pytest.raises(ValueError, match="source content changed"):
+        publish_run_init(str(source / "002.m4s"), str(destination / "002.m4s"), {})
+
+
+def test_interrupted_after_init_rename_replays(tmp_path, monkeypatch):
+    """A crash after rename leaves an owned init that can be recovered."""
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    publish = mod._publish
+
+    def interrupt_after_rename(src, dst):
+        publish(src, dst)
+        if dst.name == "init.mp4":
+            raise OSError("crash after rename")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(mod, "_publish", interrupt_after_rename)
+        with pytest.raises(OSError, match="crash after rename"):
+            mod.ensure_init(source, run)
+    assert (run / MARKER).exists()
+    mod.ensure_init(source, run)
+    assert (run / "init.mp4").read_bytes() == b"camera init"
+
+
+def test_rename_metadata_change_does_not_accept_corrupt_init(tmp_path, monkeypatch):
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"valid init")
+    run = tmp_path / "run"
+    publish = mod._publish
+
+    def rename_with_corruption(src, dst):
+        publish(src, dst)
+        if dst.name == "init.mp4":
+            dst.write_bytes(b"bad!! init")
+
+    monkeypatch.setattr(mod, "_publish", rename_with_corruption)
+    with pytest.raises(ValueError, match="destination content changed"):
+        mod.ensure_init(source, run)
+    assert source.read_bytes() == b"valid init"
