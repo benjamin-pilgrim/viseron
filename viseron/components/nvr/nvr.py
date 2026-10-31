@@ -277,6 +277,8 @@ class NVR(AbstractNVR):
         self._stop_recorder_at: datetime.datetime | None = None
         self._seconds_left = 0
         self._manual_recording: ManualRecording | None = None
+        self._manual_recording_deadline: datetime.datetime | None = None
+        self._recording_run_id: str | None = None
         self._start_manual_recording = False
         self._kill_received = False
         self._operation_state: OperationState | None = None
@@ -515,12 +517,15 @@ class NVR(AbstractNVR):
             f"{manual_recording.duration}"
         )
         self._manual_recording = manual_recording
+        self._manual_recording_deadline = None
         self._start_manual_recording = True
 
     def stop_manual_recording(self) -> None:
         """Stop manual recording."""
         self._logger.debug("Received request to stop manual recording")
         self._manual_recording = None
+        self._manual_recording_deadline = None
+        self._start_manual_recording = False
 
     def process_manual_recording(self) -> None:
         """Process manual recording."""
@@ -528,6 +533,13 @@ class NVR(AbstractNVR):
             return
 
         if not self._start_manual_recording:
+            return
+
+        if (
+            self._manual_recording_deadline
+            and utcnow() >= self._manual_recording_deadline
+        ):
+            self.stop_manual_recording()
             return
 
         if self._camera.is_recording:
@@ -539,8 +551,8 @@ class NVR(AbstractNVR):
         self._start_manual_recording = False
         self._trigger_type = TriggerTypes.MANUAL
         self._start_recorder = True
-        if self._manual_recording.duration:
-            self._stop_recorder_at = utcnow() + datetime.timedelta(
+        if self._manual_recording.duration and self._manual_recording_deadline is None:
+            self._manual_recording_deadline = utcnow() + datetime.timedelta(
                 seconds=self._manual_recording.duration
             )
 
@@ -553,12 +565,10 @@ class NVR(AbstractNVR):
         if self.camera.recorder.active_recording is None:
             return True
 
-        if self._manual_recording.duration is None:
+        if self._manual_recording_deadline is None:
             return False
 
-        return (
-            utcnow() - self.camera.recorder.active_recording.start_time
-        ).total_seconds() > self._manual_recording.duration
+        return utcnow() >= self._manual_recording_deadline
 
     def _any_filter_requires_motion_overlap(self) -> bool:
         """Return True if any configured label requires motion to overlap objects."""
@@ -859,17 +869,9 @@ class NVR(AbstractNVR):
         ):
             self._logger.info("Max recording time exceeded, stopping recorder")
             self.stop_recorder(force=True)
-        elif (
-            self._camera.is_recording
-            and self._camera.recorder.active_recording
-            and self._camera.recorder.active_recording.trigger_type
-            == TriggerTypes.MANUAL
-        ):
-            # Nested if in order to not end up in the block below
-            if self.manual_recording_ended:
-                self._logger.info("Manual recording stopped or time exceeded")
-                self.stop_recorder(force=True)
-                return
+        elif self._camera.is_recording and self._manual_is_active():
+            self._stop_manual_if_ended()
+            return
         elif self._camera.is_recording and self.event_over():
             self.stop_recorder()
         else:
@@ -886,8 +888,58 @@ class NVR(AbstractNVR):
 
         self._logger.debug("NVR thread stopped")
 
+    def _check_recording_run(self) -> None:
+        """Split an active recording when the camera starts a new recorder run."""
+        run_id = getattr(self._camera, "recording_run_id", None)
+        if not isinstance(run_id, str) or not run_id:
+            return
+        if self._recording_run_id is None:
+            self._recording_run_id = run_id
+            return
+        if self._recording_run_id == run_id:
+            return
+        self._start_recorder = False
+        self._trigger_type = None
+        if self._camera.is_recording:
+            self.stop_recorder(force=True)
+        # A failed stop must remain retryable on the next iteration.
+        self._recording_run_id = run_id
+        if self._manual_recording is not None:
+            if (
+                self._manual_recording_deadline
+                and utcnow() >= self._manual_recording_deadline
+            ):
+                self.stop_manual_recording()
+            else:
+                self._start_manual_recording = True
+
+    def _manual_is_active(self) -> bool:
+        """Inspect the current recording using a single snapshot."""
+        recording = self._camera.recorder.active_recording
+        return recording is not None and recording.trigger_type == TriggerTypes.MANUAL
+
+    def _stop_manual_if_ended(self) -> bool:
+        """Stop only the observed manual recording, capped at its deadline."""
+        recording = self._camera.recorder.active_recording
+        if recording is None or recording.trigger_type != TriggerTypes.MANUAL:
+            return False
+        deadline = self._manual_recording_deadline
+        if self._manual_recording is not None and (
+            deadline is None or utcnow() < deadline
+        ):
+            return False
+        self._logger.info("Manual recording stopped or time exceeded")
+        self.stop_manual_recording()
+        self._stop_recorder_at = None
+        self._seconds_left = 0
+        self._camera.stop_recording_at(recording, deadline)
+        return True
+
     def _run(self) -> None:
         """Process frames from camera."""
+        if self._stop_manual_if_ended():
+            return
+        self._check_recording_run()
         self.update_operation_state()
         try:
             frame = self._frame_queue.get(timeout=1)

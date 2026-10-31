@@ -364,6 +364,7 @@ class Camera(AbstractCamera):
 
         super().__init__(vis, COMPONENT, config, identifier)
         self._mp_context = get_child_process_context()
+        self._recording_run_marker = self._mp_context.Array("c", 64)
         self._frame_queue: mp.Queue[  # pylint: disable=unsubscriptable-object
             bytes
         ] = self._mp_context.Queue(maxsize=2)
@@ -382,6 +383,12 @@ class Camera(AbstractCamera):
             f"@ {self.stream.fps} FPS"
         )
         self._logger.debug(f"Camera {self.name} initialized")
+
+    @property
+    def recording_run_id(self) -> str | None:
+        """Return the run launched by the active segment-writing process."""
+        value = self._recording_run_marker.value
+        return value.decode("ascii") if value else None
 
     @property
     def _frame_reader_name(self) -> str:
@@ -422,6 +429,7 @@ class Camera(AbstractCamera):
                 self._frame_queue,
                 self._capture_frames,
                 self.decode_error,
+                self._recording_run_marker,
             ),
             target=run_frame_reader,
             daemon=True,
@@ -589,11 +597,15 @@ class Camera(AbstractCamera):
         trigger_type: TriggerTypes,
     ) -> None:
         """Start camera recorder."""
-        self._recorder.start(shared_frame, objects_in_fov or [], trigger_type)
+        with self._camera_state_lock:
+            if self.stopped.is_set():
+                return
+            self._recorder.start(shared_frame, objects_in_fov or [], trigger_type)
 
     def stop_recorder(self) -> None:
         """Stop camera recorder."""
-        self._recorder.stop(self.recorder.active_recording)
+        with self._camera_state_lock:
+            self._recorder.stop_current()
 
     @property
     def output_fps(self) -> int:

@@ -81,6 +81,7 @@ RECORDINGS_DTYPE = np.dtype(
         ("adjusted_start_time", np.int64),
         ("end_time", np.int64),
         ("created_at", np.int64),
+        ("recorder_run_id", "U64"),
     ]
 )
 
@@ -607,6 +608,7 @@ def load_recordings(
             Recordings.end_time,
             Recordings.adjusted_start_time,
             Recordings.created_at,
+            Recordings.recorder_run_id,
         ).where(
             Recordings.camera_identifier == camera_identifier,
         )
@@ -618,6 +620,7 @@ def load_recordings(
                 int(row.adjusted_start_time.timestamp()),
                 int(row.end_time.timestamp() if row.end_time else utcnow().timestamp()),
                 int(row.created_at.timestamp()),
+                row.recorder_run_id or "",
             )
             for row in result
         ]
@@ -803,6 +806,17 @@ def get_recordings_to_move(
                 files_data["orig_ctime"], end_time_search, side="right"
             )
             relevant_files_for_recording = files_data[start_idx:end_idx]
+            run_id = recording["recorder_run_id"]
+            if run_id:
+                relevant_files_for_recording = relevant_files_for_recording[
+                    np.array(
+                        [
+                            os.path.basename(os.path.dirname(path)) == run_id
+                            for path in relevant_files_for_recording["path"]
+                        ],
+                        dtype=bool,
+                    )
+                ]
         else:
             relevant_files_for_recording = np.empty(0, dtype=files_data.dtype)
 

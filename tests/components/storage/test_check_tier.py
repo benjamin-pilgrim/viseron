@@ -10,6 +10,7 @@ from sqlalchemy import update
 
 from viseron.components.storage.check_tier import (
     FILES_DTYPE,
+    RECORDINGS_DTYPE,
     Worker,
     get_continuous_files_to_move,
     get_files_to_move,
@@ -1448,3 +1449,20 @@ def test_delete_camera_lock_contention_is_deferred(caplog):
     worker.work_input(failed)
     assert not failed.deferred and "disk failed" in failed.error
     assert "Error processing command" in caplog.text
+
+
+def test_recording_retention_matches_recorder_run():
+    """Overlapping runs cannot claim each other's segments; legacy can."""
+    run_a = "20260101T000000.000000Z-aaaaaaaaaaaa"
+    run_b = "20260101T000001.000000Z-bbbbbbbbbbbb"
+    files = np.array(
+        [(1, 10, 100, f"/segments/{run_a}/one.m4s", "/tier"),
+         (2, 10, 100, f"/segments/{run_b}/two.m4s", "/tier")],
+        dtype=FILES_DTYPE,
+    )
+    for run_id, expected in [(run_b, {1: -1, 2: 7}), ("", {1: 7, 2: 7})]:
+        recordings = np.array([(7, 100, 90, 110, 100, run_id)], dtype=RECORDINGS_DTYPE)
+        result = get_recordings_to_move(
+            recordings, files.copy(), 5, 1, 200, 0, 0, 200, False
+        )
+        assert {int(row["id"]): int(row["recording_id"]) for row in result} == expected

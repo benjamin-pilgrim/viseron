@@ -58,6 +58,7 @@ def run_frame_reader(
     frame_queue: Queue[bytes],  # pylint: disable=unsubscriptable-object
     capture_frames: Event,
     decode_error: Event,
+    run_marker=None,
 ) -> None:
     """Read frames from FFmpeg and put them on the queue."""
     setproctitle.setproctitle(f"viseron.camera.{config.camera_identifier}.read_frames")
@@ -73,6 +74,7 @@ def run_frame_reader(
         decoder_command=config.decoder_command,
         segment_command=config.segment_command,
         dedicated_rawvideo_fd=config.dedicated_rawvideo_fd,
+        run_marker=run_marker,
         timing_capture_safe=config.timing_capture_safe,
     )
 

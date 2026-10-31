@@ -3,6 +3,7 @@
 import datetime
 import logging
 import time
+from queue import Empty
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -92,6 +93,12 @@ def configure_camera_for_recording_tests(
 
     camera.start_recorder.side_effect = start_recorder_side_effect
     camera.stop_recorder.side_effect = stop_recorder_side_effect
+
+    def stop_recording_at_side_effect(recording, _end_time):
+        if camera.recorder.active_recording is recording:
+            stop_recorder_side_effect()
+
+    camera.stop_recording_at.side_effect = stop_recording_at_side_effect
 
 
 def safe_put(queue, item) -> None:
@@ -1047,7 +1054,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(2)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_overrides_object_event(self, vis, monkeypatch, caplog):
@@ -1083,7 +1090,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_overrides_motion_event(self, vis, monkeypatch, caplog):
@@ -1117,7 +1124,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_does_not_restart_each_frame(
@@ -1147,7 +1154,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration(self, vis, monkeypatch, caplog):
@@ -1174,7 +1181,7 @@ class TestNVRRunManualRecording:
         feed_frame_to_nvr(nvr)
         nvr._run()
         assert "Received request to stop manual recording" in caplog.text
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        camera.stop_recording_at.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration_max_recording_time_exceeded(
@@ -1339,3 +1346,98 @@ class TestNVRRecordingSchedule:
         feed_frame_to_nvr(nvr)
         nvr._run()
         assert camera.is_recording is True
+
+
+def test_manual_recording_resumes_after_run_change_with_original_deadline(
+    vis, monkeypatch
+):
+    """A recorder restart splits a manual recording without extending its duration."""
+    nvr, camera = make_nvr(vis, camera_output_fps=5)
+    fake_time = FakeTime()
+    patch_nvr_utcnow(monkeypatch, fake_time)
+    configure_camera_for_recording_tests(camera, fake_time)
+    run = ["run-one"]
+    monkeypatch.setattr(
+        type(camera), "recording_run_id", property(lambda _: run[0]), raising=False
+    )
+    nvr.start_manual_recording(ManualRecording(duration=10))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    fake_time.advance(4)
+    run[0] = "run-two"
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    assert camera.start_recorder.call_count == 2
+    assert camera.stop_recorder.call_count == 1
+    fake_time.advance(7)
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert not camera.is_recording
+
+
+def test_active_motion_event_splits_when_recorder_run_changes(vis, monkeypatch):
+    """Continuous motion creates separately playable events after a restart."""
+    detector = MockMotionDetector(fps=5, trigger_event_recording=True)
+    nvr, camera = make_nvr(vis, camera_output_fps=5, motion_detector=detector)
+    fake_time = FakeTime()
+    patch_nvr_utcnow(monkeypatch, fake_time)
+    configure_camera_for_recording_tests(camera, fake_time)
+    run = ["run-one"]
+    monkeypatch.setattr(
+        type(camera), "recording_run_id", property(lambda _: run[0]), raising=False
+    )
+    detector.motion_detected = True
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    assert camera.recorder.active_recording.trigger_type == TriggerTypes.MOTION
+    run[0] = "run-two"
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    assert camera.stop_recorder.call_count == 1
+    assert camera.start_recorder.call_count == 2
+    assert camera.recorder.active_recording.trigger_type == TriggerTypes.MOTION
+
+
+def test_manual_recording_does_not_resume_after_its_deadline(vis, monkeypatch):
+    """A camera that returns after the manual deadline does not restart it."""
+    nvr, camera = make_nvr(vis, camera_output_fps=5)
+    fake_time = FakeTime()
+    patch_nvr_utcnow(monkeypatch, fake_time)
+    configure_camera_for_recording_tests(camera, fake_time)
+    run = ["run-one"]
+    monkeypatch.setattr(
+        type(camera), "recording_run_id", property(lambda _: run[0]), raising=False
+    )
+    nvr.start_manual_recording(ManualRecording(duration=5))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    fake_time.advance(6)
+    run[0] = "run-two"
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert not camera.is_recording
+    assert camera.start_recorder.call_count == 1
+
+
+def test_timed_manual_recording_stops_without_another_frame(vis, monkeypatch):
+    """An active timed recording ends even if camera frames have stopped."""
+
+    nvr, camera = make_nvr(vis, camera_output_fps=5)
+    fake_time = FakeTime()
+    patch_nvr_utcnow(monkeypatch, fake_time)
+    configure_camera_for_recording_tests(camera, fake_time)
+    nvr.start_manual_recording(ManualRecording(duration=5))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    deadline = nvr._manual_recording_deadline
+    recording = camera.recorder.active_recording
+    fake_time.advance(6)
+    with patch.object(nvr._frame_queue, "get", side_effect=Empty):
+        nvr._run()
+    camera.stop_recording_at.assert_called_once_with(recording, deadline)
+    assert not camera.is_recording

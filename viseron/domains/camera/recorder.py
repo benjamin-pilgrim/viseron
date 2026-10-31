@@ -8,6 +8,7 @@ import os
 import secrets
 import shutil
 import stat
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from time import sleep
@@ -234,6 +235,7 @@ class AbstractRecorder(ABC, RecorderBase):
 
         self.is_recording = False
         self._active_recording: Recording | None = None
+        self._recording_lock = threading.RLock()
 
         create_directory(self._camera.event_clips_folder)
         create_directory(self._camera.segments_folder)
@@ -346,10 +348,25 @@ class AbstractRecorder(ABC, RecorderBase):
         objects_in_fov: list[DetectedObject],
         trigger_type: TriggerTypes,
     ) -> Recording:
-        """Start recording."""
+        """Start one recording at a time."""
+        with self._recording_lock:
+            if self._active_recording is not None:
+                return self._active_recording
+            return self._start_recording(shared_frame, objects_in_fov, trigger_type)
+
+    def _start_recording(
+        self,
+        shared_frame: SharedFrame,
+        objects_in_fov: list[DetectedObject],
+        trigger_type: TriggerTypes,
+    ) -> Recording:
         self._logger.info("Starting recorder")
         self.is_recording = True
         start_time = utcnow()
+        run_id = self._camera.recording_run_id
+        adjusted_start = start_time - datetime.timedelta(
+            seconds=self.lookback + CAMERA_SEGMENT_DURATION
+        )
 
         with self._storage.get_session() as session:
             stmt = (
@@ -357,10 +374,9 @@ class AbstractRecorder(ABC, RecorderBase):
                 .values(
                     camera_identifier=self._camera.identifier,
                     trigger_type=trigger_type,
+                    recorder_run_id=run_id if isinstance(run_id, str) else None,
                     start_time=start_time,
-                    adjusted_start_time=start_time
-                    - datetime.timedelta(seconds=self.lookback)
-                    - datetime.timedelta(seconds=CAMERA_SEGMENT_DURATION),
+                    adjusted_start_time=adjusted_start,
                 )
                 .returning(Recordings.id)
             )
@@ -419,14 +435,30 @@ class AbstractRecorder(ABC, RecorderBase):
     ):
         """Start the recorder."""
 
-    def stop(self, recording: Recording | None) -> None:
-        """Stop recording."""
+    def stop_current(self) -> None:
+        """Stop the recording active after any concurrent transition finishes."""
+        with self._recording_lock:
+            self.stop(self._active_recording)
+
+    def stop(
+        self, recording: Recording | None, *, end_time: datetime.datetime | None = None
+    ) -> None:
+        """Stop a recording only if it is still active."""
+        with self._recording_lock:
+            if recording is not None and recording is not self._active_recording:
+                self._logger.debug("Ignoring stop for an inactive recording")
+                return
+            self._stop_recording(recording, end_time=end_time)
+
+    def _stop_recording(
+        self, recording: Recording | None, *, end_time: datetime.datetime | None = None
+    ) -> None:
         self._logger.info("Stopping recorder")
         if recording is None:
             self._logger.error("No active recording to stop")
             return
 
-        end_time = utcnow()
+        end_time = min(end_time, utcnow()) if end_time else utcnow()
         recording.end_time = end_time
         recording.end_timestamp = end_time.timestamp()
 

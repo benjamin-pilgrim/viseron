@@ -9,7 +9,7 @@ from abc import abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
-from threading import Event, Timer
+from threading import Event, RLock, Timer
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
@@ -80,6 +80,7 @@ from .shared_frames import SharedFrames
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     import numpy as np
 
@@ -87,7 +88,7 @@ if TYPE_CHECKING:
     from viseron.components.nvr.nvr import FrameIntervalCalculator
     from viseron.domains.object_detector.detected_object import DetectedObject
 
-    from .recorder import AbstractRecorder
+    from .recorder import AbstractRecorder, Recording
     from .shared_frames import SharedFrame
 
 
@@ -147,6 +148,7 @@ class AbstractCamera(AbstractDomain):
 
         self._connected: bool = False
         self._still_image_available: bool = False
+        self._camera_state_lock = RLock()
         self.stopped = Event()
         self.stopped.set()
         self.current_frame: SharedFrame | None = None
@@ -317,31 +319,33 @@ class AbstractCamera(AbstractDomain):
 
     def start_camera(self) -> None:
         """Start camera streaming."""
-        self.stopped.clear()
-        self.fragmenter.start()
-        self._start_camera()
-        self._vis.dispatch_event(
-            EVENT_CAMERA_STARTED.format(camera_identifier=self.identifier),
-            EventEmptyData(),
-        )
+        with self._camera_state_lock:
+            self.stopped.clear()
+            self.fragmenter.start()
+            self._start_camera()
+            self._vis.dispatch_event(
+                EVENT_CAMERA_STARTED.format(camera_identifier=self.identifier),
+                EventEmptyData(),
+            )
 
     @abstractmethod
     def _start_camera(self) -> None:
         """Start camera streaming."""
 
     def stop_camera(self) -> None:
-        """Stop camera streaming."""
-        self._stop_camera()
-        self.still_image_available = self.still_image_configured
-        self.stopped.set()
-        self.fragmenter.stop()
-        self._vis.dispatch_event(
-            EVENT_CAMERA_STOPPED.format(camera_identifier=self.identifier),
-            EventEmptyData(),
-        )
-        if self.is_recording:
-            self.stop_recorder()
-        self.current_frame = None
+        """Fence recording transitions while stopping the camera."""
+        with self._camera_state_lock:
+            self.stopped.set()
+            self._stop_camera()
+            self.still_image_available = self.still_image_configured
+            self.fragmenter.stop()
+            self._vis.dispatch_event(
+                EVENT_CAMERA_STOPPED.format(camera_identifier=self.identifier),
+                EventEmptyData(),
+            )
+            if self.is_recording:
+                self.stop_recorder()
+            self.current_frame = None
 
     @abstractmethod
     def _stop_camera(self) -> None:
@@ -359,6 +363,18 @@ class AbstractCamera(AbstractDomain):
     @abstractmethod
     def stop_recorder(self) -> None:
         """Stop camera recorder."""
+
+    def stop_recording_at(
+        self, recording: Recording, end_time: datetime | None
+    ) -> None:
+        """Stop this exact recording, capped at its requested deadline."""
+        with self._camera_state_lock:
+            self.recorder.stop(recording, end_time=end_time)
+
+    @property
+    def recording_run_id(self) -> str | None:
+        """Return the active recorder run when supported by this camera."""
+        return None
 
     @property
     def name(self) -> str:
