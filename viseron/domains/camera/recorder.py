@@ -22,7 +22,7 @@ from viseron.components.storage.models import Recordings
 from viseron.components.storage.queries import get_recording_fragments
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX
 from viseron.const import CAMERA_SEGMENT_DURATION
-from viseron.domains.camera.fragmenter import fragment_from_file
+from viseron.domains.camera.fragmenter import RUN_DIRECTORY_RE, fragment_from_file
 from viseron.domains.camera.schedule import resolve_timezone
 from viseron.events import EventData
 from viseron.helpers import create_directory, draw_objects, get_utc_offset, utcnow
@@ -364,6 +364,17 @@ class AbstractRecorder(ABC, RecorderBase):
         self.is_recording = True
         start_time = utcnow()
         run_id = self._camera.recording_run_id
+        adjusted_start = start_time - datetime.timedelta(
+            seconds=self.lookback + CAMERA_SEGMENT_DURATION
+        )
+        if isinstance(run_id, str) and RUN_DIRECTORY_RE.fullmatch(run_id):
+            try:
+                run_start = datetime.datetime.strptime(
+                    run_id[:23], "%Y%m%dT%H%M%S.%fZ"
+                ).replace(tzinfo=datetime.timezone.utc)
+                adjusted_start = max(adjusted_start, min(run_start, start_time))
+            except ValueError:
+                self._logger.warning("Invalid recorder run timestamp: %s", run_id)
 
         with self._storage.get_session() as session:
             stmt = (
@@ -373,9 +384,7 @@ class AbstractRecorder(ABC, RecorderBase):
                     trigger_type=trigger_type,
                     recorder_run_id=run_id if isinstance(run_id, str) else None,
                     start_time=start_time,
-                    adjusted_start_time=start_time
-                    - datetime.timedelta(seconds=self.lookback)
-                    - datetime.timedelta(seconds=CAMERA_SEGMENT_DURATION),
+                    adjusted_start_time=adjusted_start,
                 )
                 .returning(Recordings.id)
             )

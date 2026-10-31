@@ -3,6 +3,7 @@
 import datetime
 import logging
 import time
+from queue import Empty
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -1414,3 +1415,20 @@ def test_manual_recording_does_not_resume_after_its_deadline(vis, monkeypatch):
     nvr._run()
     assert not camera.is_recording
     assert camera.start_recorder.call_count == 1
+
+
+def test_timed_manual_recording_stops_without_another_frame(vis, monkeypatch):
+    """An active timed recording ends even if camera frames have stopped."""
+
+    nvr, camera = make_nvr(vis, camera_output_fps=5)
+    fake_time = FakeTime()
+    patch_nvr_utcnow(monkeypatch, fake_time)
+    configure_camera_for_recording_tests(camera, fake_time)
+    nvr.start_manual_recording(ManualRecording(duration=5))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert camera.is_recording
+    fake_time.advance(6)
+    with patch.object(nvr._frame_queue, "get", side_effect=Empty):
+        nvr._run()
+    assert not camera.is_recording

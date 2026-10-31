@@ -924,6 +924,19 @@ class NVR(AbstractNVR):
 
     def _run(self) -> None:
         """Process frames from camera."""
+        if (
+            self._camera.is_recording
+            and self._camera.recorder.active_recording
+            and (
+                self._camera.recorder.active_recording.trigger_type
+                == TriggerTypes.MANUAL
+            )
+            and self.manual_recording_ended
+        ):
+            self._logger.info("Manual recording stopped or time exceeded")
+            self.stop_manual_recording()
+            self.stop_recorder(force=True)
+            return
         self._check_recording_run()
         self.update_operation_state()
         try:
