@@ -366,10 +366,7 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                         if is_tier_move_temp_file(file):
                             # Run-init identity and its prepared temporary are
                             # persistent recovery state, not stale scratch files.
-                            if (
-                                file == ".viseron-tier-move-run-init.json"
-                                or file.startswith(".viseron-tier-move-init-")
-                            ):
+                            if file == ".viseron-tier-move-run-init.json":
                                 continue
                             if is_run_directory(os.path.basename(root)):
                                 camera = os.path.abspath(os.path.dirname(root))

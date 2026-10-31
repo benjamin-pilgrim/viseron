@@ -142,12 +142,13 @@ def ensure_init(source, directory, *, adopt_existing=False):
     if version not in (1, 2):
         raise ValueError("unsupported init marker")
     source_id = _id(source)
+    verify_legacy = version == 1 and source_id != record["source"]
     if version == 1:
-        # An existing marker predates the copied-byte digest. Its source must
-        # still have the recorded identity before deriving a digest from it.
-        if source_id != record["source"]:
-            raise ValueError("run init source identity changed")
+        # Legacy records have no copied-byte digest. If the source identity
+        # drifted, also verify the destination before adopting a new digest.
         digest = _hash(source)
+        if _id(source) != source_id:
+            raise ValueError("run init source changed during verification")
     else:
         digest = record["digest"]
         if source_id != record["source"]:
@@ -159,18 +160,20 @@ def ensure_init(source, directory, *, adopt_existing=False):
     temp = directory / name
     if temp.exists():
         temp_id = _id(temp)
-        if temp_id[:3] != record["destination"][:3] or os.path.lexists(target):
+        if os.path.lexists(target):
             raise FileExistsError("init publication collision")
-        if temp_id != record["destination"] and _hash(temp) != digest:
+        if (verify_legacy or temp_id != record["destination"]) and (
+            _hash(temp) != digest or _id(temp) != temp_id
+        ):
             raise ValueError("temporary init content changed")
         _publish(temp, target)
         sync_dir(directory)
     target_id = _id(target)
-    if target_id[:3] != record["destination"][:3]:
-        raise ValueError("run init destination identity changed")
-    # Some CIFS servers change mtime during rename. Only this exceptional
-    # metadata change requires destination readback; never trust size alone.
-    if target_id != record["destination"] and _hash(target) != digest:
+    # CIFS rename, remount or restart may change the filesystem identity.
+    # Verify the small init exceptionally and ensure the path stayed stable.
+    if (verify_legacy or target_id != record["destination"]) and (
+        _hash(target) != digest or _id(target) != target_id
+    ):
         raise ValueError("run init destination content changed")
     if (
         version == 1

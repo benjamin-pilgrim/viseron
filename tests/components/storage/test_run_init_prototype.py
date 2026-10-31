@@ -201,3 +201,133 @@ def test_rename_metadata_change_does_not_accept_corrupt_init(tmp_path, monkeypat
     with pytest.raises(ValueError, match="destination content changed"):
         mod.ensure_init(source, run)
     assert source.read_bytes() == b"valid init"
+
+
+def test_identical_init_remains_usable_after_share_identity_changes(tmp_path, monkeypatch):
+    """A remounted share may report a different device or inode for the same init."""
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    mod.ensure_init(source, run)
+    target = run / "init.mp4"
+    original_id = mod._id
+
+    def remounted_identity(path):
+        identity = original_id(path)
+        if path == target:
+            identity[0] += 1
+            identity[1] += 1
+        return identity
+
+    monkeypatch.setattr(mod, "_id", remounted_identity)
+    mod.ensure_init(source, run)
+    monkeypatch.setattr(mod, "_hash", lambda _: pytest.fail("unnecessary readback"))
+    mod.ensure_init(source, run)
+
+
+def test_changed_init_is_rejected_after_share_identity_changes(tmp_path, monkeypatch):
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    mod.ensure_init(source, run)
+    target = run / "init.mp4"
+    target.write_bytes(b"wrong! init")
+    original_id = mod._id
+
+    def remounted_identity(path):
+        identity = original_id(path)
+        if path == target:
+            identity[0] += 1
+            identity[1] += 1
+        return identity
+
+    monkeypatch.setattr(mod, "_id", remounted_identity)
+    with pytest.raises(ValueError, match="destination content changed"):
+        mod.ensure_init(source, run)
+
+
+def test_prepared_init_recovers_after_share_identity_changes(tmp_path, monkeypatch):
+    """An init prepared before a crash survives a later share remount."""
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    publish = mod._publish
+
+    def interrupt(src, dst):
+        if dst.name == "init.mp4":
+            raise OSError("interrupted before publish")
+        publish(src, dst)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(mod, "_publish", interrupt)
+        with pytest.raises(OSError, match="interrupted"):
+            mod.ensure_init(source, run)
+    original_id = mod._id
+
+    def remounted_identity(path):
+        identity = original_id(path)
+        if path.name.startswith(".viseron-tier-move-init-"):
+            identity[0] += 1
+            identity[1] += 1
+        return identity
+
+    monkeypatch.setattr(mod, "_id", remounted_identity)
+    mod.ensure_init(source, run)
+    assert (run / "init.mp4").read_bytes() == b"camera init"
+
+
+def test_remount_verification_rejects_init_that_changes_during_read(tmp_path, monkeypatch):
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    mod.ensure_init(source, run)
+    target = run / "init.mp4"
+    original_id = mod._id
+    count = 0
+
+    def unstable_identity(path):
+        nonlocal count
+        identity = original_id(path)
+        if path == target:
+            count += 1
+            identity[0] += count
+        return identity
+
+    monkeypatch.setattr(mod, "_id", unstable_identity)
+    with pytest.raises(ValueError, match="destination content changed"):
+        mod.ensure_init(source, run)
+
+
+def test_legacy_marker_recovers_when_source_identity_changes(tmp_path, monkeypatch):
+    """Legacy markers gain a digest after verifying both sides on a remount."""
+    import json
+    from viseron.components.storage import run_init_prototype as mod
+
+    source = tmp_path / "source"
+    source.write_bytes(b"camera init")
+    run = tmp_path / "run"
+    mod.ensure_init(source, run)
+    marker = run / MARKER
+    record = json.loads(marker.read_text())
+    record["version"] = 1
+    del record["digest"]
+    marker.write_text(json.dumps(record))
+    original_id = mod._id
+
+    def remounted_source(path):
+        identity = original_id(path)
+        if path == source:
+            identity[0] += 1
+        return identity
+
+    monkeypatch.setattr(mod, "_id", remounted_source)
+    mod.ensure_init(source, run)
+    assert json.loads(marker.read_text())["version"] == 2

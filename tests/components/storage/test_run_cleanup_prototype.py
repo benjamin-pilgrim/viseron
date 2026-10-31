@@ -83,3 +83,43 @@ class RunCleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_orphan_cleanup_reaps_old_init_temporaries_but_keeps_owned(tmp_path):
+    """Crash leftovers can be removed, while a prepared init remains replayable."""
+    import json
+    import os
+    import time
+    from viseron.components.storage.jobs import OrphanedFilesCleanup
+
+    camera = tmp_path / "camera"
+    run = camera / RUN
+    run.mkdir(parents=True)
+    owned = run / ".viseron-tier-move-init-aaaaaaaa"
+    orphan = run / ".viseron-tier-move-init-bbbbbbbb"
+    marker_temp = run / ".viseron-tier-move-init-marker-cccccccc"
+    for path in (owned, orphan, marker_temp):
+        path.write_bytes(b"init")
+        old = time.time() - 7200
+        os.utime(path, (old, old))
+    (run / ".viseron-tier-move-run-init.json").write_text(
+        json.dumps({"version": 2, "temp": owned.name, "source": [1, 2, 3, 4], "destination": [1, 2, 3, 4], "digest": "digest"})
+    )
+    session = Mock()
+    cm = Mock()
+    cm.__enter__ = Mock(return_value=session)
+    cm.__exit__ = Mock(return_value=False)
+    runner = SimpleNamespace(
+        name="test",
+        paths=[str(camera)],
+        tier_markers={},
+        ignored_files=[],
+        kill_event=SimpleNamespace(is_set=lambda: False),
+        get_session=lambda: cm,
+        log_progress=lambda _: None,
+    )
+    with patch("viseron.components.storage.jobs.time.sleep"):
+        OrphanedFilesCleanup.work(runner)
+    assert owned.exists()
+    assert not orphan.exists()
+    assert not marker_temp.exists()
