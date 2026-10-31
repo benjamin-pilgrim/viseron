@@ -171,7 +171,8 @@ for pid in os.listdir('/proc'):
     except (FileNotFoundError, ProcessLookupError, PermissionError): pass
 else: raise SystemExit('FAIL: no recorder process found')
 PYTHON
-run1=$(list_runs | head -1)
+mapfile -t initial_runs < <(list_runs | sort)
+run1=${initial_runs[0]}
 # Exercise the same nginx route used by the browser, not just the backend.
 # Files can precede database indexing, so allow the route to become ready.
 podman exec -i "$app" python3 - "${run1##*/}" <<'PYTHON'
@@ -206,6 +207,7 @@ find "$run1" -maxdepth 1 -type f \( -name init.mp4 -o -name '*.m4s' \) -print0 |
 echo "First run: $run1"
 if [[ -n ${VISERON_TEST_DEBUG_PAUSE:-} ]]; then sleep "$VISERON_TEST_DEBUG_PAUSE"; fi
 # Kill only the HLS-writing ffmpeg process in this disposable container.
+runs_before_ffmpeg_restart=$(list_runs | wc -l)
 podman exec "$app" python3 -c '
 import os, signal
 for item in os.listdir("/proc"):
@@ -219,7 +221,7 @@ for item in os.listdir("/proc"):
     except (FileNotFoundError, ProcessLookupError, PermissionError): pass
 else: raise SystemExit("FAIL: no HLS-writing FFmpeg process found")
 '
-wait_runs 2
+wait_runs "$((runs_before_ffmpeg_restart + 1))"
 mapfile -t runs < <(list_runs | sort)
 run2=${runs[-1]}
 [[ "$run1" < "$run2" ]] || { echo 'FAIL: restarted run is not ordered after the first run'; exit 1; }
@@ -236,9 +238,10 @@ kill -CONT "$publisher"
 wait_runs "$((runs_before_outage + 1))"
 echo "Camera publisher reconnected and recording resumed."
 # Restart Viseron against the same persisted storage and database, then stop it.
+runs_before_container_restart=$(list_runs | wc -l)
 podman stop -t 60 "$app" >/dev/null
 podman start "$app" >/dev/null
-wait_runs 4
+wait_runs "$((runs_before_container_restart + 1))"
 mapfile -t runs < <(list_runs | sort)
 echo "Runs after container restart:"; printf '%s\n' "${runs[@]}"
 [[ "$run2" < "${runs[-1]}" ]] || { echo 'FAIL: container restart did not create a later run'; exit 1; }
