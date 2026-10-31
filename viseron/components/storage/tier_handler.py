@@ -74,6 +74,7 @@ from viseron.components.storage.storage_subprocess import (
     DataItem,
     DataItemDeleteFile,
     DataItemMoveFile,
+    StorageCallbackCapacityError,
 )
 from viseron.components.storage.util import (
     EventFileCreated,
@@ -341,6 +342,11 @@ class TierHandler(FileSystemEventHandler):
                 item, self.on_check_tier_result
             )
             return True
+        except StorageCallbackCapacityError:
+            with self._check_tier_lock:
+                self._tier_check_in_progress = False
+            self._logger.warning("Storage worker busy; tier check deferred")
+            return False
         except Exception:
             # Release the slot if the command never made it out, otherwise this
             # tier would never be checked again.
@@ -1319,28 +1325,28 @@ def move_file(
     delete the old one.
     """
     logger.debug("Moving file from %s to %s", src, dst)
+    file_meta = None
+    pending_move = None
     try:
         with get_session() as session:
             sel = select(Files).where(Files.path == src)
             res = session.execute(sel).scalar_one()
-            storage.temporary_files_meta[dst] = FilesMeta(
+            file_meta = FilesMeta(
                 orig_ctime=res.orig_ctime,
                 duration=res.duration,
                 file_key=res.file_key,
             )
-            storage.pending_moves[src] = PendingMove(
+            pending_move = PendingMove(
                 dst=dst, tier_id=curr_tier_id + 1, tier_path=dst_tier_path
             )
-    except NoResultFound as error:
-        logger.debug(f"Failed to find metadata for {src}: {error}")
-        with get_session() as session:
-            stmt = delete(Files).where(Files.path == src)
-            session.execute(stmt)
-            session.commit()
-        delete_file(
-            storage,
+            storage.temporary_files_meta[dst] = file_meta
+            storage.pending_moves[src] = pending_move
+    except NoResultFound:
+        logger.warning(
+            "Cannot move %s: source metadata is missing; leaving the file in place",
             src,
         )
+        return
 
     def _move_file_callback(
         item: DataItemMoveFile,
@@ -1361,14 +1367,23 @@ def move_file(
                 store=False,
             )
 
-    storage.tier_check_worker_send_command(
-        DataItemMoveFile(
-            cmd="move_file",
-            src=src,
-            dst=dst,
-        ),
-        callback=_move_file_callback,
-    )
+    try:
+        storage.tier_check_worker_send_command(
+            DataItemMoveFile(
+                cmd="move_file",
+                src=src,
+                dst=dst,
+            ),
+            callback=_move_file_callback,
+        )
+    except Exception:
+        # No worker can complete a command that was not accepted. Avoid
+        # removing state replaced by another operation in the meantime.
+        if file_meta is not None and storage.temporary_files_meta.get(dst) is file_meta:
+            storage.temporary_files_meta.pop(dst, None)
+        if pending_move is not None and storage.pending_moves.get(src) is pending_move:
+            storage.pending_moves.pop(src, None)
+        raise
 
 
 def _lock_path(session: Session, path: str) -> None:

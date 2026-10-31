@@ -34,12 +34,13 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Upper bound on the parent's pending-callback dict. check_tier jobs are sent
-# with a callback, but DedupCheckQueue drops superseded jobs in the subprocess
-# so those jobs never produce a reply and their callbacks would otherwise stay
-# in _callbacks forever. Evicting the oldest entries FIFO past this cap keeps
-# the dict bounded; a lost entry only means a future reply becomes a no-op pop.
+# Upper bound on the parent's pending callbacks. Existing callbacks must remain
+# registered until their operations complete; reject new tracked work at capacity.
 MAX_PENDING_CALLBACKS = 10_000
+
+
+class StorageCallbackCapacityError(RuntimeError):
+    """Tracked storage work cannot be accepted until a callback completes."""
 
 
 @dataclass
@@ -185,11 +186,8 @@ class TierCheckWorker(SubProcessWorker):
     def __init__(self, vis: Viseron, cpulimit: int | None, workers: int) -> None:
         self._cpulimit = cpulimit
         self._workers = workers
-        # OrderedDict so the oldest pending callback can be evicted FIFO once
-        # MAX_PENDING_CALLBACKS is reached. send_command (caller thread) and
-        # work_output (subprocess output thread) both mutate _callbacks, so all
-        # access is guarded by _callbacks_lock to keep the insert+len+popitem
-        # sequence atomic against concurrent pops.
+        # send_command and work_output run on different threads, so admission
+        # and callback removal must be guarded by the same lock.
         self._callbacks: OrderedDict[
             str, Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]
         ] = OrderedDict()
@@ -225,24 +223,23 @@ class TierCheckWorker(SubProcessWorker):
         | None,
     ) -> None:
         """Send command to the subprocess."""
-        evicted: str | None = None
+        callback_id: str | None = None
         if callback is not None:
-            item.callback_id = str(next(self._next_callback_id))
             with self._callbacks_lock:
-                self._callbacks[item.callback_id] = callback
-                if len(self._callbacks) > MAX_PENDING_CALLBACKS:
-                    evicted, _ = self._callbacks.popitem(last=False)
-        if evicted is not None:
-            # Means the subprocess is taking longer to reply than we can
-            # generate new jobs. The evicted callback's reply will later
-            # surface as a benign "No callback found" miss in work_output.
-            LOGGER.warning(
-                "Pending callbacks exceeded %d, evicted oldest id=%s; "
-                "its reply will be dropped when it arrives",
-                MAX_PENDING_CALLBACKS,
-                evicted,
-            )
-        self.input_queue.put(item)
+                if len(self._callbacks) >= MAX_PENDING_CALLBACKS:
+                    raise StorageCallbackCapacityError(
+                        "Storage worker callback capacity reached"
+                    )
+                callback_id = str(next(self._next_callback_id))
+                item.callback_id = callback_id
+                self._callbacks[callback_id] = callback
+        try:
+            self.input_queue.put(item)
+        except Exception:
+            if callback_id is not None:
+                with self._callbacks_lock:
+                    self._callbacks.pop(callback_id, None)
+            raise
 
     def work_output(
         self, item: DataItem | DataItemMoveFile | DataItemDeleteFile
@@ -256,9 +253,6 @@ class TierCheckWorker(SubProcessWorker):
         if callback:
             callback(item)
         else:
-            # Expected when the callback was FIFO-evicted in send_command
-            # because MAX_PENDING_CALLBACKS was exceeded; logged at DEBUG so
-            # it doesn't spam under sustained load.
             LOGGER.debug(
                 "No callback found for id=%s cmd=%s",
                 item.callback_id,

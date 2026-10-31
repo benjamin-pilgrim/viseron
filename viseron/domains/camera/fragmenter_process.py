@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess as sp
+import uuid
 from typing import TYPE_CHECKING
 
 import psutil
@@ -438,12 +439,20 @@ class FragmenterWork(ChildProcessWork):
                 )
                 self._move_to_segments_folder(file, orig_ctime)
             else:
-                self._logger.error(f"Failed to get extinf for {file}")
-                os.remove(os.path.join(self.temp_segments_folder, file))
+                # A recorder restart can replace the playlist while older segments
+                # are still queued. Keep those bytes outside the scanned folder so
+                # they cannot block newer segments and can be recovered manually.
+                recovery_dir = os.path.join(
+                    self.segments_folder + ".recovery", uuid.uuid4().hex
+                )
+                os.makedirs(recovery_dir, exist_ok=True)
+                destination = os.path.join(recovery_dir, file)
+                shutil.move(os.path.join(self.temp_segments_folder, file), destination)
+                self._logger.error(
+                    "Failed to get extinf for %s; segment retained at %s. "
+                    "Its matching initialization data may be unavailable.",
+                    file,
+                    destination,
+                )
         except Exception as err:  # pylint: disable=broad-except
             self._logger.error(f"Failed to process m4s file {file}", exc_info=err)
-        finally:
-            try:
-                os.remove(os.path.join(self.temp_segments_folder, file))
-            except FileNotFoundError:
-                pass

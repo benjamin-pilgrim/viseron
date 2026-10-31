@@ -751,3 +751,50 @@ def test_timelapse_frame_metadata_uses_segment_orig_ctime(
     assert order.mock_calls.index(frame_meta) < order.mock_calls.index(frame_move)
     segment_meta = order.output_queue.put.call_args_list[0].args[0]
     assert segment_meta["orig_ctime"] == expected_orig_ctime
+
+
+def test_missing_segment_metadata_retains_file_for_recovery(tmp_path) -> None:
+    """A replaced playlist must not destroy a queued recording segment."""
+    temp = tmp_path / "temp"
+    target = tmp_path / "recordings" / "camera"
+    temp.mkdir()
+    target.mkdir(parents=True)
+    segment = temp / "1723111156.m4s"
+    segment.write_bytes(b"recorded segment")
+    work = _fragmenter_work(str(temp), str(target))
+    with patch.object(work, "_read_m3u8", return_value="#EXTM3U\n"):
+        work._handle_m4s(segment.name)
+    retained = list((tmp_path / "recordings" / "camera.recovery").rglob(segment.name))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b"recorded segment"
+    assert not segment.exists()
+
+
+def test_segment_processing_error_keeps_source(tmp_path) -> None:
+    """Unexpected processing failures must leave the source for retry."""
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    segment = temp / "1723111156.m4s"
+    segment.write_bytes(b"recorded segment")
+    work = _fragmenter_work(str(temp), str(tmp_path / "target"))
+    with patch.object(work, "_read_m3u8", side_effect=OSError("unavailable")):
+        work._handle_m4s(segment.name)
+    assert segment.read_bytes() == b"recorded segment"
+
+
+def test_recovery_move_error_keeps_source(tmp_path) -> None:
+    """An unavailable recovery directory must not discard the source."""
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    segment = temp / "1723111156.m4s"
+    segment.write_bytes(b"recorded segment")
+    work = _fragmenter_work(str(temp), str(tmp_path / "target"))
+    with (
+        patch.object(work, "_read_m3u8", return_value="#EXTM3U\n"),
+        patch(
+            "viseron.domains.camera.fragmenter_process.shutil.move",
+            side_effect=OSError("full"),
+        ),
+    ):
+        work._handle_m4s(segment.name)
+    assert segment.read_bytes() == b"recorded segment"

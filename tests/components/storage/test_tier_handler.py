@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 from sqlalchemy import event, insert, select, text
+from sqlalchemy.exc import NoResultFound
 from watchdog.events import FileCreatedEvent, FileDeletedEvent
 
 from viseron.components.storage import TIER_CATEGORIES, Storage
@@ -41,7 +42,10 @@ from viseron.components.storage.models import (
     PostProcessorResults,
     Recordings,
 )
-from viseron.components.storage.storage_subprocess import DataItemMoveFile
+from viseron.components.storage.storage_subprocess import (
+    DataItemMoveFile,
+    StorageCallbackCapacityError,
+)
 from viseron.components.storage.tier_handler import (
     SNAPSHOT_REFERENCE_MODELS,
     EventClipTierHandler,
@@ -719,6 +723,13 @@ def test_find_next_tier_segments(vis: Viseron):
     assert result is None
 
 
+@pytest.fixture
+def no_tier_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid starting filesystem observers in configuration-only tests."""
+    monkeypatch.setattr(TierHandler, "_start_observer", lambda _: None)
+
+
+@pytest.mark.usefixtures("no_tier_observer")
 def test_continuous_enabled_is_structural_only(vis: MockViseron) -> None:
     """continuous_enabled reflects config only, never live schedule state.
 
@@ -761,6 +772,7 @@ def test_continuous_enabled_is_structural_only(vis: MockViseron) -> None:
     assert tier_handler._create_dataitem().files_enabled is True
 
 
+@pytest.mark.usefixtures("no_tier_observer")
 def test_create_dataitem_passes_continuous_schedule_entries(
     vis: MockViseron,
 ) -> None:
@@ -798,6 +810,7 @@ def test_create_dataitem_passes_continuous_schedule_entries(
     assert item.continuous_lookback_seconds == 7
 
 
+@pytest.mark.usefixtures("no_tier_observer")
 def test_create_dataitem_continuous_schedule_none_when_omitted(
     vis: MockViseron,
 ) -> None:
@@ -832,6 +845,7 @@ def test_create_dataitem_continuous_schedule_none_when_omitted(
     assert item.files_enabled is True
 
 
+@pytest.mark.usefixtures("no_tier_observer")
 def test_continuous_enabled_now_false_when_continuous_recording_disabled(
     vis: MockViseron,
 ) -> None:
@@ -1400,3 +1414,85 @@ def test_snapshot_references_untouched_on_move_failure(
     callback(DataItemMoveFile(cmd="move_file", src=src, dst=dst, error="boom"))
 
     assert _snapshot_paths(db_storage, model) == [src]
+
+
+def test_rejected_move_clears_pending_metadata(
+    vis: MockViseron, tmp_path: Path
+) -> None:
+    """A move that was never queued must not leave phantom pending state."""
+    src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
+    row = Mock(orig_ctime=utcnow(), duration=1.0, file_key=123)
+    session = MagicMock()
+    session.__enter__.return_value.execute.return_value.scalar_one.return_value = row
+    storage = Mock(spec=Storage)
+    storage.temporary_files_meta = {}
+    storage.pending_moves = {}
+    storage.tier_check_worker_send_command.side_effect = RuntimeError(
+        "callback capacity"
+    )
+    with pytest.raises(RuntimeError, match="callback capacity"):
+        move_file(
+            vis,
+            storage,
+            lambda: session,
+            "test",
+            0,
+            "recorder",
+            "segments",
+            src,
+            dst,
+            str(tmp_path),
+            logging.getLogger(__name__),
+        )
+    assert storage.temporary_files_meta == {}
+    assert storage.pending_moves == {}
+
+
+def test_full_worker_releases_tier_check_slot() -> None:
+    """A deferred check can be scheduled after capacity becomes available."""
+    handler = TierHandler.__new__(TierHandler)
+    handler._check_tier_lock = threading.Lock()
+    handler._tier_check_in_progress = False
+    handler._time_of_last_call = utcnow()
+    handler._throttle_period = datetime.timedelta(0)
+    handler._logger = logging.getLogger(__name__)
+    handler._storage = Mock()
+    handler._storage.tier_check_worker_send_command.side_effect = (
+        StorageCallbackCapacityError("full")
+    )
+    handler._create_dataitem = Mock()  # type: ignore[method-assign]
+    assert handler.check_tier(force=True) is False
+    assert handler._tier_check_in_progress is False
+    handler._storage.tier_check_worker_send_command.side_effect = None
+    assert handler.check_tier(force=True) is True
+
+
+def test_missing_move_metadata_does_not_schedule_deletion_or_move(
+    vis: MockViseron, tmp_path: Path
+) -> None:
+    """Missing DB metadata must not cause the only on-disk copy to be deleted."""
+    src = tmp_path / "source.m4s"
+    src.write_bytes(b"only recording")
+    session = MagicMock()
+    session.__enter__.return_value.execute.return_value.scalar_one.side_effect = (
+        NoResultFound()
+    )
+    storage = Mock(spec=Storage)
+    storage.temporary_files_meta = {}
+    storage.pending_moves = {}
+    move_file(
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        str(src),
+        str(tmp_path / "dest.m4s"),
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
+    storage.tier_check_worker_send_command.assert_not_called()
+    assert src.read_bytes() == b"only recording"
+    assert not storage.pending_moves

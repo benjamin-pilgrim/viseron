@@ -1,13 +1,18 @@
 """Test the storage subprocess helpers."""
 
 import datetime
+from collections import OrderedDict
+from itertools import count
 from queue import Empty, Queue
+from threading import Lock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from viseron.components.storage.storage_subprocess import (
     DataItem,
     DedupCheckQueue,
+    TierCheckWorker,
 )
 
 
@@ -147,3 +152,38 @@ class TestDedupCheckQueue:
 
         with pytest.raises(Empty):
             queue.get(timeout=0.01)
+
+
+def test_full_callback_capacity_rejects_new_work_without_losing_inflight() -> None:
+    """Overload must not discard the callback that releases an active tier."""
+    worker = TierCheckWorker.__new__(TierCheckWorker)
+    worker._callbacks = OrderedDict()
+    worker._callbacks_lock = Lock()
+    worker._next_callback_id = count(1)
+    worker.input_queue = Queue()
+    first, second = _make_item(callback_id=None), _make_item(callback_id=None)
+    first_callback, second_callback = Mock(), Mock()
+    with patch(
+        "viseron.components.storage.storage_subprocess.MAX_PENDING_CALLBACKS", 1
+    ):
+        worker.send_command(first, first_callback)
+        with pytest.raises(RuntimeError, match="callback capacity"):
+            worker.send_command(second, second_callback)
+    assert worker.input_queue.get_nowait() is first
+    assert worker.input_queue.empty()
+    worker.work_output(first)
+    first_callback.assert_called_once_with(first)
+    second_callback.assert_not_called()
+
+
+def test_queue_failure_releases_callback_capacity() -> None:
+    """An enqueue error must not leak the callback reservation."""
+    worker = TierCheckWorker.__new__(TierCheckWorker)
+    worker._callbacks = OrderedDict()
+    worker._callbacks_lock = Lock()
+    worker._next_callback_id = count(1)
+    worker.input_queue = Mock()
+    worker.input_queue.put.side_effect = RuntimeError("queue failed")
+    with pytest.raises(RuntimeError, match="queue failed"):
+        worker.send_command(_make_item(callback_id=None), Mock())
+    assert not worker._callbacks

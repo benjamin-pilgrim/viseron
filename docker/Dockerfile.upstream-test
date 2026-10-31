@@ -6,5 +6,6 @@ COPY viseron/components/storage /src/viseron/components/storage
 COPY viseron/components/webserver/api/v1/hls.py /src/viseron/components/webserver/api/v1/hls.py
 COPY viseron/domains/camera/__init__.py /src/viseron/domains/camera/__init__.py
 COPY viseron/domains/camera/fragmenter.py /src/viseron/domains/camera/fragmenter.py
+COPY viseron/domains/camera/fragmenter_process.py /src/viseron/domains/camera/fragmenter_process.py
 
 ENV VISERON_GIT_COMMIT=dbc12197073d420e64a63c1633aaa605e2a07ea2-local-wip
