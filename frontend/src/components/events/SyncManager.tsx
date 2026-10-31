@@ -132,10 +132,6 @@ function SyncManager({ children }: SyncManagerProps) {
             }
           : null;
     }
-    // Do not let an older player position override a fresh timeline seek.
-    // Unlike an awaited delay, each tick reads the latest play and seek state.
-    if (now - (lastSeek.current.at ?? -Infinity) < SEEK_SETTLE_MS) return;
-
     const players = hlsRefs.filter(
       (player): player is React.MutableRefObject<Hls> =>
         player.current !== null && player.current.media !== null,
@@ -156,6 +152,11 @@ function SyncManager({ children }: SyncManagerProps) {
         }
       });
     }
+
+    // Observe a player reaching the target during the settling period. At
+    // high speeds it can be well past the fixed target by the time it ends.
+    // Do not use it as a reference until the settle period has elapsed.
+    if (now - (lastSeek.current.at ?? -Infinity) < SEEK_SETTLE_MS) return;
 
     // Sync mute state
     players.forEach((player) => {

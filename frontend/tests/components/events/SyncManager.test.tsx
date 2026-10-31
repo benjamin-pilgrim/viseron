@@ -384,6 +384,43 @@ describe("multi-camera playback", () => {
       1_700_000_010,
     );
   });
+  it("accepts a freshly sought player advancing at 10x without rewinding", async () => {
+    vi.useFakeTimers();
+    const fresh = makePlayer(1_700_000_060_000);
+    const stale = makePlayer(1_700_000_060_000);
+    useHlsStore.setState({ hlsRefs: [fresh, stale] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 10,
+      requestedTimestamp: 1_700_000_050,
+      playingDateRef: { current: 1_700_000_060 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    const seekAt = performance.now();
+    Object.defineProperty(fresh.current, "playingDate", {
+      configurable: true,
+      get: () =>
+        new Date(1_700_000_010_000 + (performance.now() - seekAt) * 10),
+    });
+    await act(async () => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(useReferencePlayerStore.getState().referencePlayer).toBe(
+      fresh.current,
+    );
+    expect(
+      useReferencePlayerStore.getState().playingDateRef.current,
+    ).toBeGreaterThan(1_700_000_020);
+    expect(fresh.current.media!.currentTime).toBe(12);
+  });
   it("does not jump over a distant unavailable gap", async () => {
     vi.useFakeTimers();
     const first = makePlayer(1_700_000_020_000);
