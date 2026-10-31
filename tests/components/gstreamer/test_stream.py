@@ -97,3 +97,14 @@ def test_frame_wait_times_out_so_exited_child_can_be_restarted(stream):
     assert stream.read() is None
     stream._frame_queue.get.assert_called_once_with(timeout=1)
     stream._logger.error.assert_not_called()
+
+
+def test_close_pipe_refuses_to_release_a_surviving_child(stream):
+    """A replacement must not start while the old writer may still run."""
+    import pytest
+
+    stream._process_frames_proc = MagicMock()
+    stream._process_frames_proc.exitcode = None
+    with pytest.raises(RuntimeError, match="did not exit"):
+        stream.close_pipe()
+    assert stream._process_frames_proc.join.call_count == 2

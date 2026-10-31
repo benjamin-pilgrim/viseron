@@ -180,6 +180,9 @@ class Stream(FFmpegStream):
         self._process_frames_proc.join(5)
         self._process_frames_proc.terminate()
         self._process_frames_proc.kill()
+        self._process_frames_proc.join(5)
+        if self._process_frames_proc.exitcode is None:
+            raise RuntimeError("GStreamer process did not exit after being killed")
         pop_if_full(self._frame_queue, None)
         self._logger.debug(f"{self.alias} exited")
 

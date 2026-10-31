@@ -13,7 +13,7 @@ def _camera():
     stream.poll.return_value = 1
     return SimpleNamespace(
         decode_error=Event(), _capture_stop=Event(), _capture_lock=Lock(),
-        _poll_timer=0, _thread_stuck=False, _capture_frames=True,
+        _poll_timer=0, _thread_stuck=False, _capture_frames=True, _pipe_unreleased=False,
         stream=stream, connected=False, still_image_available=False,
         still_image_configured=False, _logger=MagicMock(), current_frame=None,
     )
@@ -130,3 +130,38 @@ def test_watchdog_restarts_dead_reader():
     assert old_stop.is_set()
     assert camera._frame_reader is not old_reader
     camera._frame_reader.start.assert_called_once()
+
+
+def test_reader_exception_closes_pipe_before_watchdog_replacement():
+    """An exception cannot leave an older writer active behind a new reader."""
+    import pytest
+
+    camera = _camera()
+    camera.stream.read.side_effect = RuntimeError("reader failed")
+    with pytest.raises(RuntimeError, match="reader failed"):
+        Camera.read_frames(camera, camera._capture_stop)
+    camera.stream.close_pipe.assert_called_once()
+    assert not camera._pipe_unreleased
+    old_reader = MagicMock()
+    old_reader.is_alive.return_value = False
+    camera._frame_reader = old_reader
+    camera._create_frame_reader = MagicMock(return_value=MagicMock())
+    Camera._start_camera(camera)
+    camera._frame_reader.start.assert_called_once()
+
+
+def test_failed_close_blocks_watchdog_replacement():
+    """An ambiguous pipe close cannot authorize another writer."""
+    import pytest
+
+    camera = _camera()
+    camera.stream.read.side_effect = RuntimeError("reader failed")
+    camera.stream.close_pipe.side_effect = OSError("close failed")
+    with pytest.raises(OSError, match="close failed"):
+        Camera.read_frames(camera, camera._capture_stop)
+    assert camera._pipe_unreleased
+    camera._frame_reader = MagicMock()
+    camera._frame_reader.is_alive.return_value = False
+    camera._create_frame_reader = MagicMock()
+    Camera._start_camera(camera)
+    camera._create_frame_reader.assert_not_called()

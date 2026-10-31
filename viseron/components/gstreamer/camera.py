@@ -297,6 +297,7 @@ class Camera(AbstractCamera):
         self._capture_frames = False
         self._capture_stop = Event()
         self._capture_lock = Lock()
+        self._pipe_unreleased = False
         self._thread_stuck = False
         self.resolution = None
         self.decode_error = Event()
@@ -341,58 +342,64 @@ class Camera(AbstractCamera):
 
         if stop_event.is_set():
             return
-        self.stream.start_pipe()
+        self._pipe_unreleased = True
+        try:
+            self.stream.start_pipe()
+            while not stop_event.is_set():
+                if self.decode_error.is_set():
+                    self._poll_timer = utcnow().timestamp()
+                    self.connected = False
+                    self.still_image_available = self.still_image_configured
+                    if stop_event.wait(5):
+                        break
+                    self._logger.error("Restarting frame pipe")
+                    self.stream.close_pipe()
+                    self._pipe_unreleased = False
+                    if stop_event.is_set():
+                        self._logger.debug("Frame reader stopped")
+                        return
+                    self._pipe_unreleased = True
+                    self.stream.start_pipe()
+                    self.decode_error.clear()
+                    empty_frames = 0
 
-        while not stop_event.is_set():
-            if self.decode_error.is_set():
-                self._poll_timer = utcnow().timestamp()
-                self.connected = False
-                self.still_image_available = self.still_image_configured
-                if stop_event.wait(5):
+                self.current_frame = self.stream.read()
+                if self.current_frame:
+                    self.connected = True
+                    self.still_image_available = True
+                    empty_frames = 0
+                    self._poll_timer = utcnow().timestamp()
+                    self._vis.dispatch_event(
+                        self.frame_bytes_topic,
+                        EventFrameBytesData(
+                            camera_identifier=self.identifier,
+                            shared_frame=self.current_frame,
+                        ),
+                        store=False,
+                    )
+                    continue
+
+                if self._thread_stuck:
                     break
-                self._logger.error("Restarting frame pipe")
+
+                if self.stream.poll() is not None:
+                    self._logger.error("Frame reader process has exited")
+                    self.decode_error.set()
+                    continue
+
+                if getattr(self.stream, "frame_wait_timed_out", False) is True:
+                    continue
+                empty_frames += 1
+                if empty_frames >= MAX_EMPTY_FRAMES:
+                    self._logger.error("Did not receive a frame")
+                    self.decode_error.set()
+
+        finally:
+            self.connected = False
+            if self._pipe_unreleased:
                 self.stream.close_pipe()
-                if stop_event.is_set():
-                    self._logger.debug("Frame reader stopped")
-                    return
-                self.stream.start_pipe()
-                self.decode_error.clear()
-                empty_frames = 0
-
-            self.current_frame = self.stream.read()
-            if self.current_frame:
-                self.connected = True
-                self.still_image_available = True
-                empty_frames = 0
-                self._poll_timer = utcnow().timestamp()
-                self._vis.dispatch_event(
-                    self.frame_bytes_topic,
-                    EventFrameBytesData(
-                        camera_identifier=self.identifier,
-                        shared_frame=self.current_frame,
-                    ),
-                    store=False,
-                )
-                continue
-
-            if self._thread_stuck:
-                break
-
-            if self.stream.poll() is not None:
-                self._logger.error("Frame reader process has exited")
-                self.decode_error.set()
-                continue
-
-            if getattr(self.stream, "frame_wait_timed_out", False) is True:
-                continue
-            empty_frames += 1
-            if empty_frames >= MAX_EMPTY_FRAMES:
-                self._logger.error("Did not receive a frame")
-                self.decode_error.set()
-
-        self.connected = False
-        self.stream.close_pipe()
-        self._logger.debug("Frame reader stopped")
+                self._pipe_unreleased = False
+            self._logger.debug("Frame reader stopped")
 
     def poll_target(self) -> None:
         """Close pipe when RestartableThread.poll_timeout has been reached."""
@@ -443,6 +450,9 @@ class Camera(AbstractCamera):
                     daemon=True,
                 ).start()
                 return
+            if self._pipe_unreleased:
+                self._logger.error("Cannot start: previous pipe was not safely closed")
+                return
             self._frame_reader = self._create_frame_reader(stop_event)
             self._frame_reader.start()
 
@@ -451,6 +461,9 @@ class Camera(AbstractCamera):
         previous.join()
         with self._capture_lock:
             if stop_event.is_set() or self._capture_stop is not stop_event:
+                return
+            if self._pipe_unreleased:
+                self._logger.error("Cannot start: previous pipe was not safely closed")
                 return
             self._frame_reader = self._create_frame_reader(stop_event)
             self._frame_reader.start()
