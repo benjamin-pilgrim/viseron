@@ -139,6 +139,9 @@ else: raise SystemExit("FAIL: no HLS-writing FFmpeg process found")
 '
 wait_runs 2
 mapfile -t runs < <(list_runs | sort)
+run2=${runs[-1]}
+[[ "$run1" < "$run2" ]] || { echo 'FAIL: restarted run is not ordered after the first run'; exit 1; }
+find "$run2" -maxdepth 1 -type f \( -name init.mp4 -o -name '*.m4s' \) -print0 | sort -z | xargs -0 sha256sum > "$root/post-ffmpeg-restart.sha256"
 echo "Runs after FFmpeg restart:"; printf '%s\n' "${runs[@]}"
 sha256sum -c "$root/pre-restart.sha256"
 # Restart Viseron against the same persisted storage and database, then stop it.
@@ -147,7 +150,9 @@ podman start "$app" >/dev/null
 wait_runs 3
 mapfile -t runs < <(list_runs | sort)
 echo "Runs after container restart:"; printf '%s\n' "${runs[@]}"
+[[ "$run2" < "${runs[-1]}" ]] || { echo 'FAIL: container restart did not create a later run'; exit 1; }
 sha256sum -c "$root/pre-restart.sha256"
+sha256sum -c "$root/post-ffmpeg-restart.sha256"
 podman stop -t 60 "$app" >/dev/null
 # PostgreSQL is now unavailable; recover solely from retained run files.
 for run in "${runs[@]}"; do
