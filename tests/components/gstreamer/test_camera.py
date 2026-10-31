@@ -165,3 +165,35 @@ def test_failed_close_blocks_watchdog_replacement():
     camera._create_frame_reader = MagicMock()
     Camera._start_camera(camera)
     camera._create_frame_reader.assert_not_called()
+
+
+def test_watchdog_unregisters_dead_reader_before_replacement_and_respects_stop():
+    """Subsequent watchdog cycles cannot revive a user-stopped camera."""
+    from threading import RLock
+    from viseron.watchdog.thread_watchdog import ThreadWatchDog
+
+    camera = _camera()
+    camera._camera_state_lock = RLock()
+    camera.stopped = Event()
+    old = MagicMock()
+    old.started = True
+    old.is_alive.return_value = False
+    old.poll_method = None
+    old.thread_store_category = None
+    old.restart_method = lambda: Camera._watchdog_restart(camera)
+    camera._frame_reader = old
+    new = MagicMock()
+    new.is_alive.return_value = True
+    camera._create_frame_reader = MagicMock(return_value=new)
+    camera.start_camera = lambda: Camera._start_camera(camera)
+    watchdog = object.__new__(ThreadWatchDog)
+    watchdog.registered_items = [old]
+    old.stop.side_effect = lambda: watchdog.registered_items.remove(old)
+    watchdog.watchdog()
+    assert old not in watchdog.registered_items
+    assert camera._frame_reader is new
+    camera.stopped.set()
+    Camera._watchdog_restart(camera)
+    assert camera._create_frame_reader.call_count == 1
+    watchdog.watchdog()
+    assert camera._create_frame_reader.call_count == 1

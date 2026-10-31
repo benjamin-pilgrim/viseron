@@ -318,8 +318,14 @@ class Camera(AbstractCamera):
             poll_target=self.poll_target,
             daemon=True,
             register=True,
-            restart_method=self.start_camera,
+            restart_method=self._watchdog_restart,
         )
+
+    def _watchdog_restart(self) -> None:
+        """Respect an explicit camera stop while handling a watchdog restart."""
+        with self._camera_state_lock:
+            if not self.stopped.is_set():
+                self.start_camera()
 
     def initialize_camera(self) -> None:
         """Start processing of camera frames."""
@@ -405,7 +411,7 @@ class Camera(AbstractCamera):
         """Close pipe when RestartableThread.poll_timeout has been reached."""
         self._logger.error("Timeout waiting for frame")
         self._thread_stuck = True
-        self.stop_camera()
+        self._stop_camera()
 
     def poll_method(self) -> bool:
         """Return true on frame timeout for RestartableThread to trigger a restart."""
@@ -438,6 +444,8 @@ class Camera(AbstractCamera):
         with self._capture_lock:
             if self._capture_frames and self._frame_reader and self._frame_reader.is_alive():
                 return
+            if self._frame_reader and not self._frame_reader.is_alive():
+                self._frame_reader.stop()
             self._capture_stop.set()
             self._capture_frames = True
             stop_event = Event()
