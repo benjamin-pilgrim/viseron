@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Disposable single-camera, local-storage recovery smoke test.
-# Usage: VISERON_TEST_IMAGE=your-image [VISERON_RTSP_IMAGE=your-rtsp-image] \
+# Disposable synthetic audio/video test of recorder timestamp modes.
+# Usage: VISERON_TEST_IMAGE=your-image [VISERON_TEST_TIMESTAMP_MODE=source] \
 #          scripts/test_run_recording.sh /absolute/path/to/checkout
 # See docs/testing/run-recording.md before running.
 set -euo pipefail
@@ -20,8 +20,11 @@ suffix=${root##*/}
 app="${suffix}-app"
 mtx="${suffix}-mtx"
 pod="${suffix}-pod"
-port=${VISERON_TEST_RTSP_PORT:-29472}
+port=${VISERON_TEST_RTSP_PORT:-29474}
+mode=${VISERON_TEST_TIMESTAMP_MODE:-wallclock}
+[[ "$mode" == wallclock || "$mode" == source ]] || { echo "Invalid timestamp mode" >&2; exit 2; }
 cleanup() {
+  [[ -z ${publisher:-} ]] || kill -CONT "$publisher" 2>/dev/null || true
   [[ -z ${publisher:-} ]] || pkill -P "$publisher" 2>/dev/null || true
   [[ -z ${publisher:-} ]] || kill "$publisher" 2>/dev/null || true
   podman stop -t 60 "$app" >/dev/null 2>&1 || true
@@ -32,6 +35,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$root"/{config,segments,recordings,snapshots,thumbnails,event_clips,recovered}
 chmod 777 "$root" "$root"/{config,segments,recordings,snapshots,thumbnails,event_clips}
+mode_config=""
+[[ "$mode" != source ]] || mode_config="        timestamp_mode: source"
 cat > "$root/config/config.yaml" <<CONFIG
 logger:
   default_level: info
@@ -51,18 +56,19 @@ ffmpeg:
       path: /test
       recorder:
         continuous_recording: true
+${mode_config}
 CONFIG
 podman pod create --name "$pod" -p "127.0.0.1:$port:8554/tcp" >/dev/null
 podman run -d --pod "$pod" --name "$mtx" -e MTX_HLS=no "$rtsp_image" >/dev/null
 # Retry publisher startup because MediaMTX needs time to listen.
 (
   while :; do
-    ffmpeg -hide_banner -loglevel warning -re -f lavfi -i testsrc2=size=320x240:rate=15 -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -pix_fmt yuv420p -f rtsp -rtsp_transport tcp "rtsp://127.0.0.1:$port/test" || true
+    ffmpeg -hide_banner -loglevel warning -re -f lavfi -i testsrc2=size=320x240:rate=15 -re -f lavfi -i sine=frequency=1000:sample_rate=48000 -c:a aac -b:a 64k -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -pix_fmt yuv420p -f rtsp -rtsp_transport tcp "rtsp://127.0.0.1:$port/test" || true
     sleep 1
   done
 ) > "$root/publisher.log" 2>&1 &
 publisher=$!
-podman run -d --pod "$pod" --name "$app" \
+podman run -d --pod "$pod" --name "$app" -e S6_KILL_GRACETIME=3000 \
   -v "$repo/viseron:/src/viseron:ro" \
   -v "$root/config:/config" -v "$root/segments:/segments" \
   -v "$root/recordings:/recordings" -v "$root/snapshots:/snapshots" \
@@ -89,6 +95,24 @@ wait_runs() {
   return 1
 }
 wait_runs 1
+# Check the actual running recorder arguments, as opposed to just the config.
+podman exec -i "$app" python3 - "$mode" <<'PYTHON'
+import os, sys
+mode = sys.argv[1]
+for pid in os.listdir('/proc'):
+    if not pid.isdigit(): continue
+    try:
+        args = open('/proc/' + pid + '/cmdline', 'rb').read().split(b'\0')
+        if args and os.path.basename(args[0]).startswith(b'ffmpeg') and b'-hls_segment_filename' in args and any(b'vertical_camera' in arg for arg in args):
+            has_wallclock = b'-use_wallclock_as_timestamps' in args
+            assert has_wallclock == (mode == 'wallclock'), args
+            if has_wallclock:
+                assert args[args.index(b'-use_wallclock_as_timestamps') + 1] == b'1', args
+            print(f'Recorder timestamp mode {mode} verified')
+            break
+    except (FileNotFoundError, ProcessLookupError, PermissionError): pass
+else: raise SystemExit('FAIL: no recorder process found')
+PYTHON
 run1=$(list_runs | head -1)
 # Exercise the same nginx route used by the browser, not just the backend.
 # Files can precede database indexing, so allow the route to become ready.
@@ -144,10 +168,18 @@ run2=${runs[-1]}
 find "$run2" -maxdepth 1 -type f \( -name init.mp4 -o -name '*.m4s' \) -print0 | sort -z | xargs -0 sha256sum > "$root/post-ffmpeg-restart.sha256"
 echo "Runs after FFmpeg restart:"; printf '%s\n' "${runs[@]}"
 sha256sum -c "$root/pre-restart.sha256"
+# Pause the camera publisher and terminate its FFmpeg child, so Viseron sees
+# an actual RTSP outage rather than only a killed recorder process.
+kill -STOP "$publisher"
+pkill -P "$publisher" 2>/dev/null || true
+sleep 10
+kill -CONT "$publisher"
+wait_runs 3
+echo "Camera publisher reconnected and recording resumed."
 # Restart Viseron against the same persisted storage and database, then stop it.
 podman stop -t 60 "$app" >/dev/null
 podman start "$app" >/dev/null
-wait_runs 3
+wait_runs 4
 mapfile -t runs < <(list_runs | sort)
 echo "Runs after container restart:"; printf '%s\n' "${runs[@]}"
 [[ "$run2" < "${runs[-1]}" ]] || { echo 'FAIL: container restart did not create a later run'; exit 1; }
@@ -158,13 +190,13 @@ podman stop -t 60 "$app" >/dev/null
 for run in "${runs[@]}"; do
   name=$(basename "$run")
   python3 "$recovery_script" --output "$root/recovered/$name.m3u8" "$run" 2>&1 | tee "$root/recovered/$name.log"
-  # The smoke camera is video-only H.264. Preserve its demuxer time base:
+  # Preserve the video demuxer time base:
   # the null encoder's default frame-rate time base can round distinct VFR
   # timestamps to the same tick and report a misleading non-monotonic DTS.
   ffmpeg -v error -xerror -protocol_whitelist file,crypto,data \
-    -i "$root/recovered/$name.m3u8" -map 0:v:0 \
+    -i "$root/recovered/$name.m3u8" -map 0:v:0 -map 0:a:0 \
     -fps_mode:v passthrough -enc_time_base:v demux -f null - 2>&1 \
     | tee "$root/recovered/$name.decode.log"
   echo "Recovered and decoded $run"
 done
-echo 'PASS: distinct runs retained after FFmpeg restart and Viseron restart; offline recovery decoded with PostgreSQL stopped.'
+echo "PASS: $mode audio/video runs decoded after camera reconnect, FFmpeg and container restarts with PostgreSQL stopped."
