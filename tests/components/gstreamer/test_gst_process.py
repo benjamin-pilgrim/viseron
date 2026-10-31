@@ -45,3 +45,24 @@ def test_gst_logger_names_matches_the_parent_stream_loggers() -> None:
         f"{stream.__name__}.cam",
         f"{stream.__name__}.cam.gstreamer",
     )
+
+
+def test_terminal_bus_message_stops_pipeline(monkeypatch):
+    """Errors and EOS let the camera observe a terminated child."""
+    from unittest.mock import MagicMock
+
+    for message_type in (gst_process.Gst.MessageType.ERROR, gst_process.Gst.MessageType.EOS):
+        pipeline = MagicMock()
+        message = MagicMock()
+        message.type = message_type
+        pipeline.get_bus.return_value.timed_pop_filtered.return_value = message
+        monkeypatch.setattr(gst_process.Gst, "parse_launch", lambda _pipeline: pipeline)
+        monkeypatch.setattr(gst_process.Gst, "init", lambda _arg: None)
+        monkeypatch.setattr(gst_process.Gst, "debug_remove_log_function", lambda _arg: None)
+        monkeypatch.setattr(gst_process.Gst, "debug_set_default_threshold", lambda _arg: None)
+        monkeypatch.setattr(gst_process.Gst, "debug_add_log_function", lambda *_args: None)
+        queue = MagicMock()
+        runner = gst_process.GstRunner(_config(), queue, MagicMock(is_set=lambda: False))
+        runner.run()
+        pipeline.set_state.assert_any_call(gst_process.Gst.State.NULL)
+        pipeline.get_bus.return_value.timed_pop_filtered.assert_called_once()

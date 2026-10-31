@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+from queue import Empty
 from typing import TYPE_CHECKING, Any
 
 from viseron.components.ffmpeg.stream import FFprobe, Stream as FFmpegStream
@@ -192,7 +193,7 @@ class Stream(FFmpegStream):
         """Return a single frame from Gst buffer."""
         try:
             if self._process_frames_proc:
-                frame_bytes = self._frame_queue.get()
+                frame_bytes = self._frame_queue.get(timeout=1)
                 if self._process_frames_proc_exit.is_set():
                     return None
 
@@ -205,6 +206,8 @@ class Stream(FFmpegStream):
                         (self.width, self.height),
                         self._camera_identifier,
                     )
+        except Empty:
+            return None
         except Exception as err:  # pylint: disable=broad-except
             self._logger.error(f"Error reading frame from pipe: {err}")
         return None

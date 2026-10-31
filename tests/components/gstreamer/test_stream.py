@@ -86,3 +86,14 @@ def test_close_pipe_unregisters_the_child_log_levels(stream) -> None:
         )
         is False
     )
+
+
+def test_frame_wait_times_out_so_exited_child_can_be_restarted(stream):
+    """A dead child cannot leave the camera blocked waiting for a frame."""
+    from queue import Empty
+
+    stream._process_frames_proc = MagicMock()
+    stream._frame_queue.get.side_effect = Empty
+    assert stream.read() is None
+    stream._frame_queue.get.assert_called_once_with(timeout=1)
+    stream._logger.error.assert_not_called()

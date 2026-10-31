@@ -10,7 +10,6 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -154,11 +153,22 @@ class GstRunner:
         mux.connect("format-location", self.on_format_location, None)
 
         gst_pipeline.set_state(Gst.State.PLAYING)
-        while not self._exit_event.is_set():
-            time.sleep(1)
-
-        gst_pipeline.set_state(Gst.State.NULL)
-        mainloop.quit()
+        try:
+            bus = gst_pipeline.get_bus()
+            while not self._exit_event.is_set():
+                message = bus.timed_pop_filtered(
+                    Gst.SECOND, Gst.MessageType.ERROR | Gst.MessageType.EOS
+                )
+                if message:
+                    if message.type == Gst.MessageType.ERROR:
+                        self._logger.error(
+                            "GStreamer pipeline failed: %s", message.parse_error()
+                        )
+                    break
+        finally:
+            gst_pipeline.set_state(Gst.State.NULL)
+            pop_if_full(self._frame_queue, None)
+            mainloop.quit()
 
 
 def run_gstreamer(
