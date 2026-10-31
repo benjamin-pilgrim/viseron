@@ -1,6 +1,6 @@
 import { Dayjs } from "dayjs";
 import Hls from "hls.js";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import {
@@ -14,13 +14,15 @@ import {
   useReferencePlayerStore,
 } from "components/events/utils";
 import useControlledInterval from "hooks/UseControlledInterval";
-import { sleep } from "lib/helpers";
 import { getDayjsFromDate } from "lib/helpers/dates";
 
 const SYNC_INTERVAL = 100; // Sync interval in milliseconds
 const MAX_DRIFT = 0.5; // Maximum drift before correcting playback
-const HARD_SEEK_DRIFT = 4; // Seek only when rate correction would take too long
-const RATE_NUDGE = 0.05;
+const HARD_SEEK_DRIFT = 2; // Seek only when rate correction would take too long
+const RATE_NUDGE_FRACTION = 0.1;
+const SEEK_SETTLE_MS = 1000;
+const BUFFER_RECOVERY_MS = 2000;
+const BUFFER_RETRY_MS = 5000;
 
 interface SyncManagerProps {
   children: React.ReactNode;
@@ -36,25 +38,26 @@ function SyncManager({ children }: SyncManagerProps) {
 
   const {
     setReferencePlayer,
-    isPlaying,
     setIsPlaying,
     setIsLive,
-    isMuted,
-    playbackSpeed,
     requestedTimestamp,
     playingDateRef,
   } = useReferencePlayerStore(
     useShallow((state) => ({
       setReferencePlayer: state.setReferencePlayer,
-      isPlaying: state.isPlaying,
       setIsPlaying: state.setIsPlaying,
       setIsLive: state.setIsLive,
-      isMuted: state.isMuted,
-      playbackSpeed: state.playbackSpeed,
       requestedTimestamp: state.requestedTimestamp,
       playingDateRef: state.playingDateRef,
     })),
   );
+  const lastSeek = useRef<{ timestamp: number; at: number | null }>({
+    timestamp: requestedTimestamp,
+    at: null,
+  });
+  const lastCorrection = useRef(new WeakMap<Hls, number>());
+  const bufferingSince = useRef(new WeakMap<Hls, number>());
+
   const seekSafely = useCallback((player: Hls, referenceDate: Dayjs) => {
     if (!player.levels || player.levels.length === 0 || !player.media) {
       return false;
@@ -95,37 +98,54 @@ function SyncManager({ children }: SyncManagerProps) {
     return false;
   }, []);
 
-  const syncPlayers = useCallback(async () => {
-    if (requestedTimestamp === playingDateRef.current) {
-      await sleep(1000);
+  const syncPlayers = useCallback(() => {
+    const now = performance.now();
+    const state = useReferencePlayerStore.getState();
+    if (lastSeek.current.at === null) {
+      lastSeek.current.at =
+        state.requestedTimestamp === state.playingDateRef.current
+          ? now
+          : -Infinity;
     }
+    if (lastSeek.current.timestamp !== state.requestedTimestamp) {
+      lastSeek.current = { timestamp: state.requestedTimestamp, at: now };
+    }
+    // Do not let an older player position override a fresh timeline seek.
+    // Unlike an awaited delay, each tick reads the latest play and seek state.
+    if (now - (lastSeek.current.at ?? -Infinity) < SEEK_SETTLE_MS) return;
 
-    const playersWithTime = hlsRefs.filter(
+    const players = hlsRefs.filter(
       (player): player is React.MutableRefObject<Hls> =>
-        player.current !== null &&
-        player.current.playingDate !== null &&
-        player.current.media !== null,
+        player.current !== null && player.current.media !== null,
+    );
+
+    const playersWithTime = players.filter(
+      (player) => player.current.playingDate !== null,
     );
 
     // Sync mute state
-    playersWithTime.forEach((player) => {
+    players.forEach((player) => {
       if (player.current.media) {
-        player.current.media.muted = isMuted;
+        player.current.media.muted = state.isMuted;
       }
     });
 
-    if (!isPlaying) {
-      return;
-    }
+    if (!state.isPlaying) return;
 
     // Find the player with the latest playing date, ignoring paused players
     const referencePlayer =
       playersWithTime.reduce<React.MutableRefObject<Hls> | null>(
         (prev, current) => {
           if (prev === null) {
-            return !current.current.media?.paused ? current : null;
+            return !current.current.media?.paused &&
+              (current.current.media?.readyState ?? 0) >=
+                HTMLMediaElement.HAVE_FUTURE_DATA
+              ? current
+              : null;
           }
           return !current.current.media?.paused &&
+            (current.current.media?.readyState ?? 0) >=
+              HTMLMediaElement.HAVE_FUTURE_DATA &&
             current.current.playingDate! > prev.current.playingDate!
             ? current
             : prev;
@@ -141,45 +161,63 @@ function SyncManager({ children }: SyncManagerProps) {
       playingDateRef.current = referencePlayer.current.playingDate
         ? getDayjsFromDate(referencePlayer.current.playingDate).unix()
         : requestedTimestamp;
-      playersWithTime.forEach((player) => {
-        if (player.current.media) {
-          player.current.media.playbackRate = playbackSpeed;
+      players.forEach((player) => {
+        const media = player.current.media;
+        if (!media) return;
+        media.playbackRate = state.playbackSpeed;
+        if (player === referencePlayer) return;
+        // Give transient buffering time to resolve before seeking, and avoid
+        // repeatedly disrupting a camera while its network is unavailable.
+        const buffering = media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+        if (buffering) {
+          const since = bufferingSince.current.get(player.current) ?? now;
+          bufferingSince.current.set(player.current, since);
+          if (now - since < BUFFER_RECOVERY_MS) return;
+        } else {
+          bufferingSince.current.delete(player.current);
         }
-        if (player !== referencePlayer) {
-          const timeDiff =
-            (getDayjsFromDate(referencePlayer.current.playingDate!).valueOf() -
-              getDayjsFromDate(player.current.playingDate!).valueOf()) /
-            1000;
-
-          if (
-            Math.abs(timeDiff) > MAX_DRIFT &&
-            Math.abs(timeDiff) < HARD_SEEK_DRIFT &&
-            !player.current.media?.paused
-          ) {
-            if (player.current.media) {
-              player.current.media.playbackRate = playbackSpeed + RATE_NUDGE;
-            }
-          } else if (Math.abs(timeDiff) > MAX_DRIFT) {
-            const seeked = seekSafely(
-              player.current,
-              getDayjsFromDate(referencePlayer.current.playingDate!),
-            );
-            if (seeked && player.current.media) {
-              player.current.media
-                .play()
-                .then(() => {
-                  setHlsRefsError(player, null);
-                })
-                .catch(() => {
-                  // Ignore play errors
-                });
-            } else {
-              setHlsRefsError(
-                player,
-                translateErrorCode(HlsErrorCodes.TIMESPAN_MISSING),
-              );
-            }
-          }
+        const referenceDate = getDayjsFromDate(
+          referencePlayer.current.playingDate!,
+        );
+        const playerDate = player.current.playingDate;
+        const drift = playerDate
+          ? (referenceDate.valueOf() - getDayjsFromDate(playerDate).valueOf()) /
+            1000
+          : Infinity;
+        if (
+          drift > MAX_DRIFT &&
+          drift < HARD_SEEK_DRIFT &&
+          !media.paused &&
+          !buffering
+        ) {
+          media.playbackRate = state.playbackSpeed * (1 + RATE_NUDGE_FRACTION);
+          return;
+        }
+        if (drift <= MAX_DRIFT && !media.paused && !buffering) return;
+        const last = lastCorrection.current.get(player.current) ?? -Infinity;
+        if (now - last < (buffering ? BUFFER_RETRY_MS : SEEK_SETTLE_MS)) return;
+        lastCorrection.current.set(player.current, now);
+        // A paused but aligned player only needs play, not a discontinuous seek.
+        const aligned =
+          playerDate && Math.abs(drift) <= MAX_DRIFT && !buffering;
+        if (aligned || seekSafely(player.current, referenceDate)) {
+          media
+            .play()
+            .then(() => {
+              const latest = useReferencePlayerStore.getState();
+              if (
+                latest.isPlaying &&
+                latest.requestedTimestamp === state.requestedTimestamp
+              ) {
+                setHlsRefsError(player, null);
+              }
+            })
+            .catch(() => {});
+        } else if (!buffering && playerDate) {
+          setHlsRefsError(
+            player,
+            translateErrorCode(HlsErrorCodes.TIMESPAN_MISSING),
+          );
         }
       });
     } else {
@@ -271,9 +309,6 @@ function SyncManager({ children }: SyncManagerProps) {
     }
   }, [
     hlsRefs,
-    isMuted,
-    isPlaying,
-    playbackSpeed,
     playingDateRef,
     requestedTimestamp,
     seekSafely,
