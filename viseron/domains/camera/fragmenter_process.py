@@ -90,7 +90,10 @@ def _extract_extinf_number(playlist_content: str, file: str) -> float | None:
     escaped_file = re.escape(file)
 
     # Simplified pattern
-    pattern = rf"#EXTINF:(\d+(?:\.\d+)?)[^\n]*\n(?:(?!#EXTINF)[^\n]*\n)*{escaped_file}"
+    pattern = (
+        rf"#EXTINF:(\d+(?:\.\d+)?)[^\n]*\n"
+        rf"(?:(?!#EXTINF)#[^\n]*\n)*{escaped_file}(?=\r?(?:\n|$))"
+    )
 
     match = re.search(pattern, playlist_content)
 
@@ -107,7 +110,8 @@ def _extract_program_date_time(
     escaped_file = re.escape(file)
     pattern = (
         r"#EXT-X-PROGRAM-DATE-TIME:"
-        rf"([^\n]+)\n(?:(?!#EXT-X-PROGRAM-DATE-TIME)[^\n]*\n)*{escaped_file}"
+        rf"([^\n]+)\n(?:(?!#EXT-X-PROGRAM-DATE-TIME)#[^\n]*\n)*"
+        rf"{escaped_file}(?=\r?(?:\n|$))"
     )
 
     match = re.search(pattern, playlist_content)
