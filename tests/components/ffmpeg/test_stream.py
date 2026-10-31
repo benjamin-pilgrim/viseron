@@ -7,7 +7,9 @@ from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+import voluptuous as vol
 
+from viseron.components.ffmpeg.camera import RECORDER_SCHEMA
 from viseron.components.ffmpeg.const import (
     CONFIG_AUDIO_CODEC,
     CONFIG_CODEC,
@@ -478,3 +480,51 @@ class TestStream:
                 },
             }
             assert stream.encoder_codec_args() == expected_cmd
+
+
+@pytest.mark.parametrize("mode,has_wallclock", [("wallclock", True), ("source", False)])
+def test_recorder_timestamp_mode_input_args(mode, has_wallclock):
+    """Generated input args follow the selected recorder mode."""
+    config = {
+        **CONFIG,
+        CONFIG_INPUT_ARGS: None,
+        CONFIG_HWACCEL_ARGS: [],
+        CONFIG_RTSP_TRANSPORT: DEFAULT_RTSP_TRANSPORT,
+    }
+    with (
+        patch.object(Stream, "__init__", return_value=None),
+        patch.object(Stream, "get_decoder_codec", return_value=[]),
+    ):
+        stream = Stream(config, MockCamera(identifier="test"), "test")
+        result = stream.stream_command(
+            config, "h264", "rtsp://test", timestamp_mode=mode
+        )
+    assert ("-use_wallclock_as_timestamps" in result) is has_wallclock
+
+
+def test_recorder_timestamp_mode_preserves_custom_input_args():
+    """Explicit input args take precedence over the recorder option."""
+    config = {
+        **CONFIG,
+        CONFIG_INPUT_ARGS: ["-use_wallclock_as_timestamps", "1"],
+        CONFIG_HWACCEL_ARGS: [],
+        CONFIG_RTSP_TRANSPORT: DEFAULT_RTSP_TRANSPORT,
+    }
+    with (
+        patch.object(Stream, "__init__", return_value=None),
+        patch.object(Stream, "get_decoder_codec", return_value=[]),
+    ):
+        stream = Stream(config, MockCamera(identifier="test"), "test")
+        result = stream.stream_command(
+            config, "h264", "rtsp://test", timestamp_mode="source"
+        )
+    assert result[:2] == ["-use_wallclock_as_timestamps", "1"]
+
+
+def test_recorder_timestamp_mode_schema():
+    """Default preserves upstream behavior and unsupported values fail validation."""
+    assert RECORDER_SCHEMA({})["timestamp_mode"] == "wallclock"
+    assert RECORDER_SCHEMA({"output_args": ["-x"]})["output_args"] == ["-x"]
+    assert RECORDER_SCHEMA({"timestamp_mode": "source"})["timestamp_mode"] == "source"
+    with pytest.raises(vol.Invalid):
+        RECORDER_SCHEMA({"timestamp_mode": "invalid"})

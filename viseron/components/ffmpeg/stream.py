@@ -49,6 +49,7 @@ from .const import (
     CONFIG_RECORDER_AUDIO_FILTERS,
     CONFIG_RECORDER_CODEC,
     CONFIG_RECORDER_OUPTUT_ARGS,
+    CONFIG_RECORDER_TIMESTAMP_MODE,
     CONFIG_RECORDER_VIDEO_FILTERS,
     CONFIG_RTSP_TRANSPORT,
     CONFIG_STREAM_FORMAT,
@@ -72,6 +73,8 @@ from .const import (
     HWACCEL_RPI4_DECODER_CODEC_MAP,
     ORIN_RAWVIDEO_OUTPUT,
     STREAM_FORMAT_MAP,
+    TIMESTAMP_MODE_SOURCE,
+    TIMESTAMP_MODE_WALLCLOCK,
 )
 
 if TYPE_CHECKING:
@@ -397,7 +400,12 @@ class Stream:
         return ["-c:v", self.encoder_codec]
 
     def stream_command(
-        self, stream_config: dict[str, Any], stream_codec: str, stream_url: str
+        self,
+        stream_config: dict[str, Any],
+        stream_codec: str,
+        stream_url: str,
+        *,
+        timestamp_mode: str = TIMESTAMP_MODE_WALLCLOCK,
     ) -> list[str]:
         """Return FFmpeg input stream."""
         if stream_config[CONFIG_INPUT_ARGS]:
@@ -415,7 +423,11 @@ class Stream:
                 and timeout_option[0] == "-timeout"
             ):
                 timeout_option[0] = "-stimeout"
-            input_args = CAMERA_INPUT_ARGS + timeout_option
+            input_args = CAMERA_INPUT_ARGS.copy()
+            if timestamp_mode == TIMESTAMP_MODE_SOURCE:
+                index = input_args.index("-use_wallclock_as_timestamps")
+                del input_args[index : index + 2]
+            input_args += timeout_option
 
         return (
             input_args
@@ -522,13 +534,14 @@ class Stream:
                 "-hls_list_size",
                 "10",
                 "-hls_flags",
-                "program_date_time+delete_segments",
+                "program_date_time+second_level_segment_index+second_level_segment_duration+temp_file",
                 "-strftime",
                 "1",
                 "-hls_segment_filename",
                 os.path.join(
                     self._camera.temp_segments_folder,
-                    "%s.m4s",
+                    "__VISERON_RUN__",
+                    "%%09d-%s-%%013t.m4s",
                 ),
             ]
             + self.encoder_codec_args()
@@ -541,6 +554,7 @@ class Stream:
             + [
                 os.path.join(
                     self._camera.temp_segments_folder,
+                    "__VISERON_RUN__",
                     "index.m3u8",
                 ),
             ]
@@ -568,7 +582,12 @@ class Stream:
             return self._config[CONFIG_RAW_COMMAND].split(" ")
 
         stream_input_command = self.stream_command(
-            self._config, self._mainstream.codec, self._mainstream.url
+            self._config,
+            self._mainstream.codec,
+            self._mainstream.url,
+            timestamp_mode=self._config[CONFIG_RECORDER][
+                CONFIG_RECORDER_TIMESTAMP_MODE
+            ],
         )
         return (
             [self.segments_alias]
@@ -605,6 +624,9 @@ class Stream:
                 self._mainstream.config,
                 self._mainstream.codec,
                 self._mainstream.url,
+                timestamp_mode=self._config[CONFIG_RECORDER][
+                    CONFIG_RECORDER_TIMESTAMP_MODE
+                ],
             )
             camera_segment_args = self.segment_args()
 

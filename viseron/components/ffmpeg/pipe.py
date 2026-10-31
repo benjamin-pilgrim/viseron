@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import fcntl
 import subprocess as sp
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, BinaryIO
+from uuid import uuid4
 
 from viseron.helpers.logs import LogPipe
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
@@ -13,6 +16,48 @@ from .const import ORIN_RAWVIDEO_OUTPUT
 
 if TYPE_CHECKING:
     import logging
+
+
+RUN_TOKEN = "__VISERON_RUN__"
+
+
+def _command_for_run(command: list[str]) -> list[str]:
+    """Create one output directory per actual process launch."""
+    if not any(RUN_TOKEN in argument for argument in command):
+        return command
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + "-"
+        + uuid4().hex[:12]
+    )
+    result = [argument.replace(RUN_TOKEN, run_id) for argument in command]
+    for argument in result:
+        if run_id in argument:
+            os.makedirs(os.path.dirname(argument), exist_ok=True)
+    return result
+
+
+def _leased_command_for_run(command: list[str]) -> tuple[list[str], int | None]:
+    """Hold a writer lease from before process creation until FFmpeg exits."""
+    result = _command_for_run(command)
+    for original, resolved in zip(command, result):
+        if RUN_TOKEN in original:
+            run_dir = os.path.dirname(resolved)
+            lease = os.path.join(run_dir, ".viseron-writer-lease")
+            fd = os.open(lease, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.fsync(fd)
+                directory_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            return result, fd
+    return result, None
 
 
 class FFmpegPipe:
@@ -76,6 +121,7 @@ class FFmpegPipe:
             self._logger.debug("FFmpeg decoder command: %s", " ".join(command))
             process = RestartablePopen(
                 command,
+                command_factory=lambda: _leased_command_for_run(command),
                 name=f"viseron.camera.{self._camera_identifier}.pipe",
                 register=False,
                 stdin=sp.DEVNULL,
@@ -111,6 +157,9 @@ class FFmpegPipe:
                 )
                 self.segment_process = RestartablePopen(
                     self._segment_command,
+                    command_factory=lambda: _leased_command_for_run(
+                        self._segment_command
+                    ),
                     name=f"viseron.camera.{self._camera_identifier}.segments",
                     stdin=sp.DEVNULL,
                     stdout=sp.PIPE,
@@ -127,6 +176,9 @@ class FFmpegPipe:
                     )
                     self._pipe = RestartablePopen(
                         self._decoder_command,
+                        command_factory=lambda: _leased_command_for_run(
+                            self._decoder_command
+                        ),
                         name=f"viseron.camera.{self._camera_identifier}.pipe",
                         register=False,
                         stdin=sp.DEVNULL,

@@ -1385,3 +1385,66 @@ class TestCheckTierIntegration(BaseTestWithRecordings):
         assert item.data is not None
         assert len(item.data) == len(expected)
         assert list(item.data["id"]) == list(expected["id"])
+
+
+def test_move_lock_contention_is_deferred_but_io_errors_are_reported(caplog):
+    """Only our known camera lock contention is retryable without an error."""
+    import errno
+    from unittest.mock import Mock
+
+    from viseron.components.storage.run_lifecycle import CameraLockBusy
+    from viseron.components.storage.storage_subprocess import DataItemMoveFile
+
+    worker = Worker.__new__(Worker)
+    worker.move_file = Mock(side_effect=CameraLockBusy(errno.EAGAIN, "busy"))
+    item = DataItemMoveFile(cmd="move_file", src="source", dst="dest")
+    worker.work_input(item)
+    assert item.deferred and item.error is None
+    assert "Error processing command" not in caplog.text
+
+    worker.move_file.side_effect = BlockingIOError(errno.EAGAIN, "filesystem failure")
+    failed = DataItemMoveFile(cmd="move_file", src="source", dst="dest")
+    worker.work_input(failed)
+    assert not failed.deferred and "filesystem failure" in failed.error
+    assert "Error processing command" in caplog.text
+
+
+def test_normal_scan_defers_durable_hold_to_recovery(tmp_path):
+    """Ordinary scans cannot duplicate a move being replayed after restart."""
+    from unittest.mock import Mock
+    from viseron.components.storage.source_move_intent import marker_for_source
+    from viseron.components.storage.storage_subprocess import DataItemMoveFile
+
+    src = str(tmp_path / "fragment.m4s")
+    marker_for_source(src).write_text("incomplete")
+    worker = Worker.__new__(Worker)
+    worker.move_file = Mock()
+    item = DataItemMoveFile(cmd="move_file", src=src, dst="destination")
+    worker.work_input(item)
+    assert item.deferred and item.error is None
+    worker.move_file.assert_not_called()
+    retry = DataItemMoveFile(
+        cmd="move_file", src=src, dst="destination", dispatch_token="live"
+    )
+    with patch("viseron.components.storage.check_tier.token_permits_start", return_value=True):
+        worker.work_input(retry)
+    worker.move_file.assert_called_once_with(retry)
+
+
+def test_delete_camera_lock_contention_is_deferred(caplog):
+    """Retry expected lock competition, while real I/O errors remain errors."""
+    import errno
+    from unittest.mock import Mock
+    from viseron.components.storage.run_lifecycle import CameraLockBusy
+    from viseron.components.storage.storage_subprocess import DataItemDeleteFile
+
+    worker = Worker.__new__(Worker)
+    worker.delete_file = Mock(side_effect=CameraLockBusy(errno.EAGAIN, "busy"))
+    item = DataItemDeleteFile(cmd="delete_file", src="source")
+    worker.work_input(item)
+    assert item.deferred and item.error is None
+    worker.delete_file.side_effect = OSError("disk failed")
+    failed = DataItemDeleteFile(cmd="delete_file", src="source")
+    worker.work_input(failed)
+    assert not failed.deferred and "disk failed" in failed.error
+    assert "Error processing command" in caplog.text

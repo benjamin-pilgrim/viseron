@@ -61,9 +61,10 @@ from viseron.components.webserver.download_token import DownloadToken
 from viseron.const import CONFIG_PATH, EVENT_STATE_CHANGED, RESTART_EXIT_CODE
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.domains.camera.fragmenter import (
-    Fragment,
     Timespan,
     get_available_timespans,
+    fragment_from_file,
+    fragments_span_runs,
 )
 from viseron.exceptions import DomainNotRegisteredError, Unauthorized
 from viseron.helpers import create_directory, daterange_to_utc, get_utc_offset
@@ -620,10 +621,13 @@ async def export_recording(connection: WebSocketHandler, message) -> None:
             camera.recorder.lookback,
             connection.get_session,
         )
-        fragments = [
-            Fragment(file.filename, file.path, file.duration, file.orig_ctime)
-            for file in files
-        ]
+        fragments = [fragment_from_file(file) for file in files]
+        if fragments_span_runs(fragments):
+            return subscription_error_message(
+                message["command_id"],
+                WS_ERROR_UNKNOWN_ERROR,
+                "Export across a camera restart is not supported.",
+            )
         if not fragments:
             return subscription_error_message(
                 message["command_id"],
@@ -791,10 +795,13 @@ async def export_timespan(connection: WebSocketHandler, message) -> None:
                 "No fragments found for timespan.",
             )
 
-        fragments = [
-            Fragment(file.filename, file.path, file.duration, file.orig_ctime)
-            for file in files
-        ]
+        fragments = [fragment_from_file(file) for file in files]
+        if fragments_span_runs(fragments):
+            return subscription_error_message(
+                message["command_id"],
+                WS_ERROR_UNKNOWN_ERROR,
+                "Export across a camera restart is not supported.",
+            )
         timespan_video = camera.fragmenter.concatenate_fragments(fragments)
         if not timespan_video:
             return subscription_error_message(

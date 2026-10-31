@@ -505,6 +505,7 @@ class Viseron:
             LOGGER.debug("Waiting for Viseron to be initialized before shutdown")
             self.initialized_event.wait()
             LOGGER.debug("Viseron initialized, continuing shutdown")
+        self.domain_registry.wait_for_setups()
 
         data_stream = self.data[DATA_STREAM_COMPONENT]
 

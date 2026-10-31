@@ -24,9 +24,11 @@ from viseron.const import CAMERA_SEGMENT_DURATION, HLS_SKIP_BOUNDARY_TARGET_DURA
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.fragmenter import (
     Fragment,
-    gap_in_fragments,
+    discontinuity_in_fragments,
     generate_playlist,
     get_available_timespans,
+    run_init_for_segment,
+    RUN_DIRECTORY_RE,
 )
 from viseron.helpers import client_current_datetime, daterange_to_utc, utcnow
 from viseron.helpers.fixed_size_dict import FixedSizeDict
@@ -52,7 +54,9 @@ def count_files_removed(
 
     index = 0
     for index, file in enumerate(previous_list):
-        if file.filename == current_list[0].filename:
+        if (file.identity or file.filename) == (
+            current_list[0].identity or current_list[0].filename
+        ):
             return index
     return index + 1
 
@@ -63,7 +67,9 @@ def count_matching_fragments(
     """Count the leading Fragments that are the same in both lists."""
     count = 0
     for previous, current in zip(previous_list, current_list):
-        if previous.filename != current.filename:
+        if (previous.identity or previous.filename) != (
+            current.identity or current.filename
+        ):
             break
         count += 1
     return count
@@ -77,14 +83,14 @@ def count_removed_discontinuities(
         return 0
     last_previous_index = min(removed, len(previous) - 1)
     count = sum(
-        gap_in_fragments(previous[index - 1], previous[index])
+        discontinuity_in_fragments(previous[index - 1], previous[index])
         for index in range(1, last_previous_index + 1)
     )
     if (
         removed == len(previous)
         and current
         and current[0].creation_time > previous[-1].creation_time
-        and gap_in_fragments(previous[-1], current[0])
+        and discontinuity_in_fragments(previous[-1], current[0])
     ):
         count += 1
     return count
@@ -99,6 +105,10 @@ class HlsClient:
     media_sequence: int
     discontinuity_sequence: int
     target_duration: int
+
+
+class EventSpansRunsError(Exception):
+    """An event playlist would span more than one recorder run."""
 
 
 class HlsAPIHandler(BaseAPIHandler):
@@ -178,15 +188,22 @@ class HlsAPIHandler(BaseAPIHandler):
 
         hls_client_id = self.request.headers.get("Hls-Client-Id", None)
         subpath = self.get_subpath()
-        playlist = await self.run_in_executor(
-            _generate_playlist,
-            self._get_session,
-            hls_client_id,
-            camera,
-            recording_id,
-            subpath,
-            self.request_arguments["_HLS_skip"] is not None,
-        )
+        try:
+            playlist = await self.run_in_executor(
+                _generate_playlist,
+                self._get_session,
+                hls_client_id,
+                camera,
+                recording_id,
+                subpath,
+                self.request_arguments["_HLS_skip"] is not None,
+            )
+        except EventSpansRunsError:
+            self.response_error(
+                HTTPStatus.CONFLICT,
+                "Event playback across camera runs is not supported",
+            )
+            return
         if not playlist:
             self.response_error(
                 HTTPStatus.NOT_FOUND, f"Recording with id {recording_id} not found"
@@ -292,6 +309,8 @@ def _get_init_file(
         directories = session.execute(stmt).scalars().all()
 
     for directory in directories:
+        if RUN_DIRECTORY_RE.fullmatch(os.path.basename(directory)):
+            continue
         init_file = os.path.join(directory, "init.mp4")
         if os.path.exists(init_file):
             return init_file
@@ -346,16 +365,25 @@ def files_to_fragments(subpath: str, files: list) -> list[Fragment]:
     Segment URIs must not change between updates of a playlist, and the file key
     stays the same when a segment moves to another tier.
     """
-    return [
-        Fragment(
-            file.filename,
-            # file_key is converted to a hexadecimal string in the URL
-            f"{subpath}/file/{file.camera_identifier}/{file.file_key:x}",
-            file.duration,
-            file.orig_ctime,
+    fragments = []
+    for file in files:
+        run_id, init_path = run_init_for_segment(file.path)
+        fragments.append(
+            Fragment(
+                file.filename,
+                f"{subpath}/file/{file.camera_identifier}/{file.file_key:x}",
+                file.duration,
+                file.orig_ctime,
+                init_file=(
+                    f"{subpath}/run-init/{file.camera_identifier}/{run_id}"
+                    if init_path
+                    else None
+                ),
+                run_id=run_id,
+                identity=str(file.file_key),
+            )
         )
-        for file in files
-    ]
+    return fragments
 
 
 def _render_client_playlist(
@@ -413,6 +441,8 @@ def _generate_playlist(
         now=now,
     )
     fragments = files_to_fragments(subpath, files)
+    if len({fragment.run_id for fragment in fragments}) > 1:
+        raise EventSpansRunsError
 
     end: bool = True
     # Recording has not ended yet
@@ -426,19 +456,23 @@ def _generate_playlist(
         LOGGER.debug("Recording ended more than a minute ago")
         end = True
     # Recording has ended but the last file is not finished yet
-    elif len(files) > 0 and recording.end_time.timestamp() > float(
-        files[-1].filename.split(".")[0]
-    ) + float(files[-1].duration):
+    elif len(files) > 0 and recording.end_time > (
+        files[-1].orig_ctime + datetime.timedelta(seconds=float(files[-1].duration))
+    ):
         LOGGER.debug("Recording has ended but the last file is not finished yet")
         end = False
 
-    init_file = _get_init_file(get_session, camera)
-    if not init_file or not fragments:
+    init_file = (
+        _get_init_file(get_session, camera)
+        if any(fragment.init_file is None for fragment in fragments)
+        else ""
+    )
+    if (not init_file and any(f.init_file is None for f in fragments)) or not fragments:
         return None
 
     return _render_client_playlist(
         fragments,
-        f"{subpath}/files{init_file}",
+        f"{subpath}/files{init_file}" if init_file else "",
         hls_client_id,
         skip_requested=skip_requested,
         end=end,
@@ -473,13 +507,17 @@ def _generate_playlist_time_period(
     )
     fragments = files_to_fragments(subpath, files)
 
-    init_file = _get_init_file(get_session, camera)
-    if not init_file:
+    init_file = (
+        _get_init_file(get_session, camera)
+        if any(fragment.init_file is None for fragment in fragments)
+        else ""
+    )
+    if not init_file and any(f.init_file is None for f in fragments):
         return None
 
     return _render_client_playlist(
         fragments,
-        f"{subpath}/files{init_file}",
+        f"{subpath}/files{init_file}" if init_file else "",
         hls_client_id,
         skip_requested=skip_requested,
         end=end_playlist,

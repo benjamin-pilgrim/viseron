@@ -6,7 +6,7 @@ import datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from tests.common import BaseTestWithRecordings
 from viseron.components.storage.const import (
@@ -43,8 +43,12 @@ class TestQueries(BaseTestWithRecordings):
             created_at = self._now + datetime.timedelta(seconds=55)
             timestamp = self._now + datetime.timedelta(seconds=25)
             filename = f"{int(timestamp.timestamp())}.m4s"
+            source_key = session.execute(
+                select(Files.file_key).where(Files.path == f"/test/{filename}")
+            ).scalar_one()
             session.execute(
                 insert(Files).values(
+                    file_key=source_key,
                     tier_id=1,
                     tier_path="/tier2/",
                     camera_identifier="test",
@@ -77,8 +81,12 @@ class TestQueries(BaseTestWithRecordings):
             created_at = self._now + datetime.timedelta(seconds=55)
             timestamp = self._now + datetime.timedelta(seconds=25)
             filename = f"{int(timestamp.timestamp())}.m4s"
+            source_key = session.execute(
+                select(Files.file_key).where(Files.path == f"/test/{filename}")
+            ).scalar_one()
             session.execute(
                 insert(Files).values(
+                    file_key=source_key,
                     tier_id=1,
                     tier_path="/tier2/",
                     camera_identifier="test",
@@ -126,6 +134,75 @@ class TestQueries(BaseTestWithRecordings):
         assert len(files) == 15
         assert files[4].tier_id == 0
         assert files[5].tier_id == 1
+
+    @pytest.mark.parametrize("query", ["recording", "period", "multiple_cameras"])
+    def test_same_filename_different_runs_are_not_deduplicated(self, query):
+        """Keep distinct files while collapsing only actual tier copies."""
+        timestamp = self._now + datetime.timedelta(seconds=25)
+        filename = f"{int(timestamp.timestamp())}.m4s"
+        with self._get_db_session() as session:
+            source_keys = []
+            source_ids = []
+            for run in ("run-a", "run-b"):
+                result = session.execute(
+                    insert(Files)
+                    .values(
+                        tier_id=0,
+                        tier_path="/tier1/",
+                        camera_identifier="test",
+                        category="recorder",
+                        subcategory="segments",
+                        path=f"/tier1/{run}/{filename}",
+                        directory=f"/tier1/{run}",
+                        filename=filename,
+                        size=10,
+                        orig_ctime=timestamp,
+                        duration=5,
+                        created_at=timestamp,
+                    )
+                    .returning(Files.file_key, Files.id)
+                ).one()
+                source_keys.append(result.file_key)
+                source_ids.append(result.id)
+            copy_id = session.execute(
+                insert(Files)
+                .values(
+                    file_key=source_keys[0],
+                    tier_id=1,
+                    tier_path="/tier2/",
+                    camera_identifier="test",
+                    category="recorder",
+                    subcategory="segments",
+                    path=f"/tier2/run-a/{filename}",
+                    directory="/tier2/run-a",
+                    filename=filename,
+                    size=10,
+                    orig_ctime=timestamp,
+                    duration=5,
+                    created_at=timestamp + datetime.timedelta(seconds=1),
+                )
+                .returning(Files.id)
+            ).scalar_one()
+            session.commit()
+
+        if query == "recording":
+            files = get_recording_fragments(3, 5, self._get_db_session)
+        else:
+            cameras = ["test", "test2"] if query == "multiple_cameras" else ["test"]
+            files = get_time_period_fragments(
+                cameras,
+                timestamp.timestamp() - 1,
+                timestamp.timestamp() + 1,
+                self._get_db_session,
+            )
+        ids = {file.id for file in files}
+        assert copy_id in ids
+        assert source_ids[0] not in ids
+        assert source_ids[1] in ids
+        assert sum(file.file_key == source_keys[0] for file in files) == 1
+        assert len({file.file_key for file in files if file.filename == filename}) == (
+            4 if query == "multiple_cameras" else 3
+        )
 
 
 _TIMELAPSE_EPOCH = 1_700_000_000

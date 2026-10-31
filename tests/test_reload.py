@@ -987,6 +987,9 @@ class TestHandleCancelledRetries:
             identifier="cam2",
         )
         plan = SetupPlan()
+        vis.domain_registry.get.side_effect = lambda _domain, identifier: (
+            entry1 if identifier == "cam1" else entry2
+        )
 
         _handle_cancelled_retries(vis, [entry1, entry2], plan)
 
@@ -997,6 +1000,19 @@ class TestHandleCancelledRetries:
                 call(vis, entry2.domain, entry2.identifier),
             ]
         )
+
+    @patch("viseron.reload.unload_domain_chain")
+    def test_stale_cancelled_entry_does_not_unload_replacement(
+        self, mock_chain: MagicMock
+    ) -> None:
+        """A later reload must not unload a replacement from an older snapshot."""
+        vis = MagicMock()
+        entry = _make_domain_entry(identifier="cam1")
+        vis.domain_registry.get.return_value = _make_domain_entry(identifier="cam1")
+        plan = SetupPlan()
+        _handle_cancelled_retries(vis, [entry], plan)
+        mock_chain.assert_not_called()
+        assert not plan.domain_components
 
 
 class TestUnloadLoadedDependentsOfPendingDomains:
@@ -1218,6 +1234,31 @@ class TestApplySetupPlan:
         )
         mock_unload_dependents.assert_called_once_with(vis, plan)
         mock_setup_domains.assert_called_once_with(vis)
+
+    @patch("viseron.reload._unload_dependents_of_pending_domains")
+    @patch("viseron.reload.setup_domains")
+    @patch("viseron.reload.setup_components")
+    def test_implicit_nvr_config_recreated_after_camera_registration(
+        self,
+        mock_setup_components: MagicMock,
+        mock_setup_domains: MagicMock,
+        mock_unload_dependents: MagicMock,
+    ) -> None:
+        """Reload supplies the same implicit NVR config as initial startup."""
+        vis = MagicMock()
+        vis.domain_registry.get_identifiers.return_value = ["healthy", "delayed"]
+        config = {"ffmpeg": {"camera": {}}}
+        plan = SetupPlan(domain_components={"ffmpeg", "nvr"})
+        _apply_setup_plan(vis, config, plan)
+        assert mock_setup_components.call_args_list[1].kwargs["components"] == {
+            "ffmpeg"
+        }
+        call_args = mock_setup_components.call_args_list[2]
+        assert call_args.kwargs["components"] == {"nvr"}
+        assert call_args.args[1]["nvr"] == {"healthy": {}, "delayed": {}}
+        assert "nvr" not in config
+        mock_setup_domains.assert_called_once_with(vis)
+        mock_unload_dependents.assert_called_once_with(vis, plan)
 
     @patch("viseron.reload._unload_dependents_of_pending_domains")
     @patch("viseron.reload.setup_domains")
@@ -1537,7 +1578,7 @@ class TestReloadConfigPublic:
             result = reload_config(vis)
 
         assert result is expected
-        vis.domain_registry.cancel_all_retries.assert_called_once()
+        assert vis.domain_registry.cancel_all_retries.call_count == 2
         vis.initialized_event.wait.assert_called_once()
         mock_inner.assert_called_once_with(vis, cancelled)
         assert "Config reload completed in" in caplog.text
@@ -1556,7 +1597,7 @@ class TestReloadConfigPublic:
             result = reload_config(vis)
 
         assert result is expected
-        vis.domain_registry.cancel_all_retries.assert_called_once()
+        assert vis.domain_registry.cancel_all_retries.call_count == 2
         vis.initialized_event.wait.assert_called_once()
         assert "No configuration changes detected" in caplog.text
 
@@ -1573,6 +1614,6 @@ class TestReloadConfigPublic:
             result = reload_config(vis)
 
         assert result is expected
-        vis.domain_registry.cancel_all_retries.assert_called_once()
+        assert vis.domain_registry.cancel_all_retries.call_count == 2
         vis.initialized_event.wait.assert_called_once()
         assert "Config reload failed with errors" in caplog.text

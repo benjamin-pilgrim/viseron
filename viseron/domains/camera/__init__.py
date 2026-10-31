@@ -120,6 +120,14 @@ class EventCameraStillImageAvailable(EventData):
 EVENT_FRAME_BYTES_TOPIC = "{camera_identifier}/camera/frame_bytes"
 
 
+def _recording_spool_path(component: str, config: dict, segments_folder: str) -> str:
+    """Choose legacy staging for custom recorder commands and non-FFmpeg cameras."""
+    if component != "ffmpeg" or config.get("raw_command"):
+        return TEMP_DIR + segments_folder
+    parent, camera_name = os.path.split(segments_folder)
+    return os.path.join(parent, ".viseron-spool", camera_name)
+
+
 class AbstractCamera(AbstractDomain):
     """Represent a camera."""
 
@@ -187,7 +195,26 @@ class AbstractCamera(AbstractDomain):
         self.event_clips_folder: str = self._storage.get_event_clips_path(self)
         self.segments_folder: str = self._storage.get_segments_path(self)
         self.thumbnails_folder: str = self._storage.get_thumbnails_path(self)
-        self.temp_segments_folder: str = TEMP_DIR + self.segments_folder
+        legacy_segments_folder = TEMP_DIR + self.segments_folder
+        self.temp_segments_folder = _recording_spool_path(
+            component, config, self.segments_folder
+        )
+        if self.temp_segments_folder != legacy_segments_folder:
+            try:
+                if os.path.isdir(legacy_segments_folder) and os.listdir(
+                    legacy_segments_folder
+                ):
+                    self._logger.warning(
+                        "Legacy temporary footage remains at %s; it has been retained "
+                        "for manual recovery and is not indexed by the new spool.",
+                        legacy_segments_folder,
+                    )
+            except OSError:
+                self._logger.warning(
+                    "Cannot inspect legacy staging %s",
+                    legacy_segments_folder,
+                    exc_info=True,
+                )
         self.snapshots_object_folder: str = self._storage.get_snapshots_path(
             self, SnapshotDomain.OBJECT_DETECTOR
         )

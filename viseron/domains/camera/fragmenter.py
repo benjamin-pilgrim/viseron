@@ -6,6 +6,7 @@ import datetime
 import logging
 import os
 import queue
+import re
 import subprocess as sp
 import threading
 import uuid
@@ -18,6 +19,7 @@ from apscheduler.jobstores.base import JobLookupError
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
     EVENT_CHECK_TIER,
+    CONFIG_TIER_MARKERS,
     TIER_CATEGORY_RECORDER,
     TIER_SUBCATEGORY_SEGMENTS,
     CleanupJobNames,
@@ -74,6 +76,7 @@ class FragmenterSubProcessWorker(ChildProcessWorker):
                 camera.timelapse_folder,
                 camera.temp_timelapse_folder,
                 self._worker_event,
+                tier_markers=dict(storage.config.get(CONFIG_TIER_MARKERS, {}) or {}),
             ),
             stop_on_shutdown=False,
         )
@@ -231,6 +234,10 @@ class Fragmenter:
         self, fragments: list[Fragment], media_sequence: int = 0
     ) -> str | Literal[False]:
         """Concatenate fragments into a single mp4 file."""
+        # Avoid silent corruption from stream-copying changed codec parameters.
+        if fragments_span_runs(fragments):
+            self._logger.error("Cannot export across recorder run boundaries")
+            return False
         file_uuid = str(uuid.uuid4())
         filename = os.path.join(TEMP_DIR, f"{file_uuid}.mp4")
 
@@ -289,6 +296,19 @@ def _get_file_path(
     return file
 
 
+# Shared with the recorder run directory allocator.
+RUN_DIRECTORY_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}$")
+
+
+def run_init_for_segment(path: str) -> tuple[str | None, str | None]:
+    """Return recorder run identity and exact matching init, or legacy markers."""
+    directory = os.path.dirname(path)
+    run_id = os.path.basename(directory)
+    if RUN_DIRECTORY_RE.fullmatch(run_id):
+        return run_id, os.path.join(directory, "init.mp4")
+    return None, None
+
+
 def gap_in_fragments(prev_fragment: Fragment, fragment: Fragment) -> bool:
     """Check if there is a gap between two fragments."""
     return (
@@ -298,6 +318,13 @@ def gap_in_fragments(prev_fragment: Fragment, fragment: Fragment) -> bool:
             + datetime.timedelta(seconds=prev_fragment.duration)
         )
     ).total_seconds() > 1
+
+
+def discontinuity_in_fragments(prev_fragment: Fragment, fragment: Fragment) -> bool:
+    """Account for both clock gaps and a change in initialization run."""
+    return gap_in_fragments(prev_fragment, fragment) or (
+        prev_fragment.run_id != fragment.run_id
+    )
 
 
 def get_skipped_segment_count(fragments: list[Fragment], skip_boundary: float) -> int:
@@ -361,13 +388,26 @@ def generate_playlist(
     playlist.append("#EXT-X-INDEPENDENT-SEGMENTS")
     if skipped:
         playlist.append(f"#EXT-X-SKIP:SKIPPED-SEGMENTS={skipped}")
-    playlist.append(f'#EXT-X-MAP:URI="{_get_file_path(init_file, file_directive)}"')
+    # Make the current init available even when a delta update starts at a
+    # discontinuity; subsequent run changes emit their map after the boundary.
+    active_init = (
+        fragments[skipped].init_file or init_file
+        if skipped < len(fragments)
+        else init_file
+    )
+    playlist.append(f'#EXT-X-MAP:URI="{_get_file_path(active_init, file_directive)}"')
 
     # Compare against the last skipped fragment so a gap right after it is kept
     prev_fragment: Fragment | None = fragments[skipped - 1] if skipped else None
     for fragment in fragments[skipped:]:
-        if prev_fragment and gap_in_fragments(prev_fragment, fragment):
+        if prev_fragment and discontinuity_in_fragments(prev_fragment, fragment):
             playlist.append("#EXT-X-DISCONTINUITY")
+        fragment_init = fragment.init_file or init_file
+        if fragment_init != active_init:
+            playlist.append(
+                f'#EXT-X-MAP:URI="{_get_file_path(fragment_init, file_directive)}"'
+            )
+            active_init = fragment_init
         program_date_time = fragment.creation_time.replace(
             tzinfo=datetime.timezone.utc
         ).isoformat(timespec="milliseconds")
@@ -388,6 +428,27 @@ class Fragment:
     path: str
     duration: float
     creation_time: datetime.datetime
+    init_file: str | None = None
+    run_id: str | None = None
+    identity: str | None = None
+
+
+def fragment_from_file(file) -> Fragment:
+    """Create an export fragment using its retained recorder run identity."""
+    run_id, init_file = run_init_for_segment(file.path)
+    return Fragment(
+        file.filename,
+        file.path,
+        file.duration,
+        file.orig_ctime,
+        init_file=init_file,
+        run_id=run_id,
+    )
+
+
+def fragments_span_runs(fragments: list[Fragment]) -> bool:
+    """Return whether an export would cross a recorder run boundary."""
+    return len({fragment.run_id for fragment in fragments}) > 1
 
 
 class Timespan(TypedDict):

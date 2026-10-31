@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 import os
@@ -23,6 +24,17 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     CleanupJobNames,
 )
+from viseron.components.storage.pending_journal import protected_by_pending
+from viseron.components.storage.source_move_intent import (
+    is_source_move_marker,
+    source_move_pending,
+)
+from viseron.components.storage.run_lifecycle import (
+    camera_lock,
+    is_run_directory,
+    reclaim_empty_run,
+    remove_stale_temporary,
+)
 from viseron.components.storage.models import (
     Events,
     Files,
@@ -35,8 +47,9 @@ from viseron.components.storage.util import (
     is_tier_marker,
     is_tier_move_temp_file,
     tier_markers_available,
+    require_tier_markers,
 )
-from viseron.const import VISERON_SIGNAL_SHUTDOWN
+from viseron.const import CAMERA_SEGMENT_DURATION, VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
@@ -343,20 +356,74 @@ class OrphanedFilesCleanup(BaseCleanupJob):
 
                         total_files_processed += 1
                         files_processed += 1
-                        if file in runner.ignored_files or is_tier_move_temp_file(file):
+                        if file in runner.ignored_files:
                             continue
                         file_path = os.path.join(root, file)
+                        # A source intent is durable evidence, including malformed
+                        # records; only move recovery may remove it.
+                        if is_source_move_marker(file):
+                            continue
+                        if is_tier_move_temp_file(file):
+                            # Run-init identity and its prepared temporary are
+                            # persistent recovery state, not stale scratch files.
+                            if (
+                                file == ".viseron-tier-move-run-init.json"
+                                or file.startswith(".viseron-tier-move-init-")
+                            ):
+                                continue
+                            if is_run_directory(os.path.basename(root)):
+                                camera = os.path.abspath(os.path.dirname(root))
+                                try:
+                                    with camera_lock("/tmp/viseron-run-locks", camera):
+                                        if remove_stale_temporary(
+                                            file_path,
+                                            lambda file_path=file_path: (
+                                                require_tier_markers(
+                                                    file_path, runner.tier_markers
+                                                )
+                                            ),
+                                        ):
+                                            deleted_count += 1
+                                except OSError:
+                                    LOGGER.debug(
+                                        "Cannot clean temporary %s",
+                                        file_path,
+                                        exc_info=True,
+                                    )
+                            continue
                         if is_tier_marker(file_path, runner.tier_markers):
                             continue
                         if not tier_markers_available(file_path, runner.tier_markers):
                             continue
-                        file_exists = session.execute(
-                            select(Files).where(Files.path == file_path)
-                        ).first()
-                        if not file_exists and os.path.exists(file_path):
-                            os.remove(file_path)
-                            LOGGER.debug("%s deleted %s", runner.name, file_path)
-                            deleted_count += 1
+                        try:
+                            if is_run_directory(os.path.basename(root)):
+                                camera = os.path.abspath(os.path.dirname(root))
+                                # All publishers and acknowledgers must take this lock.
+                                with camera_lock("/tmp/viseron-run-locks", camera):
+                                    file_exists = session.execute(
+                                        select(Files).where(Files.path == file_path)
+                                    ).first()
+                                    if (
+                                        not file_exists
+                                        and not protected_by_pending(file_path)
+                                        and not source_move_pending(file_path)
+                                    ):
+                                        if os.path.exists(file_path):
+                                            os.remove(file_path)
+                                            deleted_count += 1
+                            else:
+                                file_exists = session.execute(
+                                    select(Files).where(Files.path == file_path)
+                                ).first()
+                                if not file_exists and os.path.exists(file_path):
+                                    os.remove(file_path)
+                                    deleted_count += 1
+                        except OSError:
+                            LOGGER.warning(
+                                "Unable to check cleanup candidate %s",
+                                file_path,
+                                exc_info=True,
+                            )
                         runner.log_progress(
                             f"{runner.name} processed {files_processed}/{len(files)} "
                             f"files in {root}",
@@ -421,12 +488,39 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                 last_id = files[-1][0]
 
                 # Find records where files don't exist
-                to_delete = [
-                    file_id
-                    for file_id, file_path in files
-                    if tier_markers_available(file_path, runner.tier_markers)
-                    and file_is_missing(file_path)
-                ]
+                to_delete = []
+                for file_id, file_path in files:
+                    run_dir = os.path.dirname(file_path)
+                    if not is_run_directory(os.path.basename(run_dir)):
+                        if tier_markers_available(
+                            file_path, runner.tier_markers
+                        ) and file_is_missing(file_path):
+                            to_delete.append(file_id)
+                        continue
+                    try:
+                        with camera_lock(
+                            "/tmp/viseron-run-locks",
+                            os.path.abspath(os.path.dirname(run_dir)),
+                        ):
+                            if (
+                                tier_markers_available(file_path, runner.tier_markers)
+                                and not source_move_pending(file_path)
+                                and not protected_by_pending(file_path)
+                                and file_is_missing(file_path)
+                            ):
+                                result = session.execute(
+                                    delete(Files).where(
+                                        Files.id == file_id, Files.path == file_path
+                                    )
+                                )
+                                session.commit()
+                                total_deleted += result.rowcount
+                    except OSError:
+                        LOGGER.debug(
+                            "Deferred missing run-file cleanup: %s",
+                            file_path,
+                            exc_info=True,
+                        )
 
                 if to_delete:
                     result = cast(
@@ -511,23 +605,40 @@ class ZeroSizeFilesCleanup(BaseCleanupJob):
                     path = file_row.path
                     if not tier_markers_available(path, runner.tier_markers):
                         continue
+                    run_dir = os.path.dirname(path)
+                    lock = (
+                        camera_lock(
+                            "/tmp/viseron-run-locks",
+                            os.path.abspath(os.path.dirname(run_dir)),
+                        )
+                        if is_run_directory(os.path.basename(run_dir))
+                        else contextlib.nullcontext()
+                    )
                     try:
-                        stat_size = os.path.getsize(path)
+                        with lock:
+                            if source_move_pending(path) or protected_by_pending(path):
+                                continue
+                            stat_size = os.path.getsize(path)
+                            if stat_size > 0:
+                                file_row.size = stat_size
+                                updated += 1
+                            else:
+                                os.remove(path)
+                                if is_run_directory(os.path.basename(run_dir)):
+                                    session.execute(
+                                        delete(Files).where(
+                                            Files.id == file_row.id, Files.path == path
+                                        )
+                                    )
+                                    session.commit()
+                                else:
+                                    to_delete_ids.append(file_row.id)
+                                deleted += 1
                     except OSError as error:
-                        LOGGER.debug("Skipping inaccessible file %s: %s", path, error)
+                        LOGGER.debug(
+                            "Skipping inaccessible or busy file %s: %s", path, error
+                        )
                         continue
-
-                    if stat_size > 0:
-                        file_row.size = stat_size
-                        updated += 1
-                    else:
-                        try:
-                            os.remove(path)
-                        except OSError as error:
-                            LOGGER.warning("Could not remove %s: %s", path, error)
-                            continue
-                        to_delete_ids.append(file_row.id)
-                        deleted += 1
 
                 if to_delete_ids:
                     session.execute(delete(Files).where(Files.id.in_(to_delete_ids)))
@@ -584,6 +695,31 @@ class EmptyFoldersCleanup(BaseCleanupJob):
                     f"{runner.name} processed {processed_count} folders"
                 )
                 if root == path:
+                    continue
+                if is_run_directory(os.path.basename(root)):
+                    camera = os.path.abspath(os.path.dirname(root))
+
+                    def has_refs(directory: str) -> bool:
+                        with runner.get_session() as session:
+                            return (
+                                session.execute(
+                                    select(Files.id)
+                                    .where(Files.directory == directory)
+                                    .limit(1)
+                                ).first()
+                                is not None
+                            )
+
+                    if reclaim_empty_run(
+                        "/tmp/viseron-run-locks",
+                        camera,
+                        root,
+                        lambda root=root: require_tier_markers(
+                            root, runner.tier_markers
+                        ),
+                        has_refs,
+                    ):
+                        deleted_count += 1
                     continue
                 if not dirs and not files:
                     LOGGER.debug("Deleting folder %s", root)
@@ -851,7 +987,13 @@ class OrphanedRecordingsCleanup(BaseCleanupJob):
                                 Files.camera_identifier
                                 == recording[0].camera_identifier,
                                 Files.orig_ctime.between(
-                                    recording[0].start_time, recording[0].end_time
+                                    recording[0].adjusted_start_time.replace(
+                                        microsecond=0
+                                    ),
+                                    recording[0].end_time.replace(microsecond=0)
+                                    + datetime.timedelta(
+                                        seconds=CAMERA_SEGMENT_DURATION
+                                    ),
                                 ),
                             )
                         )

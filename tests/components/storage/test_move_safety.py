@@ -7,7 +7,7 @@ import shutil
 import time
 from errno import ETIMEDOUT
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from watchdog.events import FileCreatedEvent, FileMovedEvent
@@ -22,7 +22,7 @@ from viseron.components.storage.jobs import (
     ZeroSizeFilesCleanup,
     file_is_missing,
 )
-from viseron.components.storage.tier_handler import TierHandler
+from viseron.components.storage.tier_handler import ThumbnailTierHandler, TierHandler
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX
 
 
@@ -278,3 +278,28 @@ def test_observer_sees_only_published_destination(
     finally:
         observer.stop()
         observer.join()
+
+
+def test_watcher_ignores_atomic_publication_of_ignored_file(tmp_path: Path) -> None:
+    """Moving a private file to an ignored destination must not index it."""
+    handler = TierHandler.__new__(TierHandler)
+    handler._path = str(tmp_path)
+    handler._storage = MagicMock()
+    handler._storage.ignored_files = ["latest_thumbnail.jpg"]
+    handler._event_queue = MagicMock()
+    source = str(tmp_path / f"{TIER_MOVE_TEMP_PREFIX}123.jpg")
+    destination = str(tmp_path / "latest_thumbnail.jpg")
+    handler.on_any_event(FileMovedEvent(source, destination))
+    handler._event_queue.put.assert_not_called()
+
+
+def test_thumbnail_move_skips_recording_without_thumbnail() -> None:
+    """A failed thumbnail write leaves no source path to move."""
+    handler = ThumbnailTierHandler.__new__(ThumbnailTierHandler)
+    handler._storage = MagicMock()
+    handler._logger = MagicMock()
+    session = handler._storage.get_session.return_value.__enter__.return_value
+    session.execute.return_value.scalar_one.return_value.thumbnail_path = None
+    with patch("viseron.components.storage.tier_handler.handle_file") as move:
+        handler.move_thumbnail(1, None)
+    move.assert_not_called()

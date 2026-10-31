@@ -37,13 +37,16 @@ def get_recording_fragments(
     it has been recorded. The orig_ctime is the timestamp of the original mp4 file
     and is therefore accurate.
 
-    Only the latest occurrence of each file is selected using the CTE row_number.
-    This is to accommodate for the case where a file has been copied to a succeeding
-    tier but has not been deleted from the original tier yet.
+    Only the latest row for each logical file key is selected. A file may have
+    multiple rows while a tier move is in flight; filenames are not unique across
+    cameras or recorder runs.
     """
     row_number = (
         func.row_number()
-        .over(partition_by=Files.filename, order_by=desc(Files.created_at))
+        .over(
+            partition_by=Files.file_key,
+            order_by=(desc(Files.created_at), desc(Files.id)),
+        )
         .label("row_number")
     )
     recording_files = (
@@ -109,7 +112,10 @@ def get_time_period_fragments(
 
     row_number = (
         func.row_number()
-        .over(partition_by=Files.filename, order_by=desc(Files.created_at))
+        .over(
+            partition_by=Files.file_key,
+            order_by=(desc(Files.created_at), desc(Files.id)),
+        )
         .label("row_number")
     )
     files = (

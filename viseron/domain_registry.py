@@ -56,6 +56,7 @@ class DomainEntry:
     error_instance: FailedCamera | None = None
     setup_future: Future | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    initial_setup_settled: threading.Event = field(default_factory=threading.Event)
 
     def as_dict(self) -> dict[str, Any]:
         """Return as dict for serialization."""
@@ -232,6 +233,9 @@ class DomainRegistry:
             entry = self._get_entry(domain, identifier)
             if entry:
                 entry.setup_future = future
+                future.add_done_callback(
+                    lambda _future: entry.initial_setup_settled.set()
+                )
 
     def get_future(self, domain: str, identifier: str) -> Future | None:
         """Get the setup future for a domain."""
@@ -429,6 +433,21 @@ class DomainRegistry:
                             break
         return failed
 
+    def wait_for_setups(self) -> None:
+        """Wait for current setup workers to exit before unloading their domains."""
+        with self._lock:
+            futures = [
+                entry.setup_future
+                for entries in self._domains.values()
+                for entry in entries.values()
+                if entry.setup_future is not None
+            ]
+        for future in futures:
+            try:
+                future.result()
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("Domain setup worker failed during shutdown or reload")
+
     def cancel_retry(self, domain: str, identifier: str) -> None:
         """Cancel any ongoing retry for a domain.
 
@@ -448,16 +467,32 @@ class DomainRegistry:
         with self._lock:
             for domain_entries in self._domains.values():
                 for entry in domain_entries.values():
-                    if entry.state == DomainState.RETRYING:
+                    if entry.state in (
+                        DomainState.PENDING,
+                        DomainState.LOADING,
+                        DomainState.RETRYING,
+                    ) or (
+                        entry.setup_future is not None and not entry.setup_future.done()
+                    ):
                         cancelled.append(entry)
                     entry.cancel_event.set()
         return cancelled
 
-    def clear_future(self, domain: str, identifier: str) -> None:
-        """Clear the setup future after completion."""
+    def clear_future(
+        self,
+        domain: str,
+        identifier: str,
+        expected: Future | None = None,
+        expected_entry: DomainEntry | None = None,
+    ) -> None:
+        """Clear only the future owned by the caller, if one is specified."""
         with self._lock:
             entry = self._get_entry(domain, identifier)
-            if entry:
+            if (
+                entry
+                and (expected_entry is None or entry is expected_entry)
+                and (expected is None or entry.setup_future is expected)
+            ):
                 entry.setup_future = None
 
     def _get_entry(self, domain: str, identifier: str) -> DomainEntry | None:

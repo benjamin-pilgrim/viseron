@@ -471,6 +471,8 @@ def test_work_input(
 ) -> None:
     """Drain fragments every pending segment and replies when done."""
     work = MagicMock()
+    work._last_fragment = None
+    work._last_recent = None
     files = [f"{i}.m4s" for i in range(7)]
 
     with patch(
@@ -764,10 +766,7 @@ def test_missing_segment_metadata_retains_file_for_recovery(tmp_path) -> None:
     work = _fragmenter_work(str(temp), str(target))
     with patch.object(work, "_read_m3u8", return_value="#EXTM3U\n"):
         work._handle_m4s(segment.name)
-    retained = list((tmp_path / "recordings" / "camera.recovery").rglob(segment.name))
-    assert len(retained) == 1
-    assert retained[0].read_bytes() == b"recorded segment"
-    assert not segment.exists()
+    assert segment.read_bytes() == b"recorded segment"
 
 
 def test_segment_processing_error_keeps_source(tmp_path) -> None:
@@ -798,3 +797,115 @@ def test_recovery_move_error_keeps_source(tmp_path) -> None:
     ):
         work._handle_m4s(segment.name)
     assert segment.read_bytes() == b"recorded segment"
+
+
+def test_delta_playlist_emits_first_visible_run_init_before_discontinuity() -> None:
+    """A delta playlist must include the init of its first visible run."""
+    fragments = [
+        Fragment("a", "/a", 5, PLAYLIST_BASE_TIME, init_file="/init-a", run_id="a"),
+        Fragment(
+            "b",
+            "/b",
+            5,
+            PLAYLIST_BASE_TIME + datetime.timedelta(seconds=5),
+            init_file="/init-b",
+            run_id="b",
+        ),
+        Fragment(
+            "c",
+            "/c",
+            5,
+            PLAYLIST_BASE_TIME + datetime.timedelta(seconds=10),
+            init_file="/init-c",
+            run_id="c",
+        ),
+    ]
+    playlist = generate_playlist(
+        fragments, "/legacy", can_skip_until=5, max_skipped_segments=2
+    )
+    assert "#EXT-X-SKIP:SKIPPED-SEGMENTS=2" in playlist
+    assert playlist.index('URI="/init-c"') < playlist.index("#EXT-X-DISCONTINUITY")
+    assert "/init-a" not in playlist
+    assert "/init-b" not in playlist
+
+
+def test_playlist_emits_init_after_later_run_discontinuity() -> None:
+    """A later run switches init after its discontinuity marker."""
+    fragments = [
+        Fragment("a", "/a", 5, PLAYLIST_BASE_TIME, init_file="/init-a", run_id="a"),
+        Fragment(
+            "b",
+            "/b",
+            5,
+            PLAYLIST_BASE_TIME + datetime.timedelta(seconds=5),
+            init_file="/init-b",
+            run_id="b",
+        ),
+    ]
+    playlist = generate_playlist(fragments, "/legacy")
+    assert playlist.index('URI="/init-a"') < playlist.index("#EXT-X-DISCONTINUITY")
+    assert playlist.index("#EXT-X-DISCONTINUITY") < playlist.index('URI="/init-b"')
+
+
+@pytest.mark.parametrize("run_id", [None, "20261031T143215.123456Z-aabbccddeeff"])
+def test_concatenate_fragments_accepts_legacy_and_single_run(run_id) -> None:
+    """Existing clips and single-run clips use their respective init."""
+    camera = MagicMock()
+    camera.segments_folder = "/legacy"
+    camera.config = {"recorder": {"ffmpeg_loglevel": "error"}}
+    worker = MagicMock()
+    worker._camera = camera
+    fragments = [
+        Fragment(
+            "a",
+            "/a",
+            5,
+            PLAYLIST_BASE_TIME,
+            run_id=run_id,
+            init_file=f"/{run_id}/init.mp4" if run_id else None,
+        ),
+    ]
+    with patch("viseron.domains.camera.fragmenter.sp.run") as run:
+        result = Fragmenter.concatenate_fragments(worker, fragments)
+    assert result
+    playlist = run.call_args.kwargs["input"].decode()
+    assert (f"/{run_id}/init.mp4" if run_id else "/legacy/init.mp4") in playlist
+
+
+def test_concatenate_fragments_rejects_multiple_runs() -> None:
+    """Do not invoke ffmpeg when an export spans recorder runs."""
+    worker = MagicMock()
+    fragments = [
+        Fragment("a", "/a", 5, PLAYLIST_BASE_TIME, run_id="a"),
+        Fragment("b", "/b", 5, PLAYLIST_BASE_TIME, run_id="b"),
+    ]
+    with patch("viseron.domains.camera.fragmenter.sp.run") as run:
+        assert Fragmenter.concatenate_fragments(worker, fragments) is False
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-10-25T01:30:00.000+0100", "2026-10-25T00:30:00+00:00"),
+        ("2026-10-25T01:30:00.000+0000", "2026-10-25T01:30:00+00:00"),
+        ("2026-10-25T01:30:00.000-0700", "2026-10-25T08:30:00+00:00"),
+        ("2026-10-25T01:30:00.000Z", "2026-10-25T01:30:00+00:00"),
+    ],
+)
+def test_extract_program_date_time_uses_playlist_offset(value, expected):
+    """Use each playlist recorded timestamp offset, including across DST."""
+    playlist = f"#EXT-X-PROGRAM-DATE-TIME:{value}\nsegment.m4s\n"
+    result = _extract_program_date_time(playlist, "segment.m4s")
+    assert (result.isoformat() if result is not None else None) == expected
+
+
+def test_extract_program_date_time_offsetless_legacy_fallback(monkeypatch):
+    """Keep the legacy local-offset fallback for offsetless timestamps."""
+    monkeypatch.setattr(
+        "viseron.domains.camera.fragmenter_process.get_utc_offset",
+        lambda: datetime.timedelta(hours=2),
+    )
+    playlist = "#EXT-X-PROGRAM-DATE-TIME:2026-10-25T01:30:00\nsegment.m4s\n"
+    result = _extract_program_date_time(playlist, "segment.m4s")
+    assert result.isoformat() == "2026-10-24T23:30:00+00:00"

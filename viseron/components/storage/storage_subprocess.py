@@ -70,6 +70,7 @@ class DataItem:
     callback_id: str | None = None
     data: np.ndarray | None = None
     error: str | None = None
+    deferred: bool = False
 
     @property
     def throttle_key(self) -> str:
@@ -88,6 +89,11 @@ class DataItemMoveFile:
     cmd: Literal["move_file"]
     src: str
     dst: str
+    camera_identifier: str | None = None
+    publication_meta: dict | None = None
+    dispatch_token: str | None = None
+    deferred: bool = False
+    deferred_by_hold: bool = False
     callback_id: str | None = None
     error: str | None = None
     tier_markers: dict[str, str] = field(default_factory=dict)
@@ -99,6 +105,7 @@ class DataItemDeleteFile:
 
     cmd: Literal["delete_file"]
     src: str
+    deferred: bool = False
     callback_id: str | None = None
     error: str | None = None
     tier_markers: dict[str, str] = field(default_factory=dict)

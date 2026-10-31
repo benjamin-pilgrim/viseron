@@ -58,6 +58,7 @@ export interface HlsErrorHandlerOptions {
   >;
   delayedRecoveryTimeoutRef: React.MutableRefObject<NodeJS.Timeout | undefined>;
   onReinitialize: () => void;
+  recordingPlaylist?: boolean;
 }
 
 // Sets up standardized error handling for an HLS.js instance.
@@ -72,11 +73,16 @@ export function setupHlsErrorHandling(
     delayedInitializationTimeoutRef,
     delayedRecoveryTimeoutRef,
     onReinitialize,
+    recordingPlaylist,
   } = options;
+
+  let unsupportedRecording = false;
 
   // Reset error state when a fragment is loaded successfully
   hls.on(Hls.Events.FRAG_LOADED, () => {
-    setHlsRefsError(hlsRef, null);
+    if (!unsupportedRecording) {
+      setHlsRefsError(hlsRef, null);
+    }
   });
 
   // Delayed initialization retry for fatal errors
@@ -105,6 +111,34 @@ export function setupHlsErrorHandling(
 
   // Main error handler
   hls.on(Hls.Events.ERROR, (_event, data) => {
+    // Recording playlists return 409 when their fragments span camera runs.
+    // Stop loading (including live-playlist refreshes) and prevent buffered
+    // playback; retrying cannot make this recording compatible.
+    if (
+      recordingPlaylist &&
+      data.response?.code === 409 &&
+      (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+        data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR)
+    ) {
+      unsupportedRecording = true;
+      if (delayedInitializationTimeoutRef.current) {
+        clearTimeout(delayedInitializationTimeoutRef.current);
+        delayedInitializationTimeoutRef.current = undefined;
+      }
+      if (delayedRecoveryTimeoutRef.current) {
+        clearTimeout(delayedRecoveryTimeoutRef.current);
+        delayedRecoveryTimeoutRef.current = undefined;
+      }
+      hls.stopLoad();
+      hls.media?.pause();
+      setHlsRefsError(
+        hlsRef,
+        "This recording spans camera restarts and cannot be played as one event.",
+      );
+      return;
+    }
+    if (unsupportedRecording) return;
+
     // Check if this is an ignorable error
     if (!IGNORABLE_ERROR_DETAILS.has(data.details)) {
       console.log("HLSJS Error:", data);

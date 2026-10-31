@@ -6,6 +6,7 @@ import asyncio
 import datetime
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from viseron.components.webserver.websocket_api.commands import (
     _camera_identifier_from_event,
     _event_allowed,
     _state_changed_allowed,
+    export_recording,
     export_timespan,
     get_entities,
     render_timelapse,
@@ -348,7 +350,14 @@ def test_export_timespan_filename() -> None:
         patch(
             "viseron.components.webserver.websocket_api.commands."
             "get_time_period_fragments",
-            return_value=[MagicMock()],
+            return_value=[
+                SimpleNamespace(
+                    filename="a.m4s",
+                    path="/legacy/a.m4s",
+                    duration=5,
+                    orig_ctime=datetime.datetime.now(datetime.timezone.utc),
+                )
+            ],
         ),
         patch("viseron.components.webserver.websocket_api.commands.shutil.move"),
         patch("viseron.components.webserver.websocket_api.commands.create_directory"),
@@ -686,3 +695,94 @@ class TestRenderTimelapse:
         assert sent["success"] is False
         assert sent["error"]["code"] == code
         connection.vis.data[TIMELAPSE_RENDER_MANAGER].submit.assert_not_called()
+
+
+def test_export_timespan_rejects_restart_with_explanation() -> None:
+    """The API exposes restart failures to the existing export-error toast."""
+    connection = _connection(_user())
+    connection.get_camera.return_value.identifier = "cam_a"
+
+    async def run_inline(func: Any, *args: Any) -> Any:
+        return func(*args)
+
+    connection.run_in_executor = run_inline
+    now = datetime.datetime.now(datetime.timezone.utc)
+    run_a = "20261031T143215.123456Z-aabbccddeeff"
+    run_b = "20261031T143220.123456Z-aabbccddeeff"
+    files = [
+        SimpleNamespace(
+            filename="a.m4s",
+            path=f"/segments/{run_a}/a.m4s",
+            duration=5,
+            orig_ctime=now,
+        ),
+        SimpleNamespace(
+            filename="b.m4s",
+            path=f"/segments/{run_b}/b.m4s",
+            duration=5,
+            orig_ctime=now,
+        ),
+    ]
+    with patch(f"{COMMANDS}.get_time_period_fragments", return_value=files):
+        asyncio.run(
+            export_timespan(
+                connection,
+                {
+                    "type": "export_timespan",
+                    "command_id": 1,
+                    "camera_identifier": "cam_a",
+                    "start": 1,
+                    "end": 20,
+                },
+            )
+        )
+    messages = [call.args[0] for call in connection.async_send_message.call_args_list]
+    assert any(
+        "Export across a camera restart is not supported." in str(message)
+        for message in messages
+    )
+    connection.get_camera.return_value.fragmenter.concatenate_fragments.assert_not_called()
+
+
+def test_export_recording_rejects_restart_with_explanation() -> None:
+    """Recording exports report the same clear error for multiple runs."""
+    connection = _connection(_user())
+    connection.get_camera.return_value.identifier = "cam_a"
+
+    async def run_inline(func: Any, *args: Any) -> Any:
+        return func(*args)
+
+    connection.run_in_executor = run_inline
+    now = datetime.datetime.now(datetime.timezone.utc)
+    files = [
+        SimpleNamespace(
+            filename="a.m4s",
+            path="/segments/20261031T143215.123456Z-aabbccddeeff/a.m4s",
+            duration=5,
+            orig_ctime=now,
+        ),
+        SimpleNamespace(
+            filename="b.m4s",
+            path="/segments/20261031T143220.123456Z-aabbccddeeff/b.m4s",
+            duration=5,
+            orig_ctime=now,
+        ),
+    ]
+    with patch(f"{COMMANDS}.get_recording_fragments", return_value=files):
+        asyncio.run(
+            export_recording(
+                connection,
+                {
+                    "type": "export_recording",
+                    "command_id": 1,
+                    "camera_identifier": "cam_a",
+                    "recording_id": 5,
+                },
+            )
+        )
+    messages = [call.args[0] for call in connection.async_send_message.call_args_list]
+    assert any(
+        "Export across a camera restart is not supported." in str(message)
+        for message in messages
+    )
+    connection.get_camera.return_value.fragmenter.concatenate_fragments.assert_not_called()

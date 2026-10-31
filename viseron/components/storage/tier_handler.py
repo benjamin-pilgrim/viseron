@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import datetime
+import json
 import logging
 import os
 import threading
@@ -11,6 +14,7 @@ from queue import Queue
 from threading import Timer
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from apscheduler.jobstores.base import JobLookupError
 from sqlalchemy import Delete, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import NoResultFound
@@ -58,6 +62,28 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     TIER_SUBCATEGORY_THUMBNAILS,
     CleanupJobNames,
+)
+from viseron.components.storage.dispatch_fence import create_token
+from viseron.components.storage.pending_journal import (
+    PREFIX,
+    marker_for_path,
+    sync_dir,
+    publish_or_verify,
+    protected_by_pending,
+    assign_file_key,
+    assign_destination_id,
+    release_indexed_source,
+)
+from viseron.components.storage.source_move_intent import (
+    is_source_move_marker,
+    marker_for_source,
+    source_move_pending,
+)
+from viseron.components.storage.source_move_intent import scan_source_intents
+from viseron.components.storage.run_lifecycle import (
+    CameraLockBusy,
+    camera_lock,
+    is_run_directory,
 )
 from viseron.components.storage.models import (
     FILE_KEY_SEQUENCE,
@@ -118,6 +144,14 @@ if TYPE_CHECKING:
     from viseron.domains.camera import AbstractCamera
 
 
+JOURNAL_BATCH_LIMIT = 1024
+JOURNAL_STALE_SECONDS = 300
+
+
+class SourceJournalMismatch(ValueError):
+    """The source database identity no longer matches the pending journal."""
+
+
 def _src_path(event: FileSystemEvent) -> str:
     """Return the source path of a watchdog event as a str.
 
@@ -169,7 +203,18 @@ class TierHandler(FileSystemEventHandler):
         )
         self._check_tier_lock = threading.Lock()
         self._tier_check_in_progress = False
+        self._tier_check_force_pending = False
+        self._tier_check_retry_timer: threading.Timer | None = None
+        self._tier_check_stopping = False
+        self._deletion_retry_stop = threading.Event()
 
+        self._journal_retry_lock = threading.Lock()
+        self._journal_retry_timer: threading.Timer | None = None
+        self._journal_retry_paths: set[str] = set()
+        self._journal_retry_rescan = False
+        self._journal_retry_stopping = False
+        self._journal_replay_after: str | None = None
+        self._journal_reported_issues: set[tuple[str, str]] = set()
         self._pending_updates: dict[str, Timer] = {}
         self._event_queue: Queue[FileSystemEvent | None] = Queue()
         self._event_thread = RestartableThread(
@@ -194,6 +239,381 @@ class TierHandler(FileSystemEventHandler):
         self._observer = (
             self._start_observer() if self._storage.tier_available(self._path) else None
         )
+        self._replay_pending_publications()
+        self._source_intent_job = None
+        self._source_intent_cursor = {}
+        self._source_scan_lock = threading.Lock()
+        self._hold_retry_lock = threading.Lock()
+        self._hold_retry_token = create_token()
+        self._hold_retry_active = set()
+        self._hold_retry_stopping = False
+        self._hold_retry_since = 0.0
+        self._hold_retry_warned = False
+        if self._subcategory == TIER_SUBCATEGORY_SEGMENTS:
+            self._source_intent_job = self._vis.background_scheduler.add_job(
+                self._reconcile_source_intents,
+                "interval",
+                seconds=30,
+                next_run_time=utcnow(),
+                max_instances=1,
+                coalesce=True,
+            )
+
+    def _reconcile_source_intents(self):
+        """Run at most one isolated scan without occupying the scheduler."""
+        with self._hold_retry_lock:
+            if self._hold_retry_stopping:
+                return
+            if (
+                self._hold_retry_active
+                and not self._hold_retry_warned
+                and time.monotonic() - self._hold_retry_since > JOURNAL_STALE_SECONDS
+            ):
+                self._hold_retry_warned = True
+                self._logger.warning(
+                    "Held move retry is still active; a storage worker "
+                    "or callback may be stalled"
+                )
+            if not self._source_scan_lock.acquire(blocking=False):
+                return
+
+        def scan():
+            try:
+                self._scan_source_intents()
+            finally:
+                self._source_scan_lock.release()
+
+        try:
+            threading.Thread(target=scan, daemon=True, name="source-hold-scan").start()
+        except Exception:
+            self._source_scan_lock.release()
+            raise
+
+    def _scan_source_intents(self):
+        """Scan holds; unavailable roots and unknown destinations fail closed."""
+        try:
+            tiers = self._storage.camera_tier_handlers[self._camera.identifier][
+                self._category
+            ]
+            roots = [
+                tier[TIER_SUBCATEGORY_SEGMENTS]._path
+                for tier in tiers
+                if TIER_SUBCATEGORY_SEGMENTS in tier
+            ]
+
+            def report_incomplete(marker):
+                key = (marker, "incomplete source hold")
+                with self._journal_retry_lock:
+                    if (
+                        key not in self._journal_reported_issues
+                        and len(self._journal_reported_issues) < JOURNAL_BATCH_LIMIT
+                    ):
+                        self._journal_reported_issues.add(key)
+                        self._logger.warning(
+                            "Source hold %s is long-running or interrupted. "
+                            "It may still be active on another instance; inspect "
+                            "publication state before intervening. "
+                            "Do not remove the hold.",
+                            marker,
+                        )
+
+            scan_source_intents(
+                self._path,
+                self._storage.get_session,
+                self._storage.tier_available,
+                roots,
+                "/tmp/viseron-run-locks",
+                cursor=self._source_intent_cursor,
+                report_incomplete=report_incomplete,
+                retry_incomplete=self._retry_held_move,
+            )
+        except Exception:
+            self._logger.exception("Source-intent reconciliation failed; retrying")
+
+    def _retry_held_move(self, marker, record):
+        """Isolate potentially stalled tier probes to one daemon per camera."""
+        source = record.get("source")
+        if not isinstance(source, str):
+            return
+        with self._hold_retry_lock:
+            if self._hold_retry_stopping:
+                return
+            if self._hold_retry_active:
+                if (
+                    not self._hold_retry_warned
+                    and time.monotonic() - self._hold_retry_since
+                    > JOURNAL_STALE_SECONDS
+                ):
+                    self._hold_retry_warned = True
+                    self._logger.warning(
+                        "Held move retry is still active; a storage worker "
+                        "or callback may be stalled"
+                    )
+                return
+            self._hold_retry_active.add(source)
+            self._hold_retry_since = time.monotonic()
+            self._hold_retry_warned = False
+
+        def run():
+            queued = False
+            try:
+                queued = self._retry_held_move_worker(marker, record)
+            except Exception:
+                self._logger.exception("Could not retry held move %s", marker)
+            finally:
+                if not queued:
+                    with self._hold_retry_lock:
+                        self._hold_retry_active.discard(source)
+
+        try:
+            threading.Thread(target=run, daemon=True, name="held-move-retry").start()
+        except Exception:
+            with self._hold_retry_lock:
+                self._hold_retry_active.discard(source)
+            raise
+
+    def _hold_retry_stopped(self):
+        with self._hold_retry_lock:
+            return self._hold_retry_stopping
+
+    def _retry_held_move_worker(self, marker, record):
+        """Inspect and replay an incomplete source hold in an isolated worker."""
+        source = record.get("source")
+        destination = record.get("destination")
+        source_db = record.get("source_db")
+        if not isinstance(source, str) or not isinstance(destination, str):
+            return
+        if not isinstance(source_db, dict) or not os.path.isabs(source):
+            return
+        source_dir = os.path.dirname(source)
+        if (
+            os.path.dirname(source_dir) != os.path.abspath(self._path)
+            or not is_run_directory(os.path.basename(source_dir))
+            or marker != str(marker_for_source(source))
+            or not source.endswith(".m4s")
+        ):
+            return
+        tiers = self._storage.camera_tier_handlers[self._camera.identifier][
+            self._category
+        ]
+        next_tier = next(
+            (
+                tier[self._subcategory]
+                for tier in tiers[self._tier_id + 1 :]
+                if self._subcategory in tier
+                and os.path.abspath(tier[self._subcategory]._path)
+                == os.path.dirname(os.path.dirname(destination))
+            ),
+            None,
+        )
+        if (
+            next_tier is None
+            or os.path.basename(os.path.dirname(destination))
+            != os.path.basename(source_dir)
+            or os.path.basename(destination) != os.path.basename(source)
+        ):
+            return
+        try:
+            with camera_lock(
+                "/tmp/viseron-run-locks", os.path.abspath(next_tier._path)
+            ):
+                if (
+                    not self._storage.tier_available(destination)
+                    or self._hold_retry_stopped()
+                ):
+                    return False
+                journal_exists = os.path.lexists(marker_for_path(destination))
+                if self._hold_retry_stopped():
+                    return False
+                if journal_exists:
+                    # Destination owns this replay and checks its own stop
+                    # state. Never hold our stop lock through timer creation.
+                    if not self._hold_retry_stopped():
+                        next_tier._schedule_journal_retry(destination)
+                    return False
+                destination_exists = os.path.lexists(destination)
+                if self._hold_retry_stopped():
+                    return False
+                if destination_exists:
+                    self._logger.warning(
+                        "Held move destination exists without a journal: %s",
+                        destination,
+                    )
+                    return False
+        except BlockingIOError:
+            return False
+        try:
+            with self._storage.get_session() as session:
+                row = session.execute(
+                    select(Files).where(Files.path == source)
+                ).scalar_one_or_none()
+                if self._hold_retry_stopped():
+                    return False
+                if (
+                    row is None
+                    or row.id != source_db.get("id")
+                    or row.tier_id != source_db.get("tier_id")
+                    or row.tier_path != source_db.get("tier_path")
+                    or row.camera_identifier != self._camera.identifier
+                    or row.category != self._category
+                    or row.subcategory != self._subcategory
+                    or row.file_key != record.get("file_key")
+                    or row.size != record.get("size")
+                ):
+                    raise ValueError("source row changed before held move retry")  # noqa: TRY301
+                metadata = {
+                    "orig_ctime": row.orig_ctime.isoformat(),
+                    "duration": row.duration,
+                    "file_key": row.file_key,
+                    "source_db": source_db,
+                }
+
+            def done(item):
+                with self._hold_retry_lock:
+                    self._hold_retry_active.discard(source)
+                if item.error:
+                    self._logger.warning(
+                        "Held move retry failed for %s: %s", source, item.error
+                    )
+
+            with self._hold_retry_lock:
+                if self._hold_retry_stopping:
+                    return False
+                token = self._hold_retry_token
+            # Manager IPC can block. It runs in the bounded daemon, never under
+            # the stop lock; a late item is rejected by the child token check.
+            self._storage.tier_check_worker_send_command(
+                DataItemMoveFile(
+                    cmd="move_file",
+                    src=source,
+                    dst=destination,
+                    camera_identifier=self._camera.identifier,
+                    publication_meta=metadata,
+                    dispatch_token=token,
+                ),
+                callback=done,
+            )
+            return True
+        except Exception:
+            self._logger.exception("Could not retry held move %s", marker)
+            return False
+
+    def _schedule_journal_retry(self, path: str | None = None) -> None:
+        """Keep one timer and a bounded set of pending paths per handler."""
+        with self._journal_retry_lock:
+            if self._journal_retry_stopping:
+                return
+            if path is None or len(self._journal_retry_paths) >= JOURNAL_BATCH_LIMIT:
+                self._journal_retry_rescan = True
+            else:
+                self._journal_retry_paths.add(path)
+            if self._journal_retry_timer is not None:
+                return
+            timer = threading.Timer(1, self._retry_journal_publications)
+            timer.daemon = True
+            self._journal_retry_timer = timer
+            timer.start()
+
+    def _retry_journal_publications(self) -> None:
+        with self._journal_retry_lock:
+            self._journal_retry_timer = None
+            if self._journal_retry_stopping:
+                return
+            paths = self._journal_retry_paths
+            self._journal_retry_paths = set()
+            rescan = self._journal_retry_rescan
+            self._journal_retry_rescan = False
+            for path in paths:
+                if self._event_queue.qsize() >= JOURNAL_BATCH_LIMIT:
+                    rescan = True
+                    break
+                self._event_queue.put(FileCreatedEvent(path))
+        if rescan:
+            self._replay_pending_publications()
+
+    def _replay_pending_publications(self) -> None:
+        """Queue a bounded, rotating batch after startup or tier recovery."""
+        if not self._storage.tier_available(self._path):
+            self._schedule_journal_retry()
+            return
+        queued = 0
+        after = getattr(self, "_journal_replay_after", None)
+        skipped = False
+        for root, dirs, files in os.walk(self._path):
+            dirs.sort()
+            if not is_run_directory(os.path.basename(root)):
+                continue
+            for name in sorted(files):
+                if not name.startswith(PREFIX) or not name.endswith(".m4s.json"):
+                    continue
+                target = os.path.join(root, name[len(PREFIX) : -len(".json")])
+                marker = os.path.join(root, name)
+                try:
+                    with camera_lock(
+                        "/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(root))
+                    ):
+                        with open(marker, encoding="utf-8") as source:
+                            record = json.load(source)
+                        temp_name = record.get("temp_name", "")
+                        valid_temp = (
+                            isinstance(temp_name, str)
+                            and temp_name.startswith(".viseron-tier-move-")
+                            and os.path.basename(temp_name) == temp_name
+                        )
+                        if not os.path.lexists(target) and not (
+                            valid_temp
+                            and os.path.lexists(os.path.join(root, temp_name))
+                        ):
+                            issue = "media is missing"
+                        elif (
+                            time.time() - os.stat(marker).st_mtime
+                            > JOURNAL_STALE_SECONDS
+                        ):
+                            issue = "pending for over five minutes"
+                        else:
+                            issue = None
+                        if issue:
+                            key = (marker, issue)
+                            with self._journal_retry_lock:
+                                if key not in self._journal_reported_issues:
+                                    if (
+                                        len(self._journal_reported_issues)
+                                        < JOURNAL_BATCH_LIMIT
+                                    ):
+                                        self._journal_reported_issues.add(key)
+                                        self._logger.warning(
+                                            "Journal %s: %s", marker, issue
+                                        )
+                except (OSError, ValueError, TypeError):
+                    # Replay remains responsible for retaining/reporting bad markers.
+                    pass
+                if after is not None and target <= after:
+                    skipped = True
+                    continue
+                with self._journal_retry_lock:
+                    if self._journal_retry_stopping:
+                        return
+                    if self._event_queue.qsize() >= JOURNAL_BATCH_LIMIT:
+                        self._schedule_journal_retry_unlocked()
+                        return
+                    self._event_queue.put(FileCreatedEvent(target))
+                    self._journal_replay_after = target
+                queued += 1
+                if queued >= JOURNAL_BATCH_LIMIT:
+                    self._schedule_journal_retry()
+                    return
+        self._journal_replay_after = None
+        if skipped:
+            self._schedule_journal_retry()
+
+    def _schedule_journal_retry_unlocked(self) -> None:
+        """Request a rescan while the journal retry lock is already held."""
+        self._journal_retry_rescan = True
+        if self._journal_retry_timer is None and not self._journal_retry_stopping:
+            timer = threading.Timer(1, self._retry_journal_publications)
+            timer.daemon = True
+            self._journal_retry_timer = timer
+            timer.start()
 
     def _start_observer(self):
         """Create a fresh observer for the current directory mount."""
@@ -233,6 +653,7 @@ class TierHandler(FileSystemEventHandler):
                 return False
             previous_observer = self._observer
             self._observer = observer
+        self._replay_pending_publications()
         if previous_observer is not None:
             threading.Thread(
                 target=self._dispose_observer,
@@ -312,13 +733,23 @@ class TierHandler(FileSystemEventHandler):
     def _check_tier_event_handler(self, _event: Event) -> None:
         """Handle check tier event."""
         self._storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_FILES)
-        self.check_tier()
+        self.check_tier(force=True)
 
     def check_tier(self, *, force: bool = False) -> bool:
         """Check if file should be moved to next tier."""
         with self._check_tier_lock:
-            if self._tier_check_in_progress:
+            if self._tier_check_stopping:
                 return False
+            if self._tier_check_in_progress:
+                if force:
+                    self._tier_check_force_pending = True
+                    return True
+                return False
+            if force:
+                self._tier_check_force_pending = False
+                if self._tier_check_retry_timer is not None:
+                    self._tier_check_retry_timer.cancel()
+                    self._tier_check_retry_timer = None
             # Throttling is also done in the worker process, but we do the same here
             # in order to not spam the workers with unneeded requests.
             now = utcnow()
@@ -345,6 +776,8 @@ class TierHandler(FileSystemEventHandler):
         except StorageCallbackCapacityError:
             with self._check_tier_lock:
                 self._tier_check_in_progress = False
+                if force or self._tier_check_force_pending:
+                    self._schedule_forced_tier_retry_locked()
             self._logger.warning("Storage worker busy; tier check deferred")
             return False
         except Exception:
@@ -352,7 +785,30 @@ class TierHandler(FileSystemEventHandler):
             # tier would never be checked again.
             with self._check_tier_lock:
                 self._tier_check_in_progress = False
+                if force or self._tier_check_force_pending:
+                    self._schedule_forced_tier_retry_locked()
             raise
+
+    def _schedule_forced_tier_retry_locked(self) -> None:
+        """Retry failed submissions without flooding the worker."""
+        self._tier_check_force_pending = True
+        if self._tier_check_stopping or self._tier_check_retry_timer is not None:
+            return
+        timer = threading.Timer(1.0, self._retry_forced_tier_check)
+        timer.daemon = True
+        self._tier_check_retry_timer = timer
+        timer.start()
+
+    def _retry_forced_tier_check(self) -> None:
+        with self._check_tier_lock:
+            self._tier_check_retry_timer = None
+            if self._tier_check_stopping or not self._tier_check_force_pending:
+                return
+            self._tier_check_force_pending = False
+        try:
+            self.check_tier(force=True)
+        except Exception:  # pylint: disable=broad-except # noqa: BLE001
+            self._logger.exception("Failed to retry forced tier check")
 
     def _check_tier(self, get_session: Callable[[], Session], data: np.ndarray) -> None:
         files_processed = 0
@@ -390,6 +846,8 @@ class TierHandler(FileSystemEventHandler):
         with self._check_tier_lock:
             self._time_of_last_call = utcnow()
             self._tier_check_in_progress = False
+            if self._tier_check_force_pending:
+                self._schedule_forced_tier_retry_locked()
 
     def on_check_tier_result(self, item: DataItem) -> None:
         """Handle the result of the check tier command."""
@@ -400,6 +858,9 @@ class TierHandler(FileSystemEventHandler):
         # already running for this camera, or the job was superseded in the dedup
         # queue. Release the slot immediately so the next event can send again.
         if item.data is None or len(item.data) == 0:
+            if item.deferred and item.throttle_period == timedelta(0):
+                with self._check_tier_lock:
+                    self._tier_check_force_pending = True
             self._release_check_tier()
             return
 
@@ -464,13 +925,19 @@ class TierHandler(FileSystemEventHandler):
 
         if is_tier_marker(src_path, self._storage.config.get(CONFIG_TIER_MARKERS, {})):
             return
+        if is_source_move_marker(src_path):
+            return
 
         if is_tier_move_temp_file(src_path):
             if isinstance(event, FileMovedEvent):
                 destination = cast("str", event.dest_path)
-                if not is_tier_move_temp_file(destination) and os.path.commonpath(
-                    (self._path, destination)
-                ) == os.path.normpath(self._path):
+                if (
+                    not is_tier_move_temp_file(destination)
+                    and not is_source_move_marker(destination)
+                    and os.path.basename(destination) not in self._storage.ignored_files
+                    and os.path.commonpath((self._path, destination))
+                    == os.path.normpath(self._path)
+                ):
                     self._event_queue.put(FileCreatedEvent(destination))
             return
 
@@ -479,38 +946,370 @@ class TierHandler(FileSystemEventHandler):
         self._event_queue.put(event)
 
     def _on_created(self, event: FileCreatedEvent) -> None:
-        """Insert into database when file is created."""
+        """Index a publication, acknowledging its journal only after commit."""
         src_path = _src_path(event)
+        if is_source_move_marker(src_path):
+            return
+        directory = os.path.dirname(src_path)
+        if not is_run_directory(os.path.basename(directory)):
+            self._on_created_impl(event)
+            return
+        try:
+            with camera_lock(
+                "/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(directory))
+            ):
+                marker = marker_for_path(src_path)
+                file_meta = None
+                if os.path.exists(marker):
+                    with open(marker, encoding="utf-8") as stream:
+                        record = json.load(stream)
+                    if record.get("version") == 2:  # noqa: PLR2004
+                        record = publish_or_verify(marker)
+                    if (
+                        record.get("version") != 2  # noqa: PLR2004
+                        or record.get("filename") != os.path.basename(src_path)
+                        or not os.path.isfile(os.path.join(directory, "init.mp4"))
+                    ):
+                        raise ValueError("Invalid pending publication")  # noqa: TRY301
+                    data = record["meta"]
+                    if data.get("file_key") is None:
+                        # Sequence allocation can leave gaps after a crash; it
+                        # must be persisted before the row is acknowledged.
+                        with self._storage.get_session() as session:
+                            key = session.execute(
+                                select(FILE_KEY_SEQUENCE.next_value())
+                            ).scalar_one()
+                        record = assign_file_key(marker, key)
+                        data = record["meta"]
+                    file_meta = FilesMeta(
+                        orig_ctime=datetime.datetime.fromisoformat(data["orig_ctime"]),
+                        duration=data["duration"],
+                        file_key=data["file_key"],
+                    )
+                if (
+                    file_meta is not None
+                    and record.get("source_intent")
+                    and record["meta"].get("source_db") is not None
+                ):
+                    if record.get("destination_id") is None:
+                        with self._storage.get_session() as session:
+                            existing = session.execute(
+                                select(Files.id).where(Files.path == src_path)
+                            ).scalar_one_or_none()
+                            if existing is not None:
+                                issue = (marker, "unbound destination row")
+                                with self._journal_retry_lock:
+                                    reported = getattr(
+                                        self, "_journal_reported_issues", set()
+                                    )
+                                    if (
+                                        issue not in reported
+                                        and len(reported) < JOURNAL_BATCH_LIMIT
+                                    ):
+                                        reported.add(issue)
+                                        self._journal_reported_issues = reported
+                                        self._logger.warning(
+                                            "Journal %s has an unbound destination "
+                                            "database row. Files are retained; "
+                                            "stop Viseron and reconcile the row "
+                                            "before retrying. See %s.",
+                                            marker,
+                                            "docs/testing/tier-journal-recovery.md",
+                                        )
 
+                                return
+                            destination_id = session.execute(
+                                select(
+                                    func.nextval(
+                                        func.pg_get_serial_sequence("files", "id")
+                                    )
+                                )
+                            ).scalar_one()
+                        record = assign_destination_id(marker, destination_id)
+                    try:
+                        self._on_created_impl(event, file_meta, journal_source=record)
+                    except SourceJournalMismatch:
+                        self._withdraw_journal_destination(src_path, record, file_meta)
+                        raise
+                else:
+                    self._on_created_impl(event, file_meta)
+                if file_meta is not None and not record.get("source_intent"):
+                    os.unlink(marker)
+                    sync_dir(directory)
+                elif file_meta is not None and record.get("source_intent"):
+                    camera_root = os.path.abspath(os.path.dirname(directory))
+                    parent, camera_name = os.path.split(camera_root)
+                    spool_root = os.path.join(parent, ".viseron-spool", camera_name)
+
+                    def committed(saved):
+                        with self._storage.get_session() as session:
+                            row = session.execute(
+                                select(Files).where(Files.path == src_path)
+                            ).scalar_one_or_none()
+                            return bool(
+                                row is not None
+                                and (
+                                    saved.get("destination_id") is None
+                                    or row.id == saved["destination_id"]
+                                )
+                                and row.file_key == saved["meta"]["file_key"]
+                                and row.size == saved["identity"][2]
+                                and row.camera_identifier == self._camera.identifier
+                                and row.tier_id == self._tier_id
+                                and row.tier_path == self._tier[CONFIG_PATH]
+                                and row.category == self._category
+                                and row.subcategory == self._subcategory
+                                and row.orig_ctime == file_meta.orig_ctime
+                                and row.duration == file_meta.duration
+                            )
+
+                    source_root = os.path.abspath(
+                        os.path.dirname(
+                            os.path.dirname(record["source_snapshot"]["source"])
+                        )
+                    )
+                    roots = [spool_root]
+                    if source_root != spool_root:
+                        tiers = self._storage.camera_tier_handlers[
+                            self._camera.identifier
+                        ][self._category]
+                        # Only prior configured tiers can be sources of a promotion.
+                        roots = [
+                            os.path.abspath(tier[self._subcategory]._path)
+                            for tier in tiers[: self._tier_id]
+                            if self._subcategory in tier
+                        ]
+
+                    if source_root != spool_root and not isinstance(
+                        record["meta"].get("source_db"), dict
+                    ):
+                        issue = (marker, "missing source database identity")
+                        with self._journal_retry_lock:
+                            reported = getattr(self, "_journal_reported_issues", set())
+                            if (
+                                issue not in reported
+                                and len(reported) < JOURNAL_BATCH_LIMIT
+                            ):
+                                reported.add(issue)
+                                self._journal_reported_issues = reported
+                                self._logger.warning(
+                                    "Journal %s lacks source database identity "
+                                    "from an older "
+                                    "version; source retained. Inspect the source and "
+                                    "destination database rows before manual recovery; "
+                                    "do not remove the journal or source.",
+                                    marker,
+                                )
+
+                    @contextlib.contextmanager
+                    def source_index_guard(saved, source_present):
+                        snapshot = saved["source_snapshot"]
+                        expected = saved["meta"].get("source_db")
+                        if not isinstance(expected, dict):
+                            yield None
+                            return
+                        with self._storage.get_session() as session:
+                            _lock_path(session, snapshot["source"])
+                            row = session.execute(
+                                select(Files)
+                                .where(Files.path == snapshot["source"])
+                                .with_for_update()
+                            ).scalar_one_or_none()
+                            if row is None:
+                                yield (None if source_present else lambda: None)
+                                return
+                            if (
+                                row.id != expected.get("id")
+                                or row.tier_id != expected.get("tier_id")
+                                or row.tier_path != expected.get("tier_path")
+                                or row.file_key != saved["meta"]["file_key"]
+                                or row.size != snapshot["size"]
+                                or row.camera_identifier != self._camera.identifier
+                                or row.category != self._category
+                                or row.subcategory != self._subcategory
+                                or row.orig_ctime != file_meta.orig_ctime
+                                or row.duration != file_meta.duration
+                            ):
+                                yield None
+                                return
+
+                            def finalize():
+                                session.delete(row)
+                                session.commit()
+
+                            yield finalize
+
+                    pending_moves = getattr(self._storage, "pending_moves", None)
+                    pending = None
+                    if pending_moves is not None and source_root != spool_root:
+                        with self._storage.pending_moves_lock:
+                            pending = pending_moves.get(
+                                record["source_snapshot"]["source"]
+                            )
+                    result = release_indexed_source(
+                        marker,
+                        roots,
+                        self._storage.tier_available,
+                        committed,
+                        "/tmp/viseron-run-locks",
+                        source_index_guard=(
+                            None if source_root == spool_root else source_index_guard
+                        ),
+                    )
+                    if result != "released":
+                        if result in (
+                            "source-changed",
+                            "source-index-conflict",
+                            "source-intent-mismatch",
+                        ):
+                            self._withdraw_journal_destination(
+                                src_path, record, file_meta
+                            )
+                        self._schedule_journal_retry(src_path)
+                    elif pending is not None:
+                        with self._storage.pending_moves_lock:
+                            source_path = record["source_snapshot"]["source"]
+                            if (
+                                pending.dst == src_path
+                                and pending.tier_id == self._tier_id
+                                and pending.tier_path == self._tier[CONFIG_PATH]
+                                and pending_moves.get(source_path) is pending
+                            ):
+                                pending_moves.pop(source_path, None)
+        except BlockingIOError:
+            self._logger.debug("Publication busy; retrying %s", src_path)
+            self._schedule_journal_retry(src_path)
+        except Exception:
+            self._logger.exception("Pending publication failed: %s", src_path)
+            # Retain marker and retry lock, database, or transient storage failure.
+            self._schedule_journal_retry(src_path)
+
+    def _withdraw_journal_destination(self, path, record, file_meta):
+        """Withdraw only this journal's matching row; retain all media and holds."""
+        with self._storage.get_session() as session:
+            _lock_path(session, path)
+            row = session.execute(
+                select(Files).where(Files.path == path).with_for_update()
+            ).scalar_one_or_none()
+            if (
+                row is not None
+                and row.id == record.get("destination_id")
+                and row.file_key == record["meta"]["file_key"]
+                and row.size == record["identity"][2]
+                and row.camera_identifier == self._camera.identifier
+                and row.tier_id == self._tier_id
+                and row.tier_path == self._tier[CONFIG_PATH]
+                and row.category == self._category
+                and row.subcategory == self._subcategory
+                and row.orig_ctime == file_meta.orig_ctime
+                and row.duration == file_meta.duration
+            ):
+                session.delete(row)
+                session.commit()
+
+    def _on_created_impl(
+        self, event: FileCreatedEvent, journal_meta=None, *, journal_source=None
+    ) -> None:
+        """Insert a file, using journal metadata when available."""
+        src_path = _src_path(event)
         self._logger.debug("File created: %s", src_path)
-        file_meta = self._storage.temporary_files_meta.pop(src_path, None)
+        with self._storage.pending_moves_lock:
+            queued_meta = self._storage.temporary_files_meta.pop(src_path, None)
+        file_meta = journal_meta or queued_meta
         size = os.path.getsize(src_path)
         with self._storage.get_session() as session:
             _lock_path(session, src_path)
-            stmt = (
-                insert(Files)
-                .values(
-                    tier_id=self._tier_id,
-                    tier_path=self._tier[CONFIG_PATH],
-                    camera_identifier=self._camera.identifier,
-                    category=self._category,
-                    subcategory=self._subcategory,
-                    path=src_path,
-                    directory=os.path.dirname(src_path),
-                    filename=os.path.basename(src_path),
-                    size=size,
-                    orig_ctime=file_meta.orig_ctime if file_meta else utcnow(),
-                    duration=file_meta.duration if file_meta else None,
-                    file_key=(
-                        file_meta.file_key
-                        if file_meta and file_meta.file_key is not None
-                        else FILE_KEY_SEQUENCE.next_value()
-                    ),
-                )
-                # The source row is handed over when its delete is observed first
-                .on_conflict_do_update(index_elements=[Files.path], set_={"size": size})
+            if journal_source is not None:
+                snapshot = journal_source["source_snapshot"]
+                expected = journal_source["meta"]["source_db"]
+                if snapshot.get("source_db") != expected:
+                    raise SourceJournalMismatch("source database snapshot mismatch")
+                _lock_path(session, snapshot["source"])
+                old_row = session.execute(
+                    select(Files)
+                    .where(Files.path == snapshot["source"])
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if old_row is None:
+                    # Replay after an already committed release is allowed only
+                    # when the destination row was previously indexed.
+                    existing = session.execute(
+                        select(Files).where(Files.path == src_path)
+                    ).scalar_one_or_none()
+                    if existing is None:
+                        raise SourceJournalMismatch(
+                            "source row missing before destination index"
+                        )
+                elif (
+                    old_row.id != expected.get("id")
+                    or old_row.tier_id != expected.get("tier_id")
+                    or old_row.tier_path != expected.get("tier_path")
+                    or old_row.file_key != journal_meta.file_key
+                    or old_row.size != snapshot["size"]
+                    or old_row.camera_identifier != self._camera.identifier
+                    or old_row.category != self._category
+                    or old_row.subcategory != self._subcategory
+                    or old_row.orig_ctime != journal_meta.orig_ctime
+                    or old_row.duration != journal_meta.duration
+                ):
+                    raise SourceJournalMismatch(
+                        "source row changed before destination index"
+                    )
+            stmt = insert(Files).values(
+                tier_id=self._tier_id,
+                tier_path=self._tier[CONFIG_PATH],
+                camera_identifier=self._camera.identifier,
+                category=self._category,
+                subcategory=self._subcategory,
+                path=src_path,
+                directory=os.path.dirname(src_path),
+                filename=os.path.basename(src_path),
+                size=size,
+                orig_ctime=file_meta.orig_ctime if file_meta else utcnow(),
+                duration=file_meta.duration if file_meta else None,
+                file_key=(
+                    file_meta.file_key
+                    if file_meta and file_meta.file_key is not None
+                    else FILE_KEY_SEQUENCE.next_value()
+                ),
             )
-            session.execute(stmt)
+            if journal_source is not None:
+                stmt = stmt.values(id=journal_source["destination_id"])
+            if journal_meta is not None:
+                # Do not update an unrelated concurrent insert.
+                session.execute(
+                    stmt.on_conflict_do_nothing(index_elements=[Files.path])
+                )
+                # Journal replay may repeat after commit, but an unrelated row
+                # at the same path must never count as acknowledgement.
+                existing = session.execute(
+                    select(Files).where(Files.path == src_path)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if (
+                        (
+                            journal_source is not None
+                            and existing.id != journal_source["destination_id"]
+                        )
+                        or existing.file_key != file_meta.file_key
+                        or existing.size != size
+                        or existing.camera_identifier != self._camera.identifier
+                        or existing.tier_id != self._tier_id
+                        or existing.tier_path != self._tier[CONFIG_PATH]
+                        or existing.category != self._category
+                        or existing.subcategory != self._subcategory
+                        or existing.orig_ctime != file_meta.orig_ctime
+                        or existing.duration != file_meta.duration
+                    ):
+                        raise ValueError(
+                            "Conflicting database row for pending publication"
+                        )
+            else:
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[Files.path], set_={"size": size}
+                    )
+                )
             session.commit()
 
         self._vis.dispatch_event(
@@ -566,11 +1365,41 @@ class TierHandler(FileSystemEventHandler):
         self._pending_updates[src_path].start()
 
     def _on_deleted(self, event: FileDeletedEvent) -> None:
+        """Fence stale deletion events and pending run publications."""
+        src_path = _src_path(event)
+        directory = os.path.dirname(src_path)
+        if not is_run_directory(os.path.basename(directory)):
+            return self._on_deleted_impl(event)
+        try:
+            with camera_lock(
+                "/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(directory))
+            ):
+                if (
+                    protected_by_pending(src_path)
+                    or source_move_pending(src_path)
+                    or os.path.lexists(src_path)
+                ):
+                    return
+                self._on_deleted_impl(event)
+        except CameraLockBusy:
+            # Return one event to the existing queue, without creating timers or
+            # multiplying events. Limit retries and let shutdown interrupt the wait.
+            if not self._deletion_retry_stop.wait(0.1):
+                with self._check_tier_lock:
+                    if not self._tier_check_stopping:
+                        self._event_queue.put(event)
+        except OSError:
+            self._logger.warning(
+                "Deferring deletion event for %s", src_path, exc_info=True
+            )
+
+    def _on_deleted_impl(self, event: FileDeletedEvent) -> None:
         """Remove file from database when it is deleted."""
         src_path = _src_path(event)
 
         self._logger.debug("File deleted: %s", src_path)
-        pending_move = self._storage.pending_moves.pop(src_path, None)
+        with self._storage.pending_moves_lock:
+            pending_move = self._storage.pending_moves.pop(src_path, None)
         with self._storage.get_session() as session:
             if pending_move:
                 _hand_over_row(session, src_path, pending_move)
@@ -615,6 +1444,32 @@ class TierHandler(FileSystemEventHandler):
     def _stop_observer(self) -> None:
         """Stop the observer."""
         self._logger.debug("Stopping observer")
+        with self._hold_retry_lock:
+            self._hold_retry_stopping = True
+            try:
+                os.unlink(self._hold_retry_token)
+            except FileNotFoundError:
+                pass
+        if self._source_intent_job is not None:
+            try:
+                self._source_intent_job.remove()
+            except JobLookupError:
+                # Scheduler shutdown may already have removed the job.
+                pass
+            self._source_intent_job = None
+        with self._journal_retry_lock:
+            self._journal_retry_stopping = True
+            self._journal_retry_paths.clear()
+            if self._journal_retry_timer is not None:
+                self._journal_retry_timer.cancel()
+                self._journal_retry_timer = None
+        with self._check_tier_lock:
+            self._tier_check_stopping = True
+            self._deletion_retry_stop.set()
+            self._tier_check_force_pending = False
+            if self._tier_check_retry_timer is not None:
+                self._tier_check_retry_timer.cancel()
+                self._tier_check_retry_timer = None
         with self._observer_lock:
             self._observer_stopping = True
             observer = self._observer
@@ -990,7 +1845,8 @@ class SnapshotTierHandler(TierHandler):
     def _on_deleted(self, event: FileDeletedEvent) -> None:
         src_path = _src_path(event)
 
-        pending_move = self._storage.pending_moves.get(src_path)
+        with self._storage.pending_moves_lock:
+            pending_move = self._storage.pending_moves.get(src_path)
         if pending_move:
             self._follow_move(src_path, pending_move)
             super()._on_deleted(event)
@@ -1092,6 +1948,12 @@ class ThumbnailTierHandler(TierHandler):
                     "Failed to move thumbnail for recording with id %s: %s",
                     recording_id,
                     err,
+                )
+                return
+
+            if not recording.thumbnail_path:
+                self._logger.debug(
+                    "Recording %s has no thumbnail to move", recording_id
                 )
                 return
 
@@ -1226,21 +2088,50 @@ def handle_file(
     if not storage.tier_available(path):
         logger.debug("Skipping operation on unavailable tier for %s", path)
         return
-    if next_tier is not None and not storage.tier_available(next_tier[CONFIG_PATH]):
+    if (
+        not force_delete
+        and next_tier is not None
+        and not storage.tier_available(next_tier[CONFIG_PATH])
+    ):
         logger.debug(
             "Skipping operation to unavailable tier %s", next_tier[CONFIG_PATH]
         )
         return
-    if path in storage.camera_requested_files_count[camera_identifier].filenames:
+    if (
+        os.path.basename(path)
+        in storage.camera_requested_files_count[camera_identifier].filenames
+    ):
         logger.debug("File %s is recently requested, skipping", path)
         return
 
     stuck_row = False
     if force_delete or next_tier is None:
-        delete_file(
-            storage,
-            path,
-        )
+
+        def on_delete(item: DataItemDeleteFile) -> None:
+            if item.deferred:
+                _schedule_source_retry(
+                    storage,
+                    camera_identifier,
+                    curr_tier_category,
+                    curr_tier_id,
+                    curr_tier_subcategory,
+                    path,
+                    logger,
+                )
+
+        try:
+            delete_file(storage, path, callback=on_delete)
+        except StorageCallbackCapacityError:
+            _schedule_source_retry(
+                storage,
+                camera_identifier,
+                curr_tier_category,
+                curr_tier_id,
+                curr_tier_subcategory,
+                path,
+                logger,
+            )
+            return
     else:
         new_path = path.replace(tier_path, next_tier[CONFIG_PATH], 1)
         if new_path == path:
@@ -1285,6 +2176,23 @@ def handle_file(
             curr_tier[CONFIG_PATH],
             stuck_row,
         )
+        run = os.path.dirname(path)
+        if is_run_directory(os.path.basename(run)):
+            try:
+                with camera_lock(
+                    "/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(run))
+                ):
+                    if protected_by_pending(path) or source_move_pending(path):
+                        return
+                    with get_session() as session:
+                        stmt = delete(Files).where(Files.path == path)
+                        session.execute(stmt)
+                        session.commit()
+            except OSError:
+                logger.warning(
+                    "Deferring database row cleanup for %s", path, exc_info=True
+                )
+            return
         with get_session() as session:
             stmt = delete(Files).where(Files.path == path)
             session.execute(stmt)
@@ -1294,6 +2202,8 @@ def handle_file(
 def delete_file(
     storage: Storage,
     path: str,
+    *,
+    callback: Callable[[DataItemDeleteFile], None] | None = None,
 ) -> None:
     """Delete file from storage."""
     storage.tier_check_worker_send_command(
@@ -1301,8 +2211,28 @@ def delete_file(
             cmd="delete_file",
             src=path,
         ),
-        callback=None,
+        callback=callback,
     )
+
+
+def _schedule_source_retry(
+    storage: Storage,
+    camera_identifier: str,
+    category: str,
+    tier_id: int,
+    subcategory: str,
+    path: str,
+    logger: logging.Logger,
+) -> None:
+    """Coalesce contention retries through the original tier check."""
+    try:
+        handler = storage.camera_tier_handlers[camera_identifier][category][tier_id][
+            subcategory
+        ]
+        with handler._check_tier_lock:  # pylint: disable=protected-access
+            handler._schedule_forced_tier_retry_locked()  # pylint: disable=protected-access
+    except (KeyError, IndexError):
+        logger.warning("Cannot schedule deferred operation retry for %s", path)
 
 
 def move_file(
@@ -1326,11 +2256,18 @@ def move_file(
     """
     logger.debug("Moving file from %s to %s", src, dst)
     file_meta = None
+    source_db = None
     pending_move = None
     try:
         with get_session() as session:
-            sel = select(Files).where(Files.path == src)
+            _lock_path(session, src)
+            sel = select(Files).where(Files.path == src).with_for_update()
             res = session.execute(sel).scalar_one()
+            source_db = {
+                "id": res.id,
+                "tier_id": res.tier_id,
+                "tier_path": res.tier_path,
+            }
             file_meta = FilesMeta(
                 orig_ctime=res.orig_ctime,
                 duration=res.duration,
@@ -1339,8 +2276,12 @@ def move_file(
             pending_move = PendingMove(
                 dst=dst, tier_id=curr_tier_id + 1, tier_path=dst_tier_path
             )
-            storage.temporary_files_meta[dst] = file_meta
-            storage.pending_moves[src] = pending_move
+            with storage.pending_moves_lock:
+                if src in storage.pending_moves:
+                    logger.debug("Move already pending for %s", src)
+                    return
+                storage.temporary_files_meta[dst] = file_meta
+                storage.pending_moves[src] = pending_move
     except NoResultFound:
         logger.warning(
             "Cannot move %s: source metadata is missing; leaving the file in place",
@@ -1351,9 +2292,28 @@ def move_file(
     def _move_file_callback(
         item: DataItemMoveFile,
     ) -> None:
+        if item.deferred:
+            with storage.pending_moves_lock:
+                if storage.pending_moves.get(src) is pending_move:
+                    storage.pending_moves.pop(src, None)
+                if storage.temporary_files_meta.get(dst) is file_meta:
+                    storage.temporary_files_meta.pop(dst, None)
+            if not item.deferred_by_hold:
+                _schedule_source_retry(
+                    storage,
+                    camera_identifier,
+                    curr_tier_category,
+                    curr_tier_id,
+                    curr_tier_subcategory,
+                    src,
+                    logger,
+                )
+            return
         if item.error:
             logger.error(f"Error moving file {src} to {dst}: {item.error}")
-            storage.pending_moves.pop(src, None)
+            with storage.pending_moves_lock:
+                if storage.pending_moves.get(src) is pending_move:
+                    storage.pending_moves.pop(src, None)
             vis.dispatch_event(
                 EVENT_CHECK_TIER.format(
                     camera_identifier=camera_identifier,
@@ -1373,16 +2333,30 @@ def move_file(
                 cmd="move_file",
                 src=src,
                 dst=dst,
+                camera_identifier=camera_identifier,
+                publication_meta={
+                    "orig_ctime": file_meta.orig_ctime.isoformat(),
+                    "duration": file_meta.duration,
+                    "file_key": file_meta.file_key,
+                    "source_db": source_db,
+                },
             ),
             callback=_move_file_callback,
         )
     except Exception:
         # No worker can complete a command that was not accepted. Avoid
         # removing state replaced by another operation in the meantime.
-        if file_meta is not None and storage.temporary_files_meta.get(dst) is file_meta:
-            storage.temporary_files_meta.pop(dst, None)
-        if pending_move is not None and storage.pending_moves.get(src) is pending_move:
-            storage.pending_moves.pop(src, None)
+        with storage.pending_moves_lock:
+            if (
+                file_meta is not None
+                and storage.temporary_files_meta.get(dst) is file_meta
+            ):
+                storage.temporary_files_meta.pop(dst, None)
+            if (
+                pending_move is not None
+                and storage.pending_moves.get(src) is pending_move
+            ):
+                storage.pending_moves.pop(src, None)
         raise
 
 

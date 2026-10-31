@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import DEBUG
+from threading import Event, Thread, current_thread
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import Mock, patch
 
@@ -12,6 +14,8 @@ import pytest
 import voluptuous as vol
 from pydantic import RootModel
 
+from viseron.components import ComponentError, ComponentErrorSource
+from viseron.config import ConfigDiff
 from viseron.domain_registry import DomainEntry, DomainState
 from viseron.domains import (
     OptionalDomain,
@@ -30,6 +34,7 @@ from viseron.domains import (
 from viseron.exceptions import DomainNotReady
 from viseron.helpers.config_model import ConfigModel
 from viseron.helpers.config_types import CameraIdentifier
+from viseron.reload import ReloadChanges, ReloadResult, reload_config
 
 from tests.common import MockComponent, MockDomainModule
 
@@ -1419,3 +1424,350 @@ class TestSetupDomains:
             future = vis.domain_registry.get_future("camera", "cam1")
             assert future is None
             assert entry.state == DomainState.LOADED
+
+
+class TestNonblockingDomainStartup:
+    """Startup must not turn a temporary camera failure into dependency failure."""
+
+    def test_retry_remains_pending_until_camera_recovers(
+        self, vis: MockViseron
+    ) -> None:
+        """Keep dependents pending until a retry succeeds."""
+        gate = Event()
+        returned = Event()
+        camera_attempts = []
+        dependent_calls = []
+
+        def setup_camera(*_args):
+            camera_attempts.append(1)
+            if len(camera_attempts) == 1:
+                raise DomainNotReady("offline")
+            gate.wait(5)
+            return True
+
+        def setup_dependent(*_args):
+            dependent_calls.append(1)
+            return True
+
+        camera = SimpleNamespace(setup=setup_camera)
+        dependent = SimpleNamespace(setup=setup_dependent)
+        registry = vis.domain_registry
+        cam = registry.register("test_comp", "test.path", "camera", "cam1", {})
+        nvr = registry.register(
+            "test_comp",
+            "test.path",
+            "nvr",
+            "cam1",
+            {},
+            require_domains=[RequireDomain("camera", "cam1")],
+        )
+
+        def import_module(path):
+            return camera if path.endswith(".camera") else dependent
+
+        def start():
+            setup_domains(vis)
+            returned.set()
+
+        with (
+            patch("viseron.domains.DOMAIN_RETRY_INTERVAL", 0),
+            patch("viseron.domains.importlib.import_module", side_effect=import_module),
+        ):
+            thread = Thread(target=start, daemon=True)
+            thread.start()
+            try:
+                assert returned.wait(3), "initialization blocked on camera retry"
+                assert cam.setup_future is not None
+                assert not cam.setup_future.done()
+                assert not dependent_calls
+                assert nvr.setup_future is not None
+                dependent_future = nvr.setup_future
+                gate.set()
+                assert dependent_future.result(timeout=3) is True
+                assert dependent_calls == [1]
+            finally:
+                gate.set()
+                registry.cancel_all_retries()
+                thread.join(5)
+                registry.wait_for_setups()
+
+    def test_many_offline_cameras_do_not_starve_healthy_camera(
+        self, vis: MockViseron
+    ) -> None:
+        """Keep healthy cameras responsive with more offline cameras than workers."""
+        returned = Event()
+        healthy = Event()
+        registry = vis.domain_registry
+        for num in range(120):
+            registry.register("test_comp", "test.path", "camera", f"offline{num}", {})
+        registry.register("test_comp", "test.path", "camera", "healthy", {})
+
+        def camera_setup(_vis, _config, identifier):
+            if identifier != "healthy":
+                raise DomainNotReady("offline")
+            healthy.set()
+            return True
+
+        module = SimpleNamespace(setup=camera_setup)
+
+        def start():
+            setup_domains(vis)
+            returned.set()
+
+        with (
+            patch("viseron.domains.DOMAIN_RETRY_INTERVAL", 120),
+            patch("viseron.domains.importlib.import_module", return_value=module),
+        ):
+            thread = Thread(target=start, daemon=True)
+            thread.start()
+            try:
+                assert healthy.wait(10), "offline retries starved the healthy camera"
+                assert returned.wait(10), "initial startup did not finish"
+            finally:
+                registry.cancel_all_retries()
+                registry.wait_for_setups()
+                thread.join(10)
+            assert not thread.is_alive()
+
+    def test_cancel_retry_fails_waiting_dependents(self, vis: MockViseron) -> None:
+        """Cancel a retry and resolve its dependent setup."""
+        calls = []
+        registry = vis.domain_registry
+        cam = registry.register("test_comp", "test.path", "camera", "cam1", {})
+        nvr = registry.register(
+            "test_comp",
+            "test.path",
+            "nvr",
+            "cam1",
+            {},
+            require_domains=[RequireDomain("camera", "cam1")],
+        )
+
+        def camera_setup(*_args):
+            raise DomainNotReady("offline")
+
+        def nvr_setup(*_args):
+            calls.append(1)
+            return True
+
+        def import_module(path):
+            return SimpleNamespace(
+                setup=camera_setup if path.endswith(".camera") else nvr_setup
+            )
+
+        with (
+            patch("viseron.domains.DOMAIN_RETRY_INTERVAL", 120),
+            patch("viseron.domains.importlib.import_module", side_effect=import_module),
+        ):
+            setup_domains(vis)
+            cam_future = cam.setup_future
+            nvr_future = nvr.setup_future
+            assert cam_future is not None and nvr_future is not None
+            registry.cancel_all_retries()
+            assert cam_future.result(timeout=3) is False
+            assert nvr_future.result(timeout=3) is False
+            registry.wait_for_setups()
+            assert not calls
+
+    def test_cleanup_does_not_clear_replaced_future(self, vis: MockViseron) -> None:
+        """An old batch cannot erase a newer future or replacement entry."""
+        registry = vis.domain_registry
+        old_entry = registry.register("test_comp", "test.path", "camera", "cam1", {})
+        old_future = Future()
+        new_future = Future()
+        registry.set_future("camera", "cam1", old_future)
+        registry.set_future("camera", "cam1", new_future)
+        registry.clear_future(
+            "camera", "cam1", expected=old_future, expected_entry=old_entry
+        )
+        assert registry.get_future("camera", "cam1") is new_future
+        registry.unregister("camera", "cam1")
+        replacement = registry.register("test_comp", "test.path", "camera", "cam1", {})
+        registry.set_future("camera", "cam1", old_future)
+        registry.clear_future(
+            "camera", "cam1", expected=old_future, expected_entry=old_entry
+        )
+        assert registry.get_future("camera", "cam1") is old_future
+        assert replacement is not old_entry
+
+    def test_reload_waits_for_inflight_attempt_and_records_cancellation(
+        self, vis: MockViseron
+    ) -> None:
+        """Reload cannot replace a domain while its prior setup is running."""
+        entered = Event()
+        release = Event()
+        reloaded = Event()
+        observed = []
+        registry = vis.domain_registry
+        entry = registry.register("test_comp", "test.path", "camera", "cam1", {})
+
+        def camera_setup(*_args):
+            entered.set()
+            release.wait(5)
+            raise DomainNotReady("offline")
+
+        def reload_inner(_vis, cancelled):
+            observed.extend(cancelled)
+            reloaded.set()
+            return ReloadResult(success=True)
+
+        with (
+            patch("viseron.reload._reload_config", side_effect=reload_inner),
+            patch(
+                "viseron.domains.importlib.import_module",
+                return_value=SimpleNamespace(setup=camera_setup),
+            ),
+        ):
+            startup = Thread(target=setup_domains, args=(vis,), daemon=True)
+            reload_thread = Thread(target=reload_config, args=(vis,), daemon=True)
+            startup.start()
+            try:
+                assert entered.wait(3)
+                reload_thread.start()
+                assert entry.cancel_event.wait(3)
+                assert not reloaded.is_set()
+                release.set()
+                reload_thread.join(3)
+                assert not reload_thread.is_alive()
+                assert reloaded.is_set()
+                assert entry in observed
+            finally:
+                release.set()
+                registry.cancel_all_retries()
+                startup.join(5)
+                reload_thread.join(5)
+
+    def test_coordinator_failure_resolves_every_setup(self, vis: MockViseron) -> None:
+        """A scheduler failure must not leave startup or dependency futures hung."""
+        registry = vis.domain_registry
+        entry = registry.register("test_comp", "test.path", "camera", "cam1", {})
+        with patch(
+            "viseron.domains._coordinate_setups", side_effect=RuntimeError("boom")
+        ):
+            setup_domains(vis)
+        assert entry.initial_setup_settled.is_set()
+        assert entry.state == DomainState.FAILED
+
+
+@pytest.mark.parametrize("failure_mode", ["parse", "validation"])
+def test_failed_reload_restores_offline_camera_retry(vis: MockViseron, failure_mode):
+    """A rejected reload must not strand an offline camera and its dependent."""
+    online = Event()
+    dependent_started = Event()
+    registry = vis.domain_registry
+    vis.set_config({"test_comp": {"camera": {"cam1": {}}}})
+
+    def register_domains():
+        registry.register("test_comp", "test.path", "camera", "cam1", {})
+        registry.register(
+            "test_comp",
+            "test.path",
+            "nvr",
+            "cam1",
+            {},
+            require_domains=[RequireDomain("camera", "cam1")],
+        )
+
+    def camera_setup(*_args):
+        if not online.is_set():
+            raise DomainNotReady("offline")
+        return True
+
+    def nvr_setup(*_args):
+        dependent_started.set()
+        return True
+
+    def import_module(path):
+        return SimpleNamespace(
+            setup=camera_setup if path.endswith(".camera") else nvr_setup
+        )
+
+    def components(_vis, config, **kwargs):
+        assert config is vis.config
+        if "test_comp" in kwargs["components"]:
+            register_domains()
+
+    error = ComponentError(source=ComponentErrorSource.VALIDATION, message="invalid")
+    load = RuntimeError("invalid") if failure_mode == "parse" else None
+    register_domains()
+    with (
+        patch("viseron.domains.DOMAIN_RETRY_INTERVAL", 0.01),
+        patch("viseron.reload.setup_components", side_effect=components),
+        patch(
+            "viseron.reload._load_and_diff_config",
+            side_effect=load,
+            return_value=({}, ConfigDiff(), ReloadChanges()),
+        ),
+        patch("viseron.reload._validate_config", return_value=[error]),
+        patch("viseron.domains.importlib.import_module", side_effect=import_module),
+    ):
+        try:
+            setup_domains(vis)
+            assert registry.get("camera", "cam1").state == DomainState.RETRYING
+            assert not reload_config(vis).success
+            new_camera = registry.get("camera", "cam1")
+            assert new_camera is not None
+            online.set()
+            assert dependent_started.wait(3)
+            assert new_camera.state == DomainState.LOADED
+        finally:
+            registry.cancel_all_retries()
+            registry.wait_for_setups()
+
+
+def test_queued_reload_cancels_retries_started_by_prior_reload(vis: MockViseron):
+    """A queued reload must cancel the new retry batch before waiting on it."""
+    registry = vis.domain_registry
+    first_inside = Event()
+    second_cancelled_old = Event()
+    retry_started = Event()
+    original_cancel = registry.cancel_all_retries
+
+    def cancel():
+        entries = original_cancel()
+        if current_thread().name == "second_reload":
+            second_cancelled_old.set()
+        return entries
+
+    def setup_camera(*_args):
+        retry_started.set()
+        raise DomainNotReady("offline")
+
+    def reload_inner(_vis, cancelled):
+        if not first_inside.is_set():
+            first_inside.set()
+            assert second_cancelled_old.wait(3)
+            registry.register("test_comp", "test.path", "camera", "cam1", {})
+            setup_domains(vis)
+            assert retry_started.is_set()
+        else:
+            assert any(e.identifier == "cam1" for e in cancelled)
+        return ReloadResult(success=True)
+
+    with (
+        patch.object(registry, "cancel_all_retries", side_effect=cancel),
+        patch("viseron.reload._reload_config", side_effect=reload_inner),
+        patch(
+            "viseron.domains.importlib.import_module",
+            return_value=SimpleNamespace(setup=setup_camera),
+        ),
+    ):
+        first = Thread(target=reload_config, args=(vis,), daemon=True)
+        second = Thread(
+            target=reload_config, args=(vis,), name="second_reload", daemon=True
+        )
+        try:
+            first.start()
+            assert first_inside.wait(3)
+            second.start()
+            first.join(3)
+            second.join(3)
+            assert not first.is_alive()
+            assert not second.is_alive(), (
+                "queued reload waited forever on the new retry"
+            )
+        finally:
+            original_cancel()
+            first.join(5)
+            second.join(5)
+            registry.wait_for_setups()

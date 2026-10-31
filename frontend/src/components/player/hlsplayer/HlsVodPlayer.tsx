@@ -87,6 +87,7 @@ const initializePlayer = (
 
   // Setup error handling using shared utility
   setupHlsErrorHandling(hlsRef.current, {
+    recordingPlaylist: true,
     hlsRef,
     setHlsRefsError,
     delayedInitializationTimeoutRef,

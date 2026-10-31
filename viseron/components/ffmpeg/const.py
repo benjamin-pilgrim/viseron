@@ -158,12 +158,17 @@ CONFIG_RECORDER_VIDEO_FILTERS = "video_filters"
 CONFIG_RECORDER_AUDIO_FILTERS = "audio_filters"
 CONFIG_SEGMENTS_FOLDER = "segments_folder"
 CONFIG_RECORDER_OUPTUT_ARGS = "output_args"
+CONFIG_RECORDER_TIMESTAMP_MODE = "timestamp_mode"
+TIMESTAMP_MODE_SOURCE = "source"
+TIMESTAMP_MODE_WALLCLOCK = "wallclock"
+TIMESTAMP_MODES = (TIMESTAMP_MODE_SOURCE, TIMESTAMP_MODE_WALLCLOCK)
 
 DEFAULT_RECORDER_HWACCEL_ARGS: list[str] = []
 DEFAULT_RECORDER_AUDIO_CODEC = "unset"
 DEFAULT_RECORDER_VIDEO_FILTERS: list[str] = []
 DEFAULT_RECORDER_AUDIO_FILTERS: list[str] = []
 DEFAULT_RECORDER_OUTPUT_ARGS: list[str] = []
+DEFAULT_RECORDER_TIMESTAMP_MODE = TIMESTAMP_MODE_WALLCLOCK
 DEFAULT_SEGMENTS_FOLDER = "/segments"
 
 DESC_RECORDER_HWACCEL_ARGS = "FFmpeg encoder hardware acceleration arguments."
@@ -186,6 +191,11 @@ DESC_RECORDER_AUDIO_FILTERS = (
     "These filters are applied to the recorder videos."
 )
 DESC_RECORDER_OUTPUT_ARGS = "FFmpeg encoder output arguments."
+DESC_RECORDER_TIMESTAMP_MODE = (
+    "FFmpeg input timestamp source: wallclock (default) or source. "
+    "Ignored when input_args or raw_command is set. When recording and detection "
+    "share an input, this also affects detection."
+)
 DESC_SEGMENTS_FOLDER = (
     "What folder to store FFmpeg segments in. "
     "Segments are used to produce recordings so you should not need to change this."

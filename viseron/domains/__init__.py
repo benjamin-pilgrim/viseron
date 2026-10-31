@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 DOMAIN_SETUP_LOCK = threading.Lock()
+_RETRY = object()
 
 
 @dataclass
@@ -122,6 +123,7 @@ def _wait_for_dependencies(
 
     # Collect futures for required domains
     futures: list[Future] = []
+    dependencies: list[DomainEntry] = []
     for required in entry.require_domains:
         # Skip if already loaded
         if registry.is_loaded(required.domain, required.identifier):
@@ -129,6 +131,9 @@ def _wait_for_dependencies(
         future = registry.get_future(required.domain, required.identifier)
         if future:
             futures.append(future)
+            dependency = registry.get(required.domain, required.identifier)
+            if dependency:
+                dependencies.append(dependency)
 
     # Collect futures for optional domains
     for optional in entry.optional_domains:
@@ -139,6 +144,9 @@ def _wait_for_dependencies(
         future = registry.get_future(optional.domain, optional.identifier)
         if future:
             futures.append(future)
+            dependency = registry.get(optional.domain, optional.identifier)
+            if dependency:
+                dependencies.append(dependency)
 
     if not futures:
         return True
@@ -155,6 +163,13 @@ def _wait_for_dependencies(
         seconds=SLOW_DEPENDENCY_WARNING,
         args=[futures],
     )
+
+    # A dependent is deferred if any dependency enters its retry loop. Keep
+    # the real futures pending so it starts only after dependencies succeed.
+    for dependency in dependencies:
+        dependency.initial_setup_settled.wait()
+    if any(not future.done() for future in futures):
+        entry.initial_setup_settled.set()
 
     # Wait for all dependencies
     failed = [future for future in as_completed(futures) if future.result() is not True]
@@ -175,7 +190,18 @@ def _wait_for_dependencies(
 
 
 def _setup_single_domain(vis: Viseron, entry: DomainEntry, tries: int = 1) -> bool:
-    """Set up a single domain."""
+    """Set up a domain, retaining one worker across arbitrarily many retries."""
+    while True:
+        result = _setup_single_domain_attempt(vis, entry, tries)
+        if result is not _RETRY:
+            return result
+        tries += 1
+
+
+def _setup_single_domain_attempt(
+    vis: Viseron, entry: DomainEntry, tries: int, *, coordinated: bool = False
+) -> Any:
+    """Attempt one domain setup."""
     registry = vis.domain_registry
     component_path = entry.component_path
 
@@ -200,7 +226,7 @@ def _setup_single_domain(vis: Viseron, entry: DomainEntry, tries: int = 1) -> bo
         registry.set_state(entry.domain, entry.identifier, DomainState.LOADING)
 
     # Wait for dependencies
-    if not _wait_for_dependencies(vis, entry):
+    if not coordinated and not _wait_for_dependencies(vis, entry):
         _handle_failed_domain(
             vis, entry, DomainState.FAILED, error="Dependencies failed"
         )
@@ -279,6 +305,7 @@ def _setup_single_domain(vis: Viseron, entry: DomainEntry, tries: int = 1) -> bo
             return False
 
         _handle_failed_domain(vis, entry, DomainState.RETRYING, error=str(error))
+        entry.initial_setup_settled.set()
         slow_setup_warning.cancel()
 
         wait_time = min(tries * DOMAIN_RETRY_INTERVAL, DOMAIN_RETRY_INTERVAL_MAX)
@@ -290,6 +317,9 @@ def _setup_single_domain(vis: Viseron, entry: DomainEntry, tries: int = 1) -> bo
             f"Error: {error!s}"
         )
 
+        if coordinated:
+            return _RETRY
+
         # Block until wait_time elapses or the domain is cancelled/shutdown.
         # cancel_event.wait() returns True if the event was set (cancelled),
         # False if it timed out (meaning we should retry).
@@ -299,13 +329,7 @@ def _setup_single_domain(vis: Viseron, entry: DomainEntry, tries: int = 1) -> bo
             _handle_failed_domain(vis, entry, DomainState.FAILED, error=str(error))
             return False
 
-        # Running with ThreadPoolExecutor and awaiting the future does not
-        # cause a max recursion error if we retry for a long time
-        with ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="Component.setup_domain"
-        ) as executor:
-            future = executor.submit(_setup_single_domain, vis, entry, tries + 1)
-            return future.result()
+        return _RETRY
     except Exception as error:  # pylint: disable=broad-except
         LOGGER.exception(
             f"Uncaught exception setting up domain {entry.domain} for"
@@ -413,26 +437,175 @@ def setup_domains(vis: Viseron) -> None:
 
     LOGGER.debug(f"Setting up {len(pending)} pending domains")
 
-    with ThreadPoolExecutor(max_workers=100, thread_name_prefix="setup_domains") as ex:
-        # Schedule all pending domains
-        for entry in pending:
-            _schedule_domain_setup(vis, ex, entry)
-
-        # Wait for all to complete
-        futures = [
-            registry.get_future(e.domain, e.identifier)
-            for e in pending
-            if registry.get_future(e.domain, e.identifier)
-        ]
-        for future in as_completed(futures):  # type: ignore[arg-type]
-            try:
-                future.result()
-            except Exception:  # pylint: disable=broad-except
-                LOGGER.exception("Domain setup raised exception")
-
-    # Clear futures and handle failed domains
+    # Register all eventual futures before scheduling: dependency setup must see
+    # the same future for the whole lifetime of a retrying domain.
     for entry in pending:
-        registry.clear_future(entry.domain, entry.identifier)
+        registry.set_future(entry.domain, entry.identifier, Future())
+
+    futures = {id(entry): entry.setup_future for entry in pending}
+    coordinator = threading.Thread(
+        target=_run_coordinator,
+        args=(vis, pending, futures),
+        name="domain_setup_coordinator",
+        daemon=True,
+    )
+    coordinator.start()
+    for entry in pending:
+        entry.initial_setup_settled.wait()
+    if all(entry.setup_future and entry.setup_future.done() for entry in pending):
+        coordinator.join()
+
+
+def _run_coordinator(
+    vis: Viseron, entries: list[DomainEntry], futures: dict[int, Future]
+) -> None:
+    """Resolve all outstanding futures even if scheduling itself fails."""
+    try:
+        _coordinate_setups(vis, entries, futures)
+    except Exception:  # pylint: disable=broad-except
+        LOGGER.exception("Domain setup coordinator failed")
+        for entry in entries:
+            future = futures[id(entry)]
+            if future.done():
+                continue
+            try:
+                _handle_failed_domain(
+                    vis, entry, DomainState.FAILED, error="Setup coordinator failed"
+                )
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("Failed to report domain setup coordinator failure")
+            finally:
+                future.set_result(False)
+                entry.initial_setup_settled.set()
+        for entry in entries:
+            vis.domain_registry.clear_future(
+                entry.domain,
+                entry.identifier,
+                expected=futures[id(entry)],
+                expected_entry=entry,
+            )
+
+
+def _coordinate_setups(
+    vis: Viseron, entries: list[DomainEntry], futures: dict[int, Future]
+) -> None:
+    """Run ready setup attempts without reserving workers for waiters or backoff.
+
+    One coordinator thread per setup batch owns retry timers and dependency
+    checks. Setup calls alone use the bounded worker pool. The coordinator
+    periodically checks cancellation, avoiding one timer thread per offline camera.
+    """
+    registry = vis.domain_registry
+    condition = threading.Condition()
+    # Index by identity: DomainEntry is mutable and therefore unhashable.
+    jobs: dict[int, dict[str, Any]] = {
+        id(entry): {"entry": entry, "attempt": 1, "due": 0.0, "worker": None}
+        for entry in entries
+    }
+
+    def wake(_future: Future) -> None:
+        with condition:
+            condition.notify_all()
+
+    def finish(entry: DomainEntry, result: bool) -> None:
+        future = futures[id(entry)]
+        if not future.done():
+            future.set_result(result)
+        entry.initial_setup_settled.set()
+        jobs.pop(id(entry), None)
+
+    with ThreadPoolExecutor(max_workers=100, thread_name_prefix="domain_setup") as ex:
+        while jobs:
+            with condition:
+                now = time.monotonic()
+                for job in list(jobs.values()):
+                    entry = job["entry"]
+                    worker = job["worker"]
+                    if worker is not None:
+                        if not worker.done():
+                            continue
+                        job["worker"] = None
+                        try:
+                            result = worker.result()
+                        except Exception:  # pylint: disable=broad-except
+                            LOGGER.exception("Domain setup raised exception")
+                            _handle_failed_domain(
+                                vis,
+                                entry,
+                                DomainState.FAILED,
+                                error="Setup raised exception",
+                            )
+                            result = False
+                        if result is _RETRY:
+                            job["due"] = now + min(
+                                job["attempt"] * DOMAIN_RETRY_INTERVAL,
+                                DOMAIN_RETRY_INTERVAL_MAX,
+                            )
+                            job["attempt"] += 1
+                        else:
+                            finish(entry, result is True)
+                        continue
+
+                    if entry.cancel_event.is_set() or vis.shutdown_event.is_set():
+                        _handle_failed_domain(
+                            vis, entry, DomainState.FAILED, error="Setup cancelled"
+                        )
+                        finish(entry, False)
+                        continue
+
+                    dependencies = [
+                        dep
+                        for ref in entry.require_domains + entry.optional_domains
+                        if (dep := registry.get(ref.domain, ref.identifier)) is not None
+                    ]
+                    dep_futures = [
+                        dep.setup_future for dep in dependencies if dep.setup_future
+                    ]
+                    if any(
+                        dep.state == DomainState.FAILED and dep.setup_future is None
+                        for dep in dependencies
+                    ):
+                        _handle_failed_domain(
+                            vis, entry, DomainState.FAILED, error="Dependencies failed"
+                        )
+                        finish(entry, False)
+                        continue
+                    pending_deps = [dep for dep in dependencies if dep.setup_future]
+                    if pending_deps and all(
+                        dep.initial_setup_settled.is_set() for dep in pending_deps
+                    ):
+                        if any(not future.done() for future in dep_futures):
+                            entry.initial_setup_settled.set()
+                    if any(not future.done() for future in dep_futures):
+                        continue
+                    if any(future.result() is not True for future in dep_futures):
+                        _handle_failed_domain(
+                            vis, entry, DomainState.FAILED, error="Dependencies failed"
+                        )
+                        finish(entry, False)
+                        continue
+                    if now < job["due"]:
+                        continue
+                    worker = ex.submit(
+                        _setup_single_domain_attempt,
+                        vis,
+                        entry,
+                        job["attempt"],
+                        coordinated=True,
+                    )
+                    job["worker"] = worker
+                    worker.add_done_callback(wake)
+                if jobs:
+                    # This bounds cancellation latency even when nothing is running.
+                    condition.wait(timeout=0.1)
+
+    for entry in entries:
+        registry.clear_future(
+            entry.domain,
+            entry.identifier,
+            expected=futures[id(entry)],
+            expected_entry=entry,
+        )
 
 
 def _handle_failed_domain(

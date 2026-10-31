@@ -224,7 +224,11 @@ class EventsAPIHandler(BaseAPIHandler):
                             f"{subpath}/api/v1/hls/"
                             f"{event.camera_identifier}/{event.id}/index.m3u8"
                         ),
-                        "thumbnail_path": f"{subpath}/files{event.thumbnail_path}",
+                        "thumbnail_path": (
+                            f"{subpath}/files{event.thumbnail_path}"
+                            if event.thumbnail_path
+                            else ""
+                        ),
                         "created_at": event.created_at,
                         "created_at_timestamp": event.created_at.timestamp(),
                         "lookback": camera.recorder.lookback,

@@ -24,6 +24,7 @@ vi.mock("hls.js", () => {
     BUFFER_STALLED_ERROR: "bufferStalledError",
     BUFFER_SEEK_OVER_HOLE: "bufferSeekOverHole",
     MANIFEST_LOAD_ERROR: "manifestLoadError",
+    LEVEL_LOAD_ERROR: "levelLoadError",
   };
   const ErrorTypes = {
     NETWORK_ERROR: "networkError",
@@ -138,6 +139,27 @@ beforeEach(() => {
 });
 
 describe("HlsVodPlayer", () => {
+  it.each(["manifestLoadError", "levelLoadError"])(
+    "stops playback and reports an unsupported recording on %s conflict",
+    (details) => {
+      const hls = renderAndPlay();
+      const pause = vi.spyOn(hls.media!, "pause").mockImplementation(() => {});
+      act(() => {
+        hls.handlers.hlsError("hlsError", {
+          type: "networkError",
+          details,
+          response: { code: 409 },
+          fatal: true,
+          error: new Error("Conflict"),
+        });
+      });
+      expect(hls.stopLoad).toHaveBeenCalled();
+      expect(hls.startLoad).not.toHaveBeenCalled();
+      expect(pause).toHaveBeenCalled();
+      expect(screen.getByText(/spans camera restarts/)).toBeInTheDocument();
+    },
+  );
+
   it("loads the recording source when play is pressed", () => {
     const hls = renderAndPlay();
 

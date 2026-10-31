@@ -304,6 +304,7 @@ class Storage:
         self.temporary_files_meta: dict[str, FilesMeta] = {}
         # Keyed by the source path
         self.pending_moves: dict[str, PendingMove] = {}
+        self.pending_moves_lock = threading.Lock()
 
         self.cleanup_manager = CleanupManager(vis, self)
         self.cleanup_manager.start()

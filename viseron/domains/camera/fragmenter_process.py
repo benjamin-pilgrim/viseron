@@ -7,19 +7,39 @@ memory usage.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
+import hashlib
 import logging
 import os
 import re
 import shutil
 import subprocess as sp
+import time
 import uuid
 from typing import TYPE_CHECKING
 
 import psutil
 from path import Path
 
+from viseron.components.storage.pending_journal import (
+    prepare,
+    publish_or_verify,
+    marker_for_path,
+)
+from viseron.components.storage.run_init_prototype import ensure_init
+from viseron.components.storage.run_lifecycle import (
+    CameraLockBusy,
+    camera_lock,
+    is_run_directory,
+    reclaim_spool_run,
+)
+from viseron.components.storage.source_move_intent import (
+    source_move_pending,
+    prepare_source_intent,
+)
+from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX, require_tier_markers
 from viseron.domains.camera.const import MP4BOX_PATH
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
@@ -38,7 +58,7 @@ def _get_open_files(path: str, process: psutil.Process) -> list[str]:
         open_files = process.open_files()
         for file in open_files:
             if file.path.startswith(f"{path}/"):
-                files.append(file.path.split("/")[-1])
+                files.append(os.path.relpath(file.path, path))
     except psutil.Error:
         pass
     return files
@@ -57,7 +77,11 @@ def _get_mp4_files_to_fragment(path: str) -> list[str]:
                 files_in_use.extend(_get_open_files(path, process))
         except psutil.Error:
             pass
-    return [str(f.name) for f in mp4_files if str(f.name) not in files_in_use]
+    return [
+        os.path.relpath(str(f), path)
+        for f in mp4_files
+        if f.name != "init.mp4" and os.path.relpath(str(f), path) not in files_in_use
+    ]
 
 
 def _extract_extinf_number(playlist_content: str, file: str) -> float | None:
@@ -90,26 +114,45 @@ def _extract_program_date_time(
 
     try:
         if match:
-            # Remove timezone information since fromisoformat does not support it
-            no_tz = re.sub(r"\+[0-9]{4}$", "", match.group(1))
-            # Adjust according to local timezone
-            return (datetime.datetime.fromisoformat(no_tz) - get_utc_offset()).replace(
-                tzinfo=datetime.timezone.utc
-            )
+            parsed = datetime.datetime.fromisoformat(match.group(1))
+            # Preserve the historical local-time interpretation for custom
+            # playlists without an offset; FFmpeg normally supplies one.
+            if parsed.tzinfo is None:
+                return (parsed - get_utc_offset()).replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
     except ValueError:
         pass
     return None
 
 
+_RUN_SEGMENT_NAME = re.compile(
+    r"^(?P<sequence>\d{9,})-(?P<epoch>\d+)-(?P<duration>\d{13,})\.m4s$"
+)
+
+
+def _filename_duration(file: str) -> float | None:
+    """Read FFmpeg's finalized HLS duration in microseconds, never infer it."""
+    match = _RUN_SEGMENT_NAME.fullmatch(os.path.basename(file))
+    if match is None:
+        return None
+    duration = int(match.group("duration"))
+    return duration / 1_000_000 if duration > 0 else None
+
+
 def _get_orig_ctime(
     file: str, program_date_time: datetime.datetime | None
 ) -> datetime.datetime:
-    """Return the creation time of a segment named <epoch>.<ext>."""
+    """Prefer playlist time; filename timestamps may differ from recorded time."""
     if program_date_time:
         return program_date_time
-    return datetime.datetime.fromtimestamp(
-        int(file.split(".", maxsplit=1)[0]), tz=datetime.timezone.utc
+    basename = os.path.basename(file)
+    match = _RUN_SEGMENT_NAME.fullmatch(basename)
+    epoch = (
+        match.group("epoch")
+        if match
+        else basename.split(".", maxsplit=1)[0].rsplit("-", maxsplit=1)[-1]
     )
+    return datetime.datetime.fromtimestamp(int(epoch), tz=datetime.timezone.utc)
 
 
 def fragmenter_logger_names(camera_identifier: str) -> tuple[str, str]:
@@ -136,6 +179,7 @@ class FragmenterWork(ChildProcessWork):
         timelapse_folder: str | None,
         temp_timelapse_folder: str | None,
         worker_event: Event,
+        tier_markers: dict[str, str] | None = None,
     ) -> None:
         self._camera_identifier = camera_identifier
         self.temp_segments_folder = temp_segments_folder
@@ -143,8 +187,14 @@ class FragmenterWork(ChildProcessWork):
         self._timelapse_folder = timelapse_folder
         self._temp_timelapse_folder = temp_timelapse_folder
         self._worker_event = worker_event
+        self._tier_markers = tier_markers or {}
         self._logger = logging.getLogger(fragmenter_logger_names(camera_identifier)[0])
         self._log_pipe: LogPipe
+        self._last_fragment: str | None = None
+        self._last_recent: str | None = None
+        self._last_missing_timestamp_warning: float | None = None
+        self._missing_timing_count = 0
+        self._last_reaped_run: str | None = None
 
     @property
     def logger_names(self) -> tuple[str, ...]:
@@ -168,15 +218,106 @@ class FragmenterWork(ChildProcessWork):
             f"Checking for new segments to fragment in {self.temp_segments_folder}"
         )
         mp4s = sorted(_get_mp4_files_to_fragment(self.temp_segments_folder))
-        if cmd == "fragment":
-            mp4s = mp4s[:5]
+        # A durable destination journal already owns this source; the watcher
+        # reconciler handles it. An intent without a journal is a crashed copy
+        # and must remain discoverable for idempotent re-publication.
+        mp4s = [
+            name
+            for name in mp4s
+            if not (
+                source_move_pending(os.path.join(self.temp_segments_folder, name))
+                and os.path.lexists(
+                    marker_for_path(os.path.join(self.segments_folder, name))
+                )
+            )
+        ]
+        if cmd == "fragment" and mp4s:
+            # Keep current playlist entries moving even if old unindexed
+            # fragments accumulate. Revisit one old item per pass to report it.
+            recent: list[str] = []
+            retained: list[str] = []
+            playlists: dict[str, str] = {}
+            for name in mp4s:
+                if not name.endswith(".m4s") or not _RUN_SEGMENT_NAME.fullmatch(
+                    os.path.basename(name)
+                ):
+                    recent.append(name)
+                    continue
+                run = os.path.dirname(name)
+                if run not in playlists:
+                    try:
+                        playlists[run] = self._read_m3u8(name)
+                    except OSError:
+                        playlists[run] = ""
+                data = playlists[run]
+                if (
+                    _extract_extinf_number(data, os.path.basename(name)) is not None
+                    and _extract_program_date_time(data, os.path.basename(name))
+                    is not None
+                ):
+                    recent.append(name)
+                else:
+                    retained.append(name)
+            self._missing_timing_count = len(retained)
+            batch: list[str] = []
+            if recent:
+                start = next(
+                    (
+                        i
+                        for i, name in enumerate(recent)
+                        if self._last_recent is None or name > self._last_recent
+                    ),
+                    0,
+                )
+                batch = (recent[start:] + recent[:start])[: 4 if retained else 5]
+                self._last_recent = batch[-1]
+            if retained:
+                start = next(
+                    (
+                        i
+                        for i, name in enumerate(retained)
+                        if self._last_fragment is None or name > self._last_fragment
+                    ),
+                    0,
+                )
+                old = retained[start]
+                self._last_fragment = old
+                batch.append(old)
+            mp4s = batch
         for mp4 in mp4s:
             self._logger.debug(f"Processing {mp4}")
-            if mp4.split(".")[1] == "m4s":
+            if mp4.endswith(".m4s"):
                 self._handle_m4s(mp4)
             else:
                 self._handle_mp4(mp4)
 
+        # Bound work per pass; rotate so an active or damaged old run cannot
+        # starve cleanup of later runs. Missing spool folders fail closed.
+        try:
+            runs = sorted(
+                name
+                for name in os.listdir(self.temp_segments_folder)
+                if is_run_directory(name)
+            )
+            if runs:
+                start = next(
+                    (
+                        i
+                        for i, name in enumerate(runs)
+                        if self._last_reaped_run is None or name > self._last_reaped_run
+                    ),
+                    0,
+                )
+                batch = (runs[start:] + runs[:start])[:5]
+                self._last_reaped_run = batch[-1]
+                for name in batch:
+                    reclaim_spool_run(
+                        "/tmp/viseron-run-locks",
+                        os.path.abspath(self.temp_segments_folder),
+                        os.path.join(self.temp_segments_folder, name),
+                    )
+        except OSError:
+            self._logger.exception("Could not inspect spool runs for cleanup")
         if cmd == "drain":
             return {"drained": True}
         return None
@@ -244,7 +385,9 @@ class FragmenterWork(ChildProcessWork):
         frame_filename = os.path.splitext(os.path.basename(file))[0] + ".jpg"
         tmp_frame_path = os.path.join(self._temp_timelapse_folder, frame_filename)
         frame_path = os.path.join(self._timelapse_folder, frame_filename)
-        init_path = os.path.join(self.temp_segments_folder, "init.mp4")
+        init_path = os.path.join(
+            self.temp_segments_folder, os.path.dirname(file), "init.mp4"
+        )
         segment_path = os.path.join(self.temp_segments_folder, file)
 
         self._extract_timelapse_frame(
@@ -331,21 +474,110 @@ class FragmenterWork(ChildProcessWork):
             self._logger.debug(f"{file} not found")
 
     def _move_to_segments_folder(
-        self, file: str, orig_ctime: datetime.datetime
+        self, file: str, orig_ctime: datetime.datetime, duration: float | None = None
     ) -> None:
         """Move fragmented mp4 created by encoder to segments folder."""
         self._segment_hook(file, orig_ctime)
         try:
-            shutil.move(
-                os.path.join(self.temp_segments_folder, file),
-                os.path.join(self.segments_folder, file),
+            run = os.path.dirname(file)
+            destination_dir = os.path.join(self.segments_folder, run)
+            require_tier_markers(destination_dir, self._tier_markers)
+            is_run = is_run_directory(run)
+            lock = (
+                camera_lock(
+                    "/tmp/viseron-run-locks", os.path.abspath(self.segments_folder)
+                )
+                if is_run
+                else contextlib.nullcontext()
             )
-            shutil.copy(
-                os.path.join(self.temp_segments_folder, "init.mp4"),
-                os.path.join(self.segments_folder, "init.mp4"),
-            )
+            with lock:
+                require_tier_markers(destination_dir, self._tier_markers)
+                os.makedirs(destination_dir, exist_ok=True)
+                init_source = os.path.join(self.temp_segments_folder, run, "init.mp4")
+                init_dest = os.path.join(destination_dir, "init.mp4")
+                if is_run:
+                    ensure_init(init_source, destination_dir)
+                else:
+                    temp_init = os.path.join(
+                        destination_dir, TIER_MOVE_TEMP_PREFIX + uuid.uuid4().hex
+                    )
+                    try:
+                        shutil.copyfile(init_source, temp_init)
+                        os.replace(temp_init, init_dest)
+                    finally:
+                        if os.path.exists(temp_init):
+                            os.unlink(temp_init)
+                source = os.path.join(self.temp_segments_folder, file)
+                destination = os.path.join(self.segments_folder, file)
+                if not is_run:
+                    shutil.move(source, destination)
+                else:
+                    require_tier_markers(destination_dir, self._tier_markers)
+                    if source_move_pending(destination) or os.path.lexists(destination):
+                        raise BlockingIOError("run segment is held or already exists")
+                    source_camera = os.path.abspath(self.temp_segments_folder)
+                    with camera_lock("/tmp/viseron-run-locks", source_camera):
+                        # Idempotent only if the entire previous source snapshot
+                        # matches. A partial/conflicting intent fails closed.
+                        source_intent = prepare_source_intent(
+                            source,
+                            destination,
+                            os.stat(source, follow_symlinks=False),
+                            None,
+                        )
+                    temporary = os.path.join(
+                        destination_dir, TIER_MOVE_TEMP_PREFIX + uuid.uuid4().hex
+                    )
+                    protected_temp = False
+                    try:
+                        digest = hashlib.sha256()
+                        with open(source, "rb") as inp, open(temporary, "xb") as out:
+                            before = os.fstat(inp.fileno())
+                            while chunk := inp.read(1024 * 1024):
+                                out.write(chunk)
+                                digest.update(chunk)
+                            out.flush()
+                            os.fsync(out.fileno())
+                            after = os.fstat(inp.fileno())
+                            if (
+                                before.st_dev,
+                                before.st_ino,
+                                before.st_size,
+                                before.st_mtime_ns,
+                            ) != (
+                                after.st_dev,
+                                after.st_ino,
+                                after.st_size,
+                                after.st_mtime_ns,
+                            ) or os.fstat(out.fileno()).st_size != before.st_size:
+                                raise OSError(
+                                    "staged source changed during publication"
+                                )
+                        require_tier_markers(destination, self._tier_markers)
+                        marker = prepare(
+                            destination_dir,
+                            os.path.basename(file),
+                            {
+                                "orig_ctime": orig_ctime.isoformat(),
+                                "duration": duration,
+                                "file_key": None,
+                            },
+                            temp_path=temporary,
+                            source_intent=source_intent,
+                            copied_digest=digest.hexdigest(),
+                        )
+                        protected_temp = True
+                        publish_or_verify(marker)
+                        # Keep staged source and durable hold until DB acknowledgement.
+                    finally:
+                        if not protected_temp and os.path.exists(temporary):
+                            os.unlink(temporary)
         except FileNotFoundError:
             self._logger.debug(f"{file} not found", exc_info=True)
+        except CameraLockBusy:
+            self._logger.debug(
+                "Publication busy for %s; retaining staging for retry", file
+            )
         except OSError as err:
             if err.errno == errno.ENOSPC:
                 self._logger.error(
@@ -359,6 +591,10 @@ class FragmenterWork(ChildProcessWork):
                     }
                 )
                 self._worker_event.wait(timeout=1)
+            else:
+                self._logger.warning(
+                    "Cannot publish %s; retaining staging file", file, exc_info=err
+                )
 
     def _send_files_metadata(
         self, path: str, orig_ctime: datetime.datetime, duration: float | None
@@ -385,15 +621,17 @@ class FragmenterWork(ChildProcessWork):
             encoding="utf-8",
         ).read()
 
-    def _read_m3u8(self) -> str:
+    def _read_m3u8(self, file: str) -> str:
         """Read m3u8 file created by encoder."""
-        return open(
+        with open(
             os.path.join(
                 self.temp_segments_folder,
+                os.path.dirname(file),
                 "index.m3u8",
             ),
             encoding="utf-8",
-        ).read()
+        ) as playlist:
+            return playlist.read()
 
     def _handle_mp4(self, file: str) -> None:
         """Handle mp4 files."""
@@ -427,32 +665,42 @@ class FragmenterWork(ChildProcessWork):
             self._logger.error("Failed to delete broken fragment", exc_info=err)
 
     def _handle_m4s(self, file: str) -> None:
-        """Handle m4s (fragmented mp4) files."""
+        """Handle completed fragments; preserve media with uncertain timing."""
         try:
-            m3u8 = self._read_m3u8()
-            extinf = _extract_extinf_number(m3u8, file)
-            program_date_time = _extract_program_date_time(m3u8, file)
+            try:
+                m3u8 = self._read_m3u8(file)
+            except FileNotFoundError:
+                m3u8 = ""
+            name = os.path.basename(file)
+            extinf = _extract_extinf_number(m3u8, name)
+            program_date_time = _extract_program_date_time(m3u8, name)
+            if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
+                now = time.monotonic()
+                if (
+                    self._last_missing_timestamp_warning is None
+                    or now - self._last_missing_timestamp_warning >= 60  # noqa: PLR2004
+                ):
+                    self._logger.warning(
+                        "Playlist timing unavailable for %s staged fragments "
+                        "(for example %s); retaining them and init unindexed in "
+                        "persistent staging. Filename wall times are approximate, not exact.",  # noqa: E501
+                        max(1, self._missing_timing_count),
+                        file,
+                    )
+                    self._last_missing_timestamp_warning = now
+                return
+            if extinf is None:
+                extinf = _filename_duration(name)
             if extinf:
                 orig_ctime = _get_orig_ctime(file, program_date_time)
                 self._send_files_metadata(
                     os.path.join(self.segments_folder, file), orig_ctime, extinf
                 )
-                self._move_to_segments_folder(file, orig_ctime)
+                self._move_to_segments_folder(file, orig_ctime, extinf)
             else:
-                # A recorder restart can replace the playlist while older segments
-                # are still queued. Keep those bytes outside the scanned folder so
-                # they cannot block newer segments and can be recovered manually.
-                recovery_dir = os.path.join(
-                    self.segments_folder + ".recovery", uuid.uuid4().hex
-                )
-                os.makedirs(recovery_dir, exist_ok=True)
-                destination = os.path.join(recovery_dir, file)
-                shutil.move(os.path.join(self.temp_segments_folder, file), destination)
-                self._logger.error(
-                    "Failed to get extinf for %s; segment retained at %s. "
-                    "Its matching initialization data may be unavailable.",
+                self._logger.warning(
+                    "No known duration for %s; leaving fragment and init in staging for recovery.",  # noqa: E501
                     file,
-                    destination,
                 )
         except Exception as err:  # pylint: disable=broad-except
             self._logger.error(f"Failed to process m4s file {file}", exc_info=err)

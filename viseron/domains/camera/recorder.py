@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import secrets
 import shutil
+import stat
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from time import sleep
@@ -17,8 +19,9 @@ from sqlalchemy import delete, func, insert, select, update
 from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
 from viseron.components.storage.models import Recordings
 from viseron.components.storage.queries import get_recording_fragments
+from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX
 from viseron.const import CAMERA_SEGMENT_DURATION
-from viseron.domains.camera.fragmenter import Fragment
+from viseron.domains.camera.fragmenter import fragment_from_file
 from viseron.domains.camera.schedule import resolve_timezone
 from viseron.events import EventData
 from viseron.helpers import create_directory, draw_objects, get_utc_offset, utcnow
@@ -56,6 +59,9 @@ if TYPE_CHECKING:
     from viseron.domains.object_detector.detected_object import DetectedObject
 
     from .shared_frames import SharedFrame
+
+
+THUMBNAIL_TEMP_PREFIX = f"{TIER_MOVE_TEMP_PREFIX}thumbnail-"
 
 
 class RecordingDict(TypedDict):
@@ -256,7 +262,7 @@ class AbstractRecorder(ABC, RecorderBase):
         recording_id: int,
         frame: np.ndarray,
         objects: list[DetectedObject],
-    ) -> tuple[np.ndarray, str]:
+    ) -> tuple[np.ndarray, str | None]:
         """Create thumbnails, sent to MQTT and/or saved to disk based on config."""
         self._logger.debug(f"Saving thumbnail in {self._camera.thumbnails_folder}")
         thumbnail_name = f"{recording_id}.jpg"
@@ -267,17 +273,72 @@ class AbstractRecorder(ABC, RecorderBase):
                 frame,
                 objects,
             )
-        if not cv2.imwrite(thumbnail_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100]):
-            self._logger.error(f"Failed saving thumbnail {thumbnail_path} to disk")
+        if not self._write_thumbnail_atomic(thumbnail_path, frame):
+            thumbnail_path = None
 
         if self._config[CONFIG_RECORDER][CONFIG_THUMBNAIL][CONFIG_SAVE_TO_DISK]:
-            if not cv2.imwrite(
+            self._write_thumbnail_atomic(
                 os.path.join(self._camera.thumbnails_folder, "latest_thumbnail.jpg"),
                 frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 100],
-            ):
-                self._logger.error("Failed saving latest_thumbnail.jpg to disk")
+            )
         return frame, thumbnail_path
+
+    def _write_thumbnail_atomic(self, path: str, frame: np.ndarray) -> bool:
+        """Publish a complete JPEG, leaving any previous image intact on failure."""
+        temp_path = None
+        try:
+            # O_EXCL prevents an existing file or symlink from being opened.
+            # Unlike mkstemp, 0666 observes the process umask just like imwrite.
+            for _ in range(10):
+                candidate = os.path.join(
+                    os.path.dirname(path),
+                    f"{THUMBNAIL_TEMP_PREFIX}{secrets.token_hex(16)}.jpg",
+                )
+                try:
+                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                except FileExistsError:
+                    continue
+                temp_path = candidate
+                break
+            else:
+                raise FileExistsError("Could not allocate thumbnail temporary file")
+            with os.fdopen(fd, "wb") as temp_file:
+                try:
+                    existing = os.stat(path, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISREG(existing.st_mode):
+                        existing_mode = stat.S_IMODE(existing.st_mode)
+                        if (
+                            stat.S_IMODE(os.fstat(temp_file.fileno()).st_mode)
+                            != existing_mode
+                        ):
+                            os.fchmod(temp_file.fileno(), existing_mode)
+                success, encoded = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100]
+                )
+                if not success or encoded.size == 0:
+                    self._logger.error("Failed saving thumbnail %s", path)
+                    return False
+                temp_file.write(encoded.tobytes())
+            os.replace(temp_path, path)
+            return True
+        except (OSError, cv2.error):
+            self._logger.exception("Failed saving thumbnail %s", path)
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    self._logger.warning(
+                        "Could not remove temporary thumbnail %s",
+                        temp_path,
+                        exc_info=True,
+                    )
 
     def start(
         self,
@@ -419,10 +480,7 @@ class AbstractRecorder(ABC, RecorderBase):
             self.lookback,
             self._storage.get_session,
         )
-        fragments = [
-            Fragment(file.filename, file.path, file.duration, file.orig_ctime)
-            for file in files
-        ]
+        fragments = [fragment_from_file(file) for file in files]
         num_fragments = len(fragments)
         if num_fragments == 0:
             self._logger.error("No fragments available")
@@ -612,7 +670,11 @@ def _recording_file_dict(recording: Recordings, subpath: str = "") -> RecordingD
         "end_timestamp": recording.end_time.timestamp() if recording.end_time else None,
         "trigger_type": recording.trigger_type,
         "trigger_id": recording.trigger_id,
-        "thumbnail_path": f"{subpath}/files{recording.thumbnail_path}",
+        "thumbnail_path": (
+            f"{subpath}/files{recording.thumbnail_path}"
+            if recording.thumbnail_path
+            else ""
+        ),
         "hls_url": (
             # pylint: disable=line-too-long
             f"{subpath}/api/v1/hls/{recording.camera_identifier}/{recording.id}/index.m3u8"

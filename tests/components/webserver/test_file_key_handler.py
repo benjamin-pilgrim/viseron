@@ -53,10 +53,13 @@ class FileKeyTestMixin:
         content: bytes | None,
         camera_identifier: str = "test",
         file_key: int | None = None,
+        run_id: str | None = None,
     ) -> int:
         """Insert a row for a segment, writing it to disk unless content is None."""
         tier_path = os.path.join(self._tmp_path, f"tier{tier_id}")
         directory = os.path.join(tier_path, "segments", camera_identifier)
+        if run_id:
+            directory = os.path.join(directory, run_id)
         path = os.path.join(directory, "1.m4s")
         os.makedirs(directory, exist_ok=True)
         if content is not None:
@@ -220,3 +223,45 @@ class TestFileKeyHandlerAuth(FileKeyTestMixin, TestAppBaseAuth):
 
         assert response.code == HTTPStatus.OK
         assert response.body == b"segment"
+
+
+RUN_ID = "20261031T143215.123456Z-aabbccddeeff"
+
+
+class TestRunInitHandler(FileKeyTestMixin, TestAppBaseNoAuth):
+    """Test init identity across tiers and access boundaries."""
+
+    def test_run_init_follows_move(self) -> None:
+        """Resolve the run init after its fragments move tiers."""
+        self._store_file(0, b"segment", run_id=RUN_ID)
+        self._store_file(1, b"segment", run_id=RUN_ID)
+        source = self._tmp_path / "tier0" / "segments" / "test" / RUN_ID / "init.mp4"
+        dest = self._tmp_path / "tier1" / "segments" / "test" / RUN_ID / "init.mp4"
+        source.write_bytes(b"init")
+        dest.write_bytes(b"init")
+        url = f"/run-init/test/{RUN_ID}"
+        assert self.fetch(url).body == b"init"
+        source.unlink()
+        assert self.fetch(url).body == b"init"
+        assert self.fetch(f"/run-init/other/{RUN_ID}").code == HTTPStatus.NOT_FOUND
+        assert self.fetch("/run-init/test/../../init.mp4").code == HTTPStatus.NOT_FOUND
+
+
+class TestRunInitHandlerAuth(FileKeyTestMixin, TestAppBaseAuth):
+    """Test camera token validation for run init access."""
+
+    def test_camera_token_required_before_database_query(self) -> None:
+        """Reject invalid tokens before looking up the init."""
+        MockCamera(vis=self.vis, identifier="test")
+        MockCamera(vis=self.vis, identifier="other", access_tokens=["other_token"])
+        self._store_file(0, b"segment", run_id=RUN_ID)
+        url = f"/run-init/test/{RUN_ID}"
+        assert self.fetch(url).code == HTTPStatus.UNAUTHORIZED
+        assert (
+            self.fetch(f"{url}?access_token=other_token").code
+            == HTTPStatus.UNAUTHORIZED
+        )
+        self._handler_get_session.assert_not_called()
+        path = self._tmp_path / "tier0" / "segments" / "test" / RUN_ID / "init.mp4"
+        path.write_bytes(b"init")
+        assert self.fetch(f"{url}?access_token=test_access_token").body == b"init"

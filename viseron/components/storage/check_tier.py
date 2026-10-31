@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import datetime
+import ctypes
+import errno
 import logging
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -15,6 +20,23 @@ import numpy as np
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from viseron.components.storage.dispatch_fence import token_permits_start
+from viseron.components.storage.pending_journal import (
+    prepare,
+    sync_dir,
+    protected_by_pending,
+    publish_or_verify,
+)
+from viseron.components.storage.run_lifecycle import (
+    CameraLockBusy,
+    camera_lock,
+    is_run_directory,
+)
+from viseron.components.storage.source_move_intent import (
+    prepare_source_intent,
+    set_source_digest,
+    source_move_pending,
+)
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.util import (
@@ -293,6 +315,7 @@ class Worker:
 
         with self._check_locks[item.camera_identifier]:
             if self._checks_in_progress[item.camera_identifier]:
+                item.deferred = True
                 return
             now = utcnow().timestamp()
             throttle_period = item.throttle_period.total_seconds()
@@ -325,6 +348,8 @@ class Worker:
             item.dst,
             LOGGER,
             tier_markers=item.tier_markers,
+            camera_identifier=item.camera_identifier,
+            publication_meta=item.publication_meta,
         )
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
@@ -339,12 +364,31 @@ class Worker:
     def work_input(self, item: DataItem | DataItemMoveFile | DataItemDeleteFile):
         """Perform work on input item from child process."""
         try:
+            if item.cmd == "move_file" and item.dispatch_token is not None:
+                if not token_permits_start(item.dispatch_token):
+                    item.error = "retry cancelled after handler shutdown"
+                    return
             if item.cmd == "check_tier":
                 self.check_tier(item)
             if item.cmd == "move_file":
+                # Durable holds are resumed by the source-intent scanner. A
+                # normal tier scan must not independently copy the same file.
+                if item.dispatch_token is None and source_move_pending(item.src):
+                    item.deferred = True
+                    item.deferred_by_hold = True
+                    return
                 self.move_file(item)
             if item.cmd == "delete_file":
                 self.delete_file(item)
+        except CameraLockBusy as e:
+            if item.cmd in ("move_file", "delete_file"):
+                item.deferred = True
+                LOGGER.debug(
+                    "Storage operation deferred due to camera lock contention: %s", e
+                )
+            else:
+                LOGGER.error("Error processing command: %s, error: %s", item, e)
+                item.error = str(e)
         except Exception as e:  # pylint: disable=broad-except
             LOGGER.error(
                 "Error processing command: %s, error: %s",
@@ -896,16 +940,82 @@ def delete_file(
     if is_tier_marker(path, tier_markers or {}):
         raise OSError(f"Refusing to delete storage marker {path}")
     require_tier_markers(path, tier_markers or {})
-    try:
+    run_dir = os.path.dirname(path)
+    lock = (
+        camera_lock("/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(run_dir)))
+        if is_run_directory(os.path.basename(run_dir))
+        else contextlib.nullcontext()
+    )
+    with lock:
+        if source_move_pending(path) or protected_by_pending(path):
+            raise BlockingIOError("File has an active publication hold")
+        require_tier_markers(path, tier_markers or {})
         os.remove(path)
-    except FileNotFoundError as error:
-        logger.debug(f"Failed to delete file {path}: {error}")
-        raise error
-    require_tier_markers(path, tier_markers or {})
-    with get_session() as session:
-        stmt = delete(Files).where(Files.path == path)
-        session.execute(stmt)
-        session.commit()
+        require_tier_markers(path, tier_markers or {})
+        with get_session() as session:
+            stmt = delete(Files).where(Files.path == path)
+            session.execute(stmt)
+            session.commit()
+
+
+RUN_DIRECTORY_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}$")
+
+
+def publish_run_init(src: str, dst: str, tier_markers: dict[str, str]) -> None:
+    """Atomically publish an init without replacing a competing publisher.
+
+    Linux renameat2(RENAME_NOREPLACE) is required; fail closed if unavailable.
+    """
+    run_id = os.path.basename(os.path.dirname(src))
+    if not src.endswith(".m4s") or not RUN_DIRECTORY_RE.fullmatch(run_id):
+        return
+    if os.path.basename(os.path.dirname(dst)) != run_id:
+        raise OSError("Destination does not preserve run identity")
+    source_init = os.path.join(os.path.dirname(src), "init.mp4")
+    destination_dir = os.path.dirname(dst)
+    destination_init = os.path.join(destination_dir, "init.mp4")
+    require_tier_markers(source_init, tier_markers)
+    require_tier_markers(destination_init, tier_markers)
+    with open(source_init, "rb") as source:
+        data = source.read()
+    if not data:
+        raise OSError("Refusing to publish an empty run init")
+    os.makedirs(destination_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=TIER_MOVE_TEMP_PREFIX, dir=destination_dir)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        require_tier_markers(source_init, tier_markers)
+        require_tier_markers(destination_init, tier_markers)
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "renameat2 unavailable") from exc
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100, os.fsencode(temp_path), -100, os.fsencode(destination_init), 1
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            if error != errno.EEXIST:
+                raise OSError(error, os.strerror(error), destination_init)
+            with open(destination_init, "rb") as target:
+                if target.read() != data:
+                    raise OSError("Conflicting run init at destination")
+    finally:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
 
 
 def move_file(
@@ -915,6 +1025,41 @@ def move_file(
     logger: logging.Logger,
     *,
     tier_markers: dict[str, str] | None = None,
+    camera_identifier: str | None = None,
+    publication_meta: dict | None = None,
+    verify_readback: bool = False,
+) -> None:
+    """Move a file while serializing generation publications with cleanup."""
+    is_run = is_run_directory(os.path.basename(os.path.dirname(src)))
+    if is_run and (camera_identifier is None or publication_meta is None):
+        raise ValueError("Run segment moves require camera and publication metadata")
+    destination_camera = os.path.abspath(os.path.dirname(os.path.dirname(dst)))
+    lock = (
+        camera_lock("/tmp/viseron-run-locks", destination_camera)
+        if is_run
+        else contextlib.nullcontext()
+    )
+    with lock:
+        _move_file_locked(
+            _get_session,
+            src,
+            dst,
+            logger,
+            tier_markers=tier_markers,
+            publication_meta=publication_meta,
+            verify_readback=verify_readback,
+        )
+
+
+def _move_file_locked(
+    _get_session: Callable[..., Session],
+    src: str,
+    dst: str,
+    logger: logging.Logger,
+    *,
+    tier_markers: dict[str, str] | None = None,
+    publication_meta: dict | None = None,
+    verify_readback: bool = False,
 ) -> None:
     """Move file from src to dst.
 
@@ -930,7 +1075,22 @@ def move_file(
     require_tier_markers(src, tier_markers or {})
     require_tier_markers(dst, tier_markers or {})
     temp_path: str | None = None
+    protected_temp = False
+    source_intent = None
+    is_run_source = is_run_directory(os.path.basename(os.path.dirname(src)))
+    if is_run_source:
+        source_camera = os.path.abspath(os.path.dirname(os.path.dirname(src)))
+        with camera_lock("/tmp/viseron-run-locks", source_camera):
+            require_tier_markers(src, tier_markers or {})
+            source_intent = prepare_source_intent(
+                src,
+                dst,
+                os.stat(src, follow_symlinks=False),
+                publication_meta.get("file_key"),
+                source_db=publication_meta.get("source_db"),
+            )
     try:
+        publish_run_init(src, dst, tier_markers or {})
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with open(src, "rb") as source:
             source_stat = os.fstat(source.fileno())
@@ -938,9 +1098,15 @@ def move_file(
             fd, temp_path = tempfile.mkstemp(
                 prefix=TIER_MOVE_TEMP_PREFIX, dir=os.path.dirname(dst)
             )
+            digest = hashlib.sha256() if source_intent is not None else None
             with os.fdopen(fd, "wb") as target:
                 os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
-                shutil.copyfileobj(source, target)
+                if digest is None:
+                    shutil.copyfileobj(source, target)
+                else:
+                    while chunk := source.read(1024 * 1024):
+                        target.write(chunk)
+                        digest.update(chunk)
                 target.flush()
                 os.fsync(target.fileno())
                 if (
@@ -948,18 +1114,73 @@ def move_file(
                     or os.fstat(source.fileno()).st_size != source_size
                 ):
                     raise OSError(f"Incomplete copy of {src}")  # noqa: TRY301
-        os.replace(temp_path, dst)
-        temp_path = None
-        require_tier_markers(src, tier_markers or {})
+        if source_intent is not None:
+            with open(
+                os.path.join(os.path.dirname(src), "init.mp4"), "rb"
+            ) as init_source:
+                init_digest = hashlib.sha256(init_source.read()).hexdigest()
+            if verify_readback:
+                copied_digest = hashlib.sha256()
+                with open(temp_path, "rb") as copied:
+                    while chunk := copied.read(1024 * 1024):
+                        copied_digest.update(chunk)
+                if copied_digest.digest() != digest.digest():
+                    raise OSError("Destination readback checksum mismatch")  # noqa: TRY301
+        elif verify_readback:
+            raise ValueError("Readback verification requires run-segment metadata")
+        if source_intent is not None:
+            marker = prepare(
+                os.path.dirname(dst),
+                os.path.basename(dst),
+                publication_meta,
+                temp_path=temp_path,
+                source_intent=source_intent,
+                copied_digest=digest.hexdigest(),
+            )
+            protected_temp = True
+            publish_or_verify(marker)
+            temp_path = None
+        else:
+            os.replace(temp_path, dst)
+            sync_dir(os.path.dirname(dst))
+            temp_path = None
         require_tier_markers(dst, tier_markers or {})
-        os.remove(src)
+        is_run = is_run_directory(os.path.basename(os.path.dirname(src)))
+        source_camera = os.path.abspath(os.path.dirname(os.path.dirname(src)))
+        source_lock = (
+            camera_lock("/tmp/viseron-run-locks", source_camera)
+            if is_run
+            else contextlib.nullcontext()
+        )
+        # No destination I/O while holding the local source lock.
+        with source_lock:
+            require_tier_markers(src, tier_markers or {})
+            current = os.stat(src)
+            if (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ) != (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+            ):
+                raise OSError("Source changed while being copied")  # noqa: TRY301
+            if source_intent is not None:
+                # Experiment: protect source until a future reconciler proves the
+                # destination was indexed. Do not enable deletion without proof.
+                set_source_digest(source_intent, digest.hexdigest(), init_digest)
+            else:
+                os.remove(src)
     except OSError as error:
         logger.debug("Failed to move file %s to %s: %s", src, dst, error)
         # A destination or network failure says nothing about whether the source
         # is safe to discard. Leave both the source and its record for retry.
         raise
     finally:
-        if temp_path is not None:
+        if temp_path is not None and not protected_temp:
             try:
                 os.remove(temp_path)
             except FileNotFoundError:

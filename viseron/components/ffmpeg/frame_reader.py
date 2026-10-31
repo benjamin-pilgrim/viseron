@@ -78,13 +78,27 @@ def run_frame_reader(
     empty_frames = 0
 
     pipe.start()
+    pipe_closed = False
 
     while capture_frames.is_set():
         if decode_error.is_set():
-            time.sleep(5)
+            # Check for shutdown during backoff instead of sleeping through
+            # the parent's stop deadline and restarting a dying camera.
+            for _ in range(50):
+                if not capture_frames.is_set():
+                    break
+                time.sleep(0.1)
+            if not capture_frames.is_set():
+                break
             logger.error("Restarting frame pipe")
             pipe.close()
+            pipe_closed = True
+            if not capture_frames.is_set():
+                break
             pipe.start()
+            pipe_closed = False
+            if not capture_frames.is_set():
+                break
             decode_error.clear()
             empty_frames = 0
 
@@ -106,7 +120,8 @@ def run_frame_reader(
             logger.error("Did not receive a frame")
             decode_error.set()
 
-    pipe.close()
+    if not pipe_closed:
+        pipe.close()
     frame_queue.close()
     logger.debug("Frame reader stopped")
     os.kill(os.getpid(), signal.SIGKILL)

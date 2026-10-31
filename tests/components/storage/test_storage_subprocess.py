@@ -187,3 +187,17 @@ def test_queue_failure_releases_callback_capacity() -> None:
     with pytest.raises(RuntimeError, match="queue failed"):
         worker.send_command(_make_item(callback_id=None), Mock())
     assert not worker._callbacks
+
+
+def test_worker_marks_busy_check_as_deferred() -> None:
+    """Distinguish a busy camera from a normal no-op check."""
+    from viseron.components.storage.check_tier import Worker  # noqa: PLC0415
+
+    worker = Worker.__new__(Worker)
+    worker._check_locks = {"test": Lock()}
+    worker._checks_in_progress = {"test": True}
+    worker._last_call = {}
+    item = _make_item()
+    worker.check_tier(item)
+    assert item.deferred
+    assert item.data is None

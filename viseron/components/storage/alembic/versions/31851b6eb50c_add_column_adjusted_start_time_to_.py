@@ -36,7 +36,9 @@ def upgrade() -> None:
         ),
     )
     connection = op.get_bind()
-    results = connection.execute(sa.select(Recordings)).fetchall()
+    results = connection.execute(
+        sa.select(Recordings.id, Recordings.start_time)
+    ).fetchall()
     for result in results:
         adjusted_start_time = (
             result.start_time

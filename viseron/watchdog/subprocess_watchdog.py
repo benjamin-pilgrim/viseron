@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess as sp
 from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.helpers import utcnow
@@ -35,9 +37,12 @@ class RestartablePopen(_Base):
         register: bool = True,
         stage: str | None = VISERON_SIGNAL_SHUTDOWN,
         start_new_session: bool = True,
+        command_factory: Callable[[], list[str] | tuple[list[str], int | None]]
+        | None = None,
         **kwargs,
     ) -> None:
         self._args = args
+        self._command_factory = command_factory
         self._name = name
         self._grace_period = grace_period
         self._kwargs = kwargs
@@ -89,10 +94,23 @@ class RestartablePopen(_Base):
 
     def start(self) -> None:
         """Start the subprocess."""
-        self._subprocess = sp.Popen(
-            *self._args,
-            **self._kwargs,
-        )
+        launch = self._command_factory() if self._command_factory else None
+        lease_fd = None
+        launch_kwargs = self._kwargs.copy()
+        if isinstance(launch, tuple):
+            launch, lease_fd = launch
+            if lease_fd is not None:
+                launch_kwargs["pass_fds"] = (
+                    *launch_kwargs.get("pass_fds", ()),
+                    lease_fd,
+                )
+        try:
+            self._subprocess = sp.Popen(
+                *([launch] if launch is not None else self._args), **launch_kwargs
+            )
+        finally:
+            if lease_fd is not None:
+                os.close(lease_fd)
         self._start_time = utcnow().timestamp()
         self._started = True
 

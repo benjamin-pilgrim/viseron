@@ -7,8 +7,12 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import tornado.web
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from viseron.components.storage.const import (
+    TIER_CATEGORY_RECORDER,
+    TIER_SUBCATEGORY_SEGMENTS,
+)
 from viseron.components.storage.models import Files
 from viseron.components.webserver.static_file_handler import (
     AccessTokenStaticFileHandler,
@@ -75,3 +79,31 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
             raise tornado.web.HTTPError(HTTPStatus.NOT_FOUND)
         self.root = os.path.dirname(resolved_path)
         await super().get(os.path.basename(resolved_path), include_body)
+
+
+class RunInitHandler(FileKeyHandler):
+    """Resolve a run's init through any tier with indexed fragments.
+
+    Run IDs are validated by the route. Every tier holding fragments must also
+    publish its own matching init before indexing a fragment there.
+    """
+
+    def _resolve(self) -> str | None:
+        """Find an available init for this camera and run, preferring lower tiers."""
+        run_id = self._encoded_file_key
+        with self._get_session() as session:
+            stmt = (
+                select(Files.directory)
+                .where(Files.camera_identifier == self._camera_identifier)
+                .where(Files.category == TIER_CATEGORY_RECORDER)
+                .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
+                .where(Files.directory.endswith("/" + run_id, autoescape=True))
+                .group_by(Files.directory)
+                .order_by(func.min(Files.tier_id))
+            )
+            directories = session.execute(stmt).scalars().all()
+        for directory in directories:
+            init_path = os.path.join(directory, "init.mp4")
+            if os.path.isfile(init_path):
+                return init_path
+        return None

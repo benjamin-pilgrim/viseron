@@ -6,6 +6,9 @@ import logging
 import os
 import pickle
 import tempfile
+import threading
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -18,8 +21,10 @@ from viseron.components.storage.jobs import (
     OrphanedDatabaseFilesCleanup,
     OrphanedEventClipsCleanup,
     OrphanedFilesCleanup,
+    OrphanedRecordingsCleanup,
     OrphanedThumbnailsCleanup,
 )
+from viseron.components.storage.models import Files, Recordings
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.viseron_types import SnapshotDomain
 
@@ -35,6 +40,47 @@ ALL_PATHS = [
     "/timelapse",
     *[f"/snapshots/{domain.value}" for domain in SnapshotDomain],
 ]
+
+
+def test_orphan_recording_cleanup_keeps_preroll(get_db_session, monkeypatch) -> None:
+    """A recording with only its pre-roll indexed still has video."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    with get_db_session() as session:
+        recording = Recordings(
+            camera_identifier="camera",
+            adjusted_start_time=now - timedelta(seconds=20),
+            start_time=now + timedelta(seconds=5),
+            end_time=now + timedelta(seconds=10),
+        )
+        session.add(recording)
+        session.add(
+            Files(
+                tier_id=0,
+                tier_path="/tier",
+                camera_identifier="camera",
+                category="recorder",
+                subcategory="segments",
+                path="/tier/preroll.m4s",
+                directory="/tier",
+                filename="preroll.m4s",
+                size=1,
+                duration=1,
+                orig_ctime=now,
+            )
+        )
+        session.commit()
+        recording_id = recording.id
+
+    runner = SimpleNamespace(
+        name="test",
+        get_session=get_db_session,
+        kill_event=threading.Event(),
+        log_progress=MagicMock(),
+    )
+    monkeypatch.setattr("viseron.components.storage.jobs.time.sleep", lambda _: None)
+    OrphanedRecordingsCleanup.work(runner)
+    with get_db_session() as session:
+        assert session.get(Recordings, recording_id) is not None
 
 
 def _storage() -> MagicMock:

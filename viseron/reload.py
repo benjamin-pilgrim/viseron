@@ -25,7 +25,9 @@ from viseron.config import (
     diff_identifier_config,
     load_config,
 )
+from viseron.components.nvr.const import COMPONENT as NVR_COMPONENT
 from viseron.const import DEFAULT_COMPONENTS, FAILED, LOADED, LOADING
+from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.domain_registry import DomainState
 from viseron.domains import (
     setup_domains,
@@ -290,6 +292,8 @@ def _handle_cancelled_retries(
 ) -> None:
     """Unload domain retries that were cancelled before reload."""
     for entry in cancelled_retries:
+        if vis.domain_registry.get(entry.domain, entry.identifier) is not entry:
+            continue
         LOGGER.debug(
             f"Unloading retrying domain {entry.domain} with identifier "
             f"{entry.identifier} that was cancelled during reload"
@@ -349,14 +353,36 @@ def _apply_setup_plan(vis: Viseron, new_config: dict, plan: SetupPlan) -> None:
     _unload_dependents_of_pending_domains(vis, plan)
 
     LOGGER.debug(f"Components to setup domains for: {plan.domain_components}")
+    domain_components = plan.domain_components - plan.components
+    implicit_nvr = (
+        NVR_COMPONENT in domain_components and NVR_COMPONENT not in new_config
+    )
+    if implicit_nvr:
+        # Camera providers must register before deriving the NVR camera list.
+        # Otherwise a camera removed and re-added during reload is missed.
+        domain_components = domain_components - {NVR_COMPONENT}
     setup_components(
         vis,
         new_config,
         reloading=True,
         domains_only=True,
-        # Make sure a components setup_domains isn't called twice
-        components=plan.domain_components - plan.components,
+        components=domain_components,
     )
+    if implicit_nvr:
+        domain_config = {
+            **new_config,
+            NVR_COMPONENT: {
+                identifier: {}
+                for identifier in vis.domain_registry.get_identifiers(CAMERA_DOMAIN)
+            },
+        }
+        setup_components(
+            vis,
+            domain_config,
+            reloading=True,
+            domains_only=True,
+            components={NVR_COMPONENT},
+        )
     setup_domains(vis)
 
 
@@ -505,7 +531,22 @@ def reload_config(vis: Viseron) -> ReloadResult:
     with vis.reload_lock:
         # Wait until initial setup is complete before allowing reload
         vis.initialized_event.wait()
+        # Another reload may have started new retries while this reload waited
+        # for the lock. Cancel those too before waiting for setup workers.
+        latest_cancelled = vis.domain_registry.cancel_all_retries()
+        cancelled_ids = {id(entry) for entry in cancelled_retries}
+        cancelled_retries.extend(
+            entry for entry in latest_cancelled if id(entry) not in cancelled_ids
+        )
+        vis.domain_registry.wait_for_setups()
         result = _reload_config(vis, cancelled_retries)
+        if not result.success and cancelled_retries:
+            # A rejected configuration must not strand cameras whose retry
+            # workers were cancelled to serialize this reload. Recreate their
+            # domain chains using the last successfully applied configuration.
+            recovery_plan = SetupPlan()
+            _handle_cancelled_retries(vis, cancelled_retries, recovery_plan)
+            _apply_setup_plan(vis, vis.config, recovery_plan)
 
     if not result.success:
         LOGGER.error(f"Config reload failed with errors: {result.errors}")
