@@ -192,6 +192,7 @@ class Stream(FFmpegStream):
     def read(self) -> SharedFrame | None:
         """Return a single frame from Gst buffer."""
         try:
+            self.frame_wait_timed_out = False
             if self._process_frames_proc:
                 frame_bytes = self._frame_queue.get(timeout=1)
                 if self._process_frames_proc_exit.is_set():
@@ -207,6 +208,7 @@ class Stream(FFmpegStream):
                         self._camera_identifier,
                     )
         except Empty:
+            self.frame_wait_timed_out = True
             return None
         except Exception as err:  # pylint: disable=broad-except
             self._logger.error(f"Error reading frame from pipe: {err}")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -307,11 +307,12 @@ class Camera(AbstractCamera):
 
         self.initialize_camera()
 
-    def _create_frame_reader(self) -> RestartableThread:
+    def _create_frame_reader(self, stop_event: Event) -> RestartableThread:
         """Return a frame reader thread."""
         return RestartableThread(
             name="viseron.camera." + self.identifier,
             target=self.read_frames,
+            args=(stop_event,),
             poll_method=self.poll_method,
             poll_target=self.poll_target,
             daemon=True,
@@ -331,32 +332,30 @@ class Camera(AbstractCamera):
 
         self._logger.debug(f"Camera {self.name} initialized")
 
-    def read_frames(self) -> None:
-        """Read frames from camera."""
+    def read_frames(self, stop_event: Event) -> None:
+        """Read frames using a stop event unique to this reader."""
         self.decode_error.clear()
         self._poll_timer = utcnow().timestamp()
         empty_frames = 0
         self._thread_stuck = False
 
-        with self._capture_lock:
-            if not self._capture_frames:
-                return
-            self.stream.start_pipe()
+        if stop_event.is_set():
+            return
+        self.stream.start_pipe()
 
-        while self._capture_frames:
+        while not stop_event.is_set():
             if self.decode_error.is_set():
                 self._poll_timer = utcnow().timestamp()
                 self.connected = False
                 self.still_image_available = self.still_image_configured
-                if self._capture_stop.wait(5):
+                if stop_event.wait(5):
                     break
                 self._logger.error("Restarting frame pipe")
                 self.stream.close_pipe()
-                with self._capture_lock:
-                    if not self._capture_frames:
-                        self._logger.debug("Frame reader stopped")
-                        return
-                    self.stream.start_pipe()
+                if stop_event.is_set():
+                    self._logger.debug("Frame reader stopped")
+                    return
+                self.stream.start_pipe()
                 self.decode_error.clear()
                 empty_frames = 0
 
@@ -377,13 +376,15 @@ class Camera(AbstractCamera):
                 continue
 
             if self._thread_stuck:
-                return
+                break
 
             if self.stream.poll() is not None:
                 self._logger.error("Frame reader process has exited")
                 self.decode_error.set()
                 continue
 
+            if getattr(self.stream, "frame_wait_timed_out", False) is True:
+                continue
             empty_frames += 1
             if empty_frames >= MAX_EMPTY_FRAMES:
                 self._logger.error("Did not receive a frame")
@@ -425,27 +426,46 @@ class Camera(AbstractCamera):
         return super().calculate_output_fps(scanners)
 
     def _start_camera(self) -> None:
-        """Start capturing frames from camera."""
+        """Start a reader once the previous owner has released the pipe."""
         self._logger.debug("Starting capture thread")
         with self._capture_lock:
-            self._capture_stop.clear()
+            if self._capture_frames:
+                return
             self._capture_frames = True
-        if not self._frame_reader or not self._frame_reader.is_alive():
-            self._frame_reader = self._create_frame_reader()
+            stop_event = Event()
+            self._capture_stop = stop_event
+            previous = self._frame_reader
+            if previous and previous.is_alive():
+                Thread(
+                    target=self._start_after_previous,
+                    args=(previous, stop_event),
+                    daemon=True,
+                ).start()
+                return
+            self._frame_reader = self._create_frame_reader(stop_event)
+            self._frame_reader.start()
+
+    def _start_after_previous(self, previous, stop_event: Event) -> None:
+        """Do not share a stream with a reader still closing its pipe."""
+        previous.join()
+        with self._capture_lock:
+            if stop_event.is_set() or self._capture_stop is not stop_event:
+                return
+            self._frame_reader = self._create_frame_reader(stop_event)
             self._frame_reader.start()
 
     def _stop_camera(self) -> None:
-        """Release the connection to the camera."""
+        """Signal the current owner; never close its pipe concurrently."""
         self._logger.debug("Stopping capture thread")
         with self._capture_lock:
             self._capture_frames = False
             self._capture_stop.set()
-        if self._frame_reader:
-            self._frame_reader.stop()
-            self._frame_reader.join(timeout=5)
-            if self._frame_reader.is_alive():
-                self._logger.debug("Timed out trying to stop camera. Killing pipe")
-                self.stream.close_pipe()
+            reader = self._frame_reader
+        if reader:
+            reader.stop()
+            reader.join(timeout=5)
+            if reader.is_alive():
+                self._logger.debug("Frame reader is still stopping")
 
     def start_recorder(
         self,
