@@ -541,6 +541,7 @@ class TestFragmenterLifecycle:
 
     def teardown_method(self) -> None:
         """Tear down test method."""
+        self.fragmenter.stop()
         self._worker_patcher.stop()
         shutil.rmtree(self.camera.temp_segments_folder)
 

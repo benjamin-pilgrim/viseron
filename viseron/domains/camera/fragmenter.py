@@ -12,6 +12,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 from apscheduler.jobstores.base import JobLookupError
@@ -29,6 +30,7 @@ from viseron.components.storage.queries import get_time_period_fragments
 from viseron.const import CAMERA_SEGMENT_DURATION, TEMP_DIR, VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import CONFIG_FFMPEG_LOGLEVEL, CONFIG_RECORDER
 from viseron.domains.camera.fragmenter_process import FragmenterWork
+from viseron.domains.camera.playlist_timing import capture_playlist_times
 from viseron.events import EventEmptyData
 from viseron.helpers.child_process_context import get_child_process_context
 from viseron.helpers.child_process_worker import ChildProcessWorker
@@ -143,6 +145,8 @@ class Fragmenter:
         self._lock = threading.Lock()
         self._fragment_worker: FragmenterSubProcessWorker | None = None
         self._fragment_job: Job | None = None
+        self._timing_stop = threading.Event()
+        self._timing_thread: threading.Thread | None = None
         self._fragment_job_id = f"fragment_{self._camera.identifier}"
         self._event_listeners = []
         self._event_listeners.append(
@@ -174,6 +178,14 @@ class Fragmenter:
                 coalesce=True,
                 replace_existing=True,
             )
+            self._timing_stop = threading.Event()
+            self._timing_thread = threading.Thread(
+                target=self._capture_playlist_timing,
+                args=(self._timing_stop,),
+                name=f"playlist-timing.{self._camera.identifier}",
+                daemon=True,
+            )
+            self._timing_thread.start()
 
     def stop(self) -> None:
         """Stop the fragmentation child process and the job that feeds it."""
@@ -196,6 +208,20 @@ class Fragmenter:
                 self._logger.warning("Timed out fragmenting remaining segments")
             self._fragment_worker.stop()
             self._fragment_worker = None
+            self._timing_stop.set()
+            if self._timing_thread is not None:
+                self._timing_thread.join(timeout=2)
+                self._timing_thread = None
+
+    def _capture_playlist_timing(self, stop: threading.Event) -> None:
+        """Observe playlist updates independently of the publication worker."""
+        stage = Path(self._camera.temp_segments_folder)
+        while not stop.is_set():
+            try:
+                capture_playlist_times(stage)
+            except Exception:  # pylint: disable=broad-except
+                self._logger.exception("Playlist timing capture failed")
+            stop.wait(1)
 
     def _on_metadata_from_worker(self, item) -> None:
         """Update temporary_files_meta with metadata from subprocess."""

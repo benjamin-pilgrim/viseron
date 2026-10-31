@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, BinaryIO
 from uuid import uuid4
 
 from viseron.helpers.logs import LogPipe
+from viseron.helpers.recording_timing_contract import (
+    TIMING_CONTRACT_CONTENT,
+    TIMING_CONTRACT_FILE,
+)
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
 
 from .const import ORIN_RAWVIDEO_OUTPUT
@@ -38,7 +42,9 @@ def _command_for_run(command: list[str]) -> list[str]:
     return result
 
 
-def _leased_command_for_run(command: list[str]) -> tuple[list[str], int | None]:
+def _leased_command_for_run(
+    command: list[str], *, timing_capture_safe: bool = False
+) -> tuple[list[str], int | None]:
     """Hold a writer lease from before process creation until FFmpeg exits."""
     result = _command_for_run(command)
     for original, resolved in zip(command, result):
@@ -48,6 +54,19 @@ def _leased_command_for_run(command: list[str]) -> tuple[list[str], int | None]:
             fd = os.open(lease, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if timing_capture_safe:
+                    marker = os.path.join(run_dir, TIMING_CONTRACT_FILE)
+                    try:
+                        with open(marker, "x", encoding="utf-8") as contract:
+                            contract.write(TIMING_CONTRACT_CONTENT)
+                            contract.flush()
+                            os.fsync(contract.fileno())
+                    except OSError:
+                        # Recording can continue; recovery simply fails closed.
+                        try:
+                            os.unlink(marker)
+                        except OSError:
+                            pass
                 os.fsync(fd)
                 directory_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -73,6 +92,7 @@ class FFmpegPipe:
         segment_command: list[str] | None = None,
         dedicated_rawvideo_fd: bool = False,
         run_marker=None,
+        timing_capture_safe: bool = False,
     ) -> None:
         self._camera_identifier = camera_identifier
         self._logger = logger
@@ -81,6 +101,7 @@ class FFmpegPipe:
         self._segment_command = segment_command
         self._dedicated_rawvideo_fd = dedicated_rawvideo_fd
         self._run_marker = run_marker
+        self._timing_capture_safe = timing_capture_safe
 
         self._pipe: RestartablePopen | None = None
         self._log_pipe: LogPipe | None = None
@@ -139,7 +160,9 @@ class FFmpegPipe:
             self._logger.debug("FFmpeg decoder command: %s", " ".join(command))
             process = RestartablePopen(
                 command,
-                command_factory=lambda: _leased_command_for_run(command),
+                command_factory=lambda: _leased_command_for_run(
+                    command, timing_capture_safe=self._timing_capture_safe
+                ),
                 launch_callback=self._record_run_launch
                 if not self._segment_command
                 else None,
@@ -179,7 +202,8 @@ class FFmpegPipe:
                 self.segment_process = RestartablePopen(
                     self._segment_command,
                     command_factory=lambda: _leased_command_for_run(
-                        self._segment_command
+                        self._segment_command,
+                        timing_capture_safe=self._timing_capture_safe,
                     ),
                     name=f"viseron.camera.{self._camera_identifier}.segments",
                     launch_callback=self._record_run_launch,
@@ -199,7 +223,8 @@ class FFmpegPipe:
                     self._pipe = RestartablePopen(
                         self._decoder_command,
                         command_factory=lambda: _leased_command_for_run(
-                            self._decoder_command
+                            self._decoder_command,
+                            timing_capture_safe=self._timing_capture_safe,
                         ),
                         name=f"viseron.camera.{self._camera_identifier}.pipe",
                         launch_callback=self._record_run_launch
