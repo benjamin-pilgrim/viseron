@@ -7,6 +7,7 @@ The staged file identity is checked again when the fragment is published.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import math
@@ -32,6 +33,7 @@ _SEGMENT = re.compile(r"^\d{9,}-\d+-\d{13,}\.m4s$")
 _PREFIX = ".viseron-timing-"
 _TIMING_RECORD = re.compile(r"^\.viseron-timing-(\d{9,}-\d+-\d{13,}\.m4s)\.json$")
 _MAX_SEGMENT_DURATION = 86400
+_TIMING_RECORD_VERSION = 2
 
 
 def _identity(path: Path) -> list[int]:
@@ -92,15 +94,32 @@ def capture_playlist_times(stage: Path) -> None:
                 ) != TIMING_CONTRACT_CONTENT:
                     continue
                 contents = (run / "index.m3u8").read_text(encoding="utf-8")
-                _capture_run(run, contents)
                 _prune_released_records(run)
+            _capture_run(stage, run, contents)
         except (CameraLockBusy, FileNotFoundError):
             continue
         except (OSError, UnicodeError):
             _LOGGER.warning("Cannot capture timing playlist %s", run, exc_info=True)
 
 
-def _capture_run(run: Path, contents: str) -> None:
+def _source_digest(fragment: Path) -> tuple[list[int], str]:
+    """Read only the local source and reject a source that changes mid-read."""
+    fd = os.open(fragment, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("fragment is not a regular file")
+        identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
+        digest = hashlib.sha256()
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+        if identity != [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns]:
+            raise ValueError("fragment changed while calculating timing digest")
+    return identity, digest.hexdigest()
+
+
+def _capture_run(stage: Path, run: Path, contents: str) -> None:
     for name, duration, timestamp in _records(contents):
         fragment = run / name
         target = run / f"{_PREFIX}{name}.json"
@@ -108,32 +127,35 @@ def _capture_run(run: Path, contents: str) -> None:
             continue
         temp = None
         try:
-            identity = _identity(fragment)
+            # Hash outside the camera lock: a large fragment must not stall
+            # publication, event handling or retention for this camera.
+            identity, digest = _source_digest(fragment)
             record = {
-                "version": 1,
+                "version": _TIMING_RECORD_VERSION,
                 "name": name,
                 "identity": identity,
+                "sha256": digest,
                 "duration": duration,
                 "program_date_time": timestamp.isoformat(),
             }
-            fd, temp = tempfile.mkstemp(prefix=".viseron-timing-tmp-", dir=run)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(record, output, sort_keys=True)
-                output.flush()
-                os.fsync(output.fileno())
-            if _identity(fragment) != identity:
-                raise ValueError("fragment changed while recording timing")  # noqa: TRY301
-            try:
-                os.link(temp, target)
-            except FileExistsError:
-                pass
-            directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except FileNotFoundError:
-            # A concurrently acknowledged fragment may already be gone.
+            with camera_lock("/tmp/viseron-run-locks", os.path.abspath(stage)):
+                if _identity(fragment) != identity:
+                    raise ValueError("fragment changed while recording timing")  # noqa: TRY301
+                fd, temp = tempfile.mkstemp(prefix=".viseron-timing-tmp-", dir=run)
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(record, output, sort_keys=True)
+                    output.flush()
+                    os.fsync(output.fileno())
+                try:
+                    os.link(temp, target)
+                except FileExistsError:
+                    pass
+                directory = os.open(run, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except (FileNotFoundError, CameraLockBusy):
             continue
         except (OSError, ValueError):
             _LOGGER.warning("Cannot preserve timing for %s", fragment, exc_info=True)
@@ -161,7 +183,7 @@ def _prune_released_records(run: Path) -> None:
 
 def read_playlist_time(
     fragment: Path,
-) -> tuple[datetime.datetime, float, list[int]] | None:
+) -> tuple[datetime.datetime, float, list[int], str | None] | None:
     """Return only a record that still identifies the original staged file."""
     if not _SEGMENT.fullmatch(fragment.name):
         return None
@@ -176,13 +198,33 @@ def read_playlist_time(
         timestamp = datetime.datetime.fromisoformat(record["program_date_time"])
         duration = float(record["duration"])
         if (
-            record["version"] != 1
+            record["version"] not in (1, _TIMING_RECORD_VERSION)
             or record["name"] != fragment.name
-            or record["identity"] != _identity(fragment)
+            or (
+                record["version"] == _TIMING_RECORD_VERSION
+                and not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+            )
             or timestamp.utcoffset() is None
             or not 0 < duration < _MAX_SEGMENT_DURATION
         ):
             return None
-        return timestamp.astimezone(datetime.timezone.utc), duration, record["identity"]
+        identity = _identity(fragment)
+        expected_digest = (
+            record["sha256"] if record["version"] == _TIMING_RECORD_VERSION else None
+        )
+        if record["identity"] != identity:
+            # Older records lack a content hash and cannot safely survive an
+            # identity change. Preserve those sources for manual recovery.
+            if record["version"] == 1:
+                return None
+            identity, actual_digest = _source_digest(fragment)
+            if actual_digest != expected_digest:
+                return None
+        return (
+            timestamp.astimezone(datetime.timezone.utc),
+            duration,
+            identity,
+            expected_digest,
+        )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None

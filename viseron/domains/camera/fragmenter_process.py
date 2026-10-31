@@ -386,6 +386,7 @@ class FragmenterWork(ChildProcessWork):
         *,
         init_path: str | None = None,
         segment_path: str | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> None:
         """Perform per fragment tasks before moving fragment to storage.
 
@@ -403,7 +404,12 @@ class FragmenterWork(ChildProcessWork):
         segment_path = segment_path or os.path.join(self.temp_segments_folder, file)
 
         self._extract_timelapse_frame(
-            init_path, segment_path, tmp_frame_path, frame_path, orig_ctime
+            init_path,
+            segment_path,
+            tmp_frame_path,
+            frame_path,
+            orig_ctime,
+            pass_fds=pass_fds,
         )
 
     def _extract_timelapse_frame(
@@ -413,6 +419,8 @@ class FragmenterWork(ChildProcessWork):
         tmp_frame_path: str,
         frame_path: str,
         orig_ctime: datetime.datetime,
+        *,
+        pass_fds: tuple[int, ...] = (),
     ) -> None:
         """Extract a timelapse frame from segment files."""
         try:
@@ -433,6 +441,7 @@ class FragmenterWork(ChildProcessWork):
                 text=True,
                 timeout=TIMELAPSE_FFMPEG_TIMEOUT,
                 check=False,
+                pass_fds=pass_fds,
             )
             if result.returncode == 0:
                 self._logger.debug(f"Timelapse: Extracted frame {tmp_frame_path}")
@@ -491,12 +500,14 @@ class FragmenterWork(ChildProcessWork):
         orig_ctime: datetime.datetime,
         duration: float | None = None,
         expected_identity: list[int] | None = None,
+        expected_digest: str | None = None,
     ) -> None:
         """Move fragmented mp4 created by encoder to segments folder."""
         run = os.path.dirname(file)
         is_run = is_run_directory(run)
         if not is_run:
             self._segment_hook(file, orig_ctime)
+        timelapse_fds: list[int] = []
         try:
             destination_dir = os.path.join(self.segments_folder, run)
             require_tier_markers(destination_dir, self._tier_markers)
@@ -592,6 +603,13 @@ class FragmenterWork(ChildProcessWork):
                                 raise OSError(
                                     "staged source changed during publication"
                                 )
+                        if (
+                            expected_digest is not None
+                            and digest.hexdigest() != expected_digest
+                        ):
+                            raise OSError(
+                                "staged fragment content changed before publication"
+                            )
                         require_tier_markers(destination, self._tier_markers)
                         marker = prepare(
                             destination_dir,
@@ -607,18 +625,35 @@ class FragmenterWork(ChildProcessWork):
                         )
                         protected_temp = True
                         publish_or_verify(marker)
-                        # Use the validated published copy, never an unchecked
-                        # staged path that may have changed after timing capture.
-                        self._segment_hook(
-                            file,
-                            orig_ctime,
-                            init_path=init_dest,
-                            segment_path=destination,
-                        )
+                        # Pin the verified published inputs under the lock; do
+                        # the potentially slow FFmpeg work after releasing it.
+                        if self._timelapse_folder and self._temp_timelapse_folder:
+                            try:
+                                for path in (init_dest, destination):
+                                    timelapse_fds.append(
+                                        os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                                    )
+                            except OSError:
+                                for fd in timelapse_fds:
+                                    os.close(fd)
+                                timelapse_fds.clear()
+                                self._logger.warning(
+                                    "Cannot open validated timelapse inputs for %s",
+                                    file,
+                                    exc_info=True,
+                                )
                         # Keep staged source and durable hold until DB acknowledgement.
                     finally:
                         if not protected_temp and os.path.exists(temporary):
                             os.unlink(temporary)
+            if timelapse_fds:
+                self._segment_hook(
+                    file,
+                    orig_ctime,
+                    init_path=f"/proc/self/fd/{timelapse_fds[0]}",
+                    segment_path=f"/proc/self/fd/{timelapse_fds[1]}",
+                    pass_fds=tuple(timelapse_fds),
+                )
         except FileNotFoundError:
             self._logger.debug(f"{file} not found", exc_info=True)
         except CameraLockBusy:
@@ -642,6 +677,9 @@ class FragmenterWork(ChildProcessWork):
                 self._logger.warning(
                     "Cannot publish %s; retaining staging file", file, exc_info=err
                 )
+        finally:
+            for fd in timelapse_fds:
+                os.close(fd)
 
     def _send_files_metadata(
         self, path: str, orig_ctime: datetime.datetime, duration: float | None
@@ -716,6 +754,7 @@ class FragmenterWork(ChildProcessWork):
         try:
             name = os.path.basename(file)
             expected_identity = None
+            expected_digest = None
             if _RUN_SEGMENT_NAME.fullmatch(name):
                 try:
                     snapshot = os.stat(
@@ -739,7 +778,9 @@ class FragmenterWork(ChildProcessWork):
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 timing = read_playlist_time(Path(self.temp_segments_folder) / file)
                 if timing is not None:
-                    program_date_time, extinf, expected_identity = timing
+                    program_date_time, extinf, expected_identity, expected_digest = (
+                        timing
+                    )
             if _RUN_SEGMENT_NAME.fullmatch(name) and expected_identity is None:
                 program_date_time = None
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
@@ -765,7 +806,7 @@ class FragmenterWork(ChildProcessWork):
                     os.path.join(self.segments_folder, file), orig_ctime, extinf
                 )
                 self._move_to_segments_folder(
-                    file, orig_ctime, extinf, expected_identity
+                    file, orig_ctime, extinf, expected_identity, expected_digest
                 )
             else:
                 self._logger.warning(
