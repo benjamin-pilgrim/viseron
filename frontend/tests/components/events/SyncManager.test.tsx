@@ -695,3 +695,86 @@ describe("multi-camera playback", () => {
     expect(player.current.media!.pause).toHaveBeenCalled();
   });
 });
+it("review aligned seek without seeked remains usable", async () => {
+  vi.useFakeTimers();
+  const player = makePlayer(1_700_000_010_000);
+  const media = player.current.media!;
+  const events = new EventTarget();
+  media.addEventListener = events.addEventListener.bind(events);
+  media.removeEventListener = events.removeEventListener.bind(events);
+  media.currentTime = 10;
+  useHlsStore.setState({ hlsRefs: [player] });
+  useReferencePlayerStore.setState({
+    isPlaying: true,
+    requestedTimestamp: 1_700_000_050,
+    playingDateRef: { current: 1_700_000_010 },
+  });
+  render(
+    <SyncManager>
+      <div>players</div>
+    </SyncManager>,
+  );
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(200);
+  });
+  await act(async () => {
+    useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+    observeSeek(
+      player.current,
+      media,
+      useReferencePlayerStore.getState().seekGeneration,
+      10,
+    );
+    await vi.advanceTimersByTimeAsync(7000);
+  });
+  expect(useReferencePlayerStore.getState().referencePlayer).toBe(
+    player.current,
+  );
+});
+
+it("retains an already-aligned advancing seek without a seeked event", async () => {
+  vi.useFakeTimers();
+  const player = makePlayer(1_700_000_010_000);
+  const media = player.current.media!;
+  media.currentTime = 10;
+  const events = new EventTarget();
+  media.addEventListener = events.addEventListener.bind(events);
+  media.removeEventListener = events.removeEventListener.bind(events);
+  useHlsStore.setState({ hlsRefs: [player] });
+  useReferencePlayerStore.setState({
+    isPlaying: true,
+    requestedTimestamp: 1_700_000_050,
+    playingDateRef: { current: 1_700_000_010 },
+  });
+  render(
+    <SyncManager>
+      <div>players</div>
+    </SyncManager>,
+  );
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(200);
+  });
+  await act(async () => {
+    useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+    observeSeek(
+      player.current,
+      media,
+      useReferencePlayerStore.getState().seekGeneration,
+      10,
+    );
+    const startedAt = performance.now();
+    Object.defineProperty(media, "currentTime", {
+      configurable: true,
+      get: () => 10 + (performance.now() - startedAt) / 1000,
+    });
+    Object.defineProperty(player.current, "playingDate", {
+      configurable: true,
+      get: () => new Date(1_700_000_010_000 + performance.now() - startedAt),
+    });
+    await vi.advanceTimersByTimeAsync(7000);
+  });
+  expect(useReferencePlayerStore.getState().referencePlayer).toBe(
+    player.current,
+  );
+  expect(media.currentTime).toBeGreaterThan(16);
+});

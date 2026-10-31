@@ -2,6 +2,7 @@ import Hls from "hls.js";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  confirmAlreadyAlignedSeek,
   hasCompletedSeek,
   noteSeekPlaybackRate,
   observeSeek,
@@ -88,6 +89,27 @@ describe("seek acknowledgement", () => {
       media.dispatchEvent(new Event("ratechange"));
       media.dispatchEvent(new Event("seeked"));
       expect(hasCompletedSeek(player, 12)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("does not infer a no-op acknowledgement from another or initially unaligned generation", () => {
+    vi.useFakeTimers();
+    try {
+      const player = {} as Hls;
+      const media = document.createElement("video");
+      Object.defineProperty(media, "readyState", {
+        value: HTMLMediaElement.HAVE_FUTURE_DATA,
+      });
+      media.currentTime = 60;
+      observeSeek(player, media, 10, 10);
+      media.currentTime = 10;
+      vi.advanceTimersByTime(1200);
+      expect(confirmAlreadyAlignedSeek(player, media, 10)).toBe(false);
+      observeSeek(player, media, 11, 10);
+      vi.advanceTimersByTime(1200);
+      expect(confirmAlreadyAlignedSeek(player, media, 10)).toBe(false);
+      expect(confirmAlreadyAlignedSeek(player, media, 11)).toBe(true);
     } finally {
       vi.useRealTimers();
     }

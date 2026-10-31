@@ -11,6 +11,8 @@ const seeks = new WeakMap<
     maxRate: number;
     startedAt: number;
     blockRecovery: boolean;
+    alignedAtStart: boolean;
+    target: number;
     cleanup: () => void;
   }
 >();
@@ -29,6 +31,8 @@ export function observeSeek(
     complete: false,
     startedAt,
     blockRecovery,
+    alignedAtStart: Math.abs(media.currentTime - target) <= 0.5,
+    target,
     maxRate: Math.max(1, media.playbackRate),
     cleanup: () => {
       media.removeEventListener("seeked", onSeeked);
@@ -82,4 +86,34 @@ export function hasPendingSeek(player: Hls, generation: number): boolean {
     !seek.complete &&
     performance.now() - seek.startedAt < 5000
   );
+}
+
+// Browsers need not emit seeked for a no-op seek. If this generation was
+// already aligned before the assignment, a settled media position can prove
+// it remained at or advanced from that target without rewinding it.
+export function confirmAlreadyAlignedSeek(
+  player: Hls,
+  media: HTMLMediaElement,
+  generation: number,
+): boolean {
+  const seek = seeks.get(player);
+  if (
+    !seek ||
+    seek.generation !== generation ||
+    !seek.alignedAtStart ||
+    media.seeking ||
+    media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+  )
+    return false;
+  const elapsed = Math.max(0, (performance.now() - seek.startedAt) / 1000);
+  if (
+    elapsed < 1 ||
+    media.currentTime < seek.target - 0.5 ||
+    media.currentTime >
+      seek.target + elapsed * Math.max(seek.maxRate, media.playbackRate) + 0.5
+  )
+    return false;
+  seek.complete = true;
+  seek.cleanup();
+  return true;
 }

@@ -110,6 +110,28 @@ Object.assign(window, {
     observeSeek(players[0], video, generation, target);
     videos[0].currentTime = target;
   },
+  alignedSeekWithoutEvent: () => {
+    const video = videos[0];
+    const player = players[0];
+    const current = player.playingDate!;
+    useReferencePlayerStore
+      .getState()
+      .setRequestedTimestamp(current.getTime() / 1000);
+    const generation = useReferencePlayerStore.getState().seekGeneration;
+    const target = video.currentTime;
+    const add = video.addEventListener.bind(video);
+    video.addEventListener = ((
+      type: string,
+      listener: EventListener,
+      options?: AddEventListenerOptions,
+    ) => {
+      if (type !== "seeked") add(type, listener, options);
+    }) as typeof video.addEventListener;
+    observeSeek(player, video, generation, target);
+    video.addEventListener = add as typeof video.addEventListener;
+    video.currentTime = target;
+    return target;
+  },
   referenceForTest: () => useReferencePlayerStore.getState().referencePlayer,
   setPlaybackSpeed: (speed: number) =>
     useReferencePlayerStore.getState().setPlaybackSpeed(speed),

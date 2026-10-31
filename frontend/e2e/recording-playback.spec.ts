@@ -234,3 +234,42 @@ test("a seek stays eligible when 10x playback slows before delayed seeked", asyn
     )
     .toBe(true);
 });
+
+test("an already aligned player continues without a seeked acknowledgement", async ({
+  page,
+}) => {
+  await page.route("**/playback-fixture/*", async (route) => {
+    const filename = basename(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      status: 200,
+      contentType: filename.endsWith(".m3u8")
+        ? "application/vnd.apple.mpegurl"
+        : "video/mp4",
+      body: readFileSync(join(mediaDirectory, filename)),
+    });
+  });
+  await page.goto("/e2e/recording-playback/index.html");
+  await page.waitForFunction(
+    () =>
+      (window as any).playbackReady &&
+      (window as any).playbackPlayers.every(
+        (player: any) => player.playingDate,
+      ),
+  );
+  const target = await page.evaluate(() =>
+    (window as any).alignedSeekWithoutEvent(),
+  );
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const state = window as any;
+          return (
+            state.referenceForTest() === state.playbackPlayers[0] &&
+            state.playbackVideos[0].currentTime
+          );
+        }),
+      { timeout: 10000 },
+    )
+    .toBeGreaterThan(target + 1);
+});

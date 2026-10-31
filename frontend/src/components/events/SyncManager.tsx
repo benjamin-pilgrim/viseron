@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import {
+  confirmAlreadyAlignedSeek,
   hasCompletedSeek,
   hasPendingSeek,
   noteSeekPlaybackRate,
@@ -165,10 +166,19 @@ function SyncManager({ children }: SyncManagerProps) {
           date &&
           fragment &&
           current.media &&
-          hasCompletedSeek(current, state.seekGeneration) &&
           Math.abs(
             getSeekTarget(fragment, date.getTime()) - current.media.currentTime,
-          ) <= HARD_SEEK_DRIFT;
+          ) <= HARD_SEEK_DRIFT &&
+          (hasCompletedSeek(current, state.seekGeneration) ||
+            (Math.abs(
+              getSeekTarget(fragment, date.getTime()) -
+                current.media.currentTime,
+            ) <= MAX_DRIFT &&
+              confirmAlreadyAlignedSeek(
+                current,
+                current.media,
+                state.seekGeneration,
+              )));
         if (completedAndConsistent) {
           seekFence.current?.eligible.add(current);
         }
