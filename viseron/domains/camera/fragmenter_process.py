@@ -469,7 +469,7 @@ class FragmenterWork(ChildProcessWork):
 
     def _move_to_segments_folder_mp4box(
         self, file: str, orig_ctime: datetime.datetime
-    ) -> None:
+    ) -> bool:
         """Move fragmented mp4 created by mp4box to segments folder."""
         self._segment_hook_mp4box(file, orig_ctime)
         try:
@@ -493,6 +493,8 @@ class FragmenterWork(ChildProcessWork):
             )
         except FileNotFoundError:
             self._logger.debug(f"{file} not found")
+            return False
+        return True
 
     def _move_to_segments_folder(
         self,
@@ -719,27 +721,32 @@ class FragmenterWork(ChildProcessWork):
             return playlist.read()
 
     def _handle_mp4(self, file: str) -> None:
-        """Handle mp4 files."""
+        """Handle MP4 while retaining the original if conversion fails."""
         try:
-            if self._mp4box_command(file):
-                extinf = _extract_extinf_number(
-                    self._read_m3u8_mp4box(file), "clip_1.m4s"
-                )
-                if extinf:
-                    orig_ctime = _get_orig_ctime(file, None)
-                    self._send_files_metadata(
-                        os.path.join(
-                            self.segments_folder,
-                            file.split(".", maxsplit=1)[0] + ".m4s",
-                        ),
-                        orig_ctime,
-                        extinf,
-                    )
-                    self._move_to_segments_folder_mp4box(file, orig_ctime)
-                else:
-                    self._logger.error(f"Failed to get extinf for {file}")
+            if not self._mp4box_command(file):
+                return
+            extinf = _extract_extinf_number(
+                self._read_m3u8_mp4box(file), "clip_1.m4s"
+            )
+            if not extinf:
+                self._logger.error("Failed to get extinf for %s", file)
+                return
+            orig_ctime = _get_orig_ctime(file, None)
+            self._send_files_metadata(
+                os.path.join(
+                    self.segments_folder,
+                    file.split(".", maxsplit=1)[0] + ".m4s",
+                ),
+                orig_ctime,
+                extinf,
+            )
+            if not self._move_to_segments_folder_mp4box(file, orig_ctime):
+                return
         except Exception as err:  # pylint: disable=broad-except
-            self._logger.error(f"Failed to fragment {file}", exc_info=err)
+            self._logger.error(
+                "Failed to fragment %s; retaining original", file, exc_info=err
+            )
+            return
 
         try:
             os.remove(os.path.join(self.temp_segments_folder, file))
@@ -747,7 +754,7 @@ class FragmenterWork(ChildProcessWork):
                 os.path.join(self.temp_segments_folder, file.split(".", maxsplit=1)[0]),
             )
         except FileNotFoundError as err:
-            self._logger.error("Failed to delete broken fragment", exc_info=err)
+            self._logger.error("Failed to clean converted fragment", exc_info=err)
 
     def _handle_m4s(self, file: str) -> None:
         """Handle completed fragments; preserve media with uncertain timing."""

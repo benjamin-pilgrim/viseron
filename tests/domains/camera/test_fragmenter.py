@@ -910,3 +910,76 @@ def test_extract_program_date_time_offsetless_legacy_fallback(monkeypatch):
     playlist = "#EXT-X-PROGRAM-DATE-TIME:2026-10-25T01:30:00\nsegment.m4s\n"
     result = _extract_program_date_time(playlist, "segment.m4s")
     assert result.isoformat() == "2026-10-24T23:30:00+00:00"
+
+
+def test_mp4box_failure_keeps_original_recording_for_retry(tmp_path) -> None:
+    """A conversion failure must not discard the camera's only complete MP4."""
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    source = temp / "1723111156.mp4"
+    source.write_bytes(b"camera recording")
+    work = _fragmenter_work(str(temp), str(tmp_path / "segments"))
+    with patch.object(work, "_mp4box_command", return_value=False):
+        work._handle_mp4(source.name)
+    assert source.read_bytes() == b"camera recording"
+
+
+def test_mp4box_missing_init_keeps_original_recording_for_retry(tmp_path) -> None:
+    """A partial publication must not discard the original camera recording."""
+    temp = tmp_path / "temp"
+    out = tmp_path / "segments"
+    temp.mkdir()
+    out.mkdir()
+    source = temp / "1723111156.mp4"
+    source.write_bytes(b"camera recording")
+    generated = temp / "1723111156"
+    generated.mkdir()
+    (generated / "clip_1.m4s").write_bytes(b"fragment")
+    work = _fragmenter_work(str(temp), str(out))
+    work.output_queue = MagicMock()
+    with (
+        patch.object(work, "_mp4box_command", return_value=True),
+        patch.object(
+            work, "_read_m3u8_mp4box", return_value="#EXTINF:5.0,\nclip_1.m4s\n"
+        ),
+    ):
+        work._handle_mp4(source.name)
+    assert source.read_bytes() == b"camera recording"
+
+
+def test_mp4box_failure_is_retried_with_same_original(tmp_path) -> None:
+    """A transient conversion error is retried and successful work is cleaned up."""
+    temp = tmp_path / "temp"
+    out = tmp_path / "segments"
+    temp.mkdir()
+    out.mkdir()
+    source = temp / "1723111156.mp4"
+    source.write_bytes(b"camera recording")
+    generated = temp / "1723111156"
+    work = _fragmenter_work(str(temp), str(out))
+    work.output_queue = MagicMock()
+    attempts = 0
+
+    def convert(_file):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        assert source.read_bytes() == b"camera recording"
+        generated.mkdir()
+        (generated / "clip_1.m4s").write_bytes(b"fragment")
+        (generated / "clip_init.mp4").write_bytes(b"init")
+        return True
+
+    with (
+        patch.object(work, "_mp4box_command", side_effect=convert),
+        patch.object(
+            work, "_read_m3u8_mp4box", return_value="#EXTINF:5.0,\nclip_1.m4s\n"
+        ),
+    ):
+        work._handle_mp4(source.name)
+        assert source.exists()
+        work._handle_mp4(source.name)
+    assert not source.exists()
+    assert (out / "1723111156.m4s").read_bytes() == b"fragment"
+    assert (out / "init.mp4").read_bytes() == b"init"
