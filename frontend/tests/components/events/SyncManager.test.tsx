@@ -267,6 +267,75 @@ describe("multi-camera playback", () => {
     });
     expect(buffering.current.media!.currentTime).toBe(20);
   });
+  it("retries a shared buffering outage with bounded attempts and honors pause", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_020_000);
+    const second = makePlayer(1_700_000_019_000);
+    Object.defineProperty(first.current.media!, "readyState", { value: 2 });
+    Object.defineProperty(second.current.media!, "readyState", { value: 2 });
+    useHlsStore.setState({ hlsRefs: [first, second] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1900);
+    });
+    expect(first.current.media!.play).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(first.current.media!.play).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    expect(first.current.media!.play).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      useReferencePlayerStore.setState({ isPlaying: false });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(first.current.media!.play).toHaveBeenCalledTimes(1);
+  });
+  it("does not recover an all-buffering outage over a fresh seek", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_020_000);
+    Object.defineProperty(first.current.media!, "readyState", { value: 2 });
+    useHlsStore.setState({ hlsRefs: [first] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1900);
+    });
+    await act(async () => {
+      useReferencePlayerStore.setState({
+        requestedTimestamp: 1_700_000_030,
+        playingDateRef: { current: 1_700_000_030 },
+      });
+      await vi.advanceTimersByTimeAsync(800);
+    });
+    expect(first.current.media!.play).not.toHaveBeenCalled();
+    expect(first.current.media!.currentTime).toBe(12);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(first.current.media!.currentTime).toBe(30);
+  });
   it("does not resume a user-paused player on HLS errors", async () => {
     vi.useFakeTimers();
     const player = makePlayer(1_700_000_020_000);

@@ -117,6 +117,53 @@ test("two actual HLS players converge smoothly and seek large drift", async ({
     Reflect.deleteProperty(state.playbackVideos[1], "readyState");
   });
 
+  // Both media elements can stall together during a shared storage outage.
+  await page.evaluate(() => {
+    const state = window as unknown as {
+      playbackVideos: HTMLVideoElement[];
+      recoveryAttempts: number;
+    };
+    state.recoveryAttempts = 0;
+    state.playbackVideos.forEach((video) => {
+      const play = video.play.bind(video);
+      video.play = () => {
+        state.recoveryAttempts += 1;
+        return play();
+      };
+      Object.defineProperty(video, "readyState", {
+        configurable: true,
+        value: 2,
+      });
+    });
+  });
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            (window as unknown as { recoveryAttempts: number })
+              .recoveryAttempts,
+        ),
+      { timeout: 4000 },
+    )
+    .toBeGreaterThan(0);
+  const attempts = await page.evaluate(
+    () => (window as unknown as { recoveryAttempts: number }).recoveryAttempts,
+  );
+  await page.waitForTimeout(1000);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { recoveryAttempts: number }).recoveryAttempts,
+    ),
+  ).toBe(attempts);
+  await page.evaluate(() => {
+    const state = window as unknown as { playbackVideos: HTMLVideoElement[] };
+    state.playbackVideos.forEach((video) =>
+      Reflect.deleteProperty(video, "readyState"),
+    );
+  });
+
   await page.evaluate(() => {
     const state = window as unknown as {
       setPlaybackSpeed: (speed: number) => void;

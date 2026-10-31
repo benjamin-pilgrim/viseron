@@ -166,7 +166,10 @@ function SyncManager({ children }: SyncManagerProps) {
         const media = player.current.media;
         if (!media) return;
         media.playbackRate = state.playbackSpeed;
-        if (player === referencePlayer) return;
+        if (player === referencePlayer) {
+          bufferingSince.current.delete(player.current);
+          return;
+        }
         // Give transient buffering time to resolve before seeking, and avoid
         // repeatedly disrupting a camera while its network is unavailable.
         const buffering = media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
@@ -246,9 +249,15 @@ function SyncManager({ children }: SyncManagerProps) {
       }
     }
 
-    // Check if all players are paused
+    // Recover one camera if none can provide a running, ready reference.
     if (
-      playersWithTime.every((player) => player.current.media?.paused ?? true)
+      !referencePlayer &&
+      playersWithTime.every(
+        (player) =>
+          player.current.media?.paused ||
+          (player.current.media?.readyState ?? 0) <
+            HTMLMediaElement.HAVE_FUTURE_DATA,
+      )
     ) {
       const playingDateMillis = playingDateRef.current * 1000;
 
@@ -292,20 +301,32 @@ function SyncManager({ children }: SyncManagerProps) {
           findFragmentByTimestamp(fragments, playingDateMillis) ??
           findClosestFragment(fragments, playingDateMillis);
         const media = playerToPlay.current.media;
+        const buffering =
+          !!media && media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+        if (buffering) {
+          const since = bufferingSince.current.get(playerToPlay.current) ?? now;
+          bufferingSince.current.set(playerToPlay.current, since);
+          if (now - since < BUFFER_RECOVERY_MS) return;
+        } else {
+          bufferingSince.current.delete(playerToPlay.current);
+        }
+        const correctionTimes = buffering
+          ? lastBufferCorrection
+          : lastCorrection;
         const last =
-          lastCorrection.current.get(playerToPlay.current) ?? -Infinity;
+          correctionTimes.current.get(playerToPlay.current) ?? -Infinity;
         if (
           media &&
           closestFragment?.programDateTime &&
-          now - last >= SEEK_SETTLE_MS
+          now - last >= (buffering ? BUFFER_RETRY_MS : SEEK_SETTLE_MS)
         ) {
-          lastCorrection.current.set(playerToPlay.current, now);
+          correctionTimes.current.set(playerToPlay.current, now);
           const currentDate = playerToPlay.current.playingDate;
           const aligned =
             currentDate &&
             Math.abs(currentDate.getTime() - playingDateMillis) <=
               MAX_DRIFT * 1000;
-          if (!aligned) {
+          if (!aligned || buffering) {
             const target = getSeekTarget(closestFragment, playingDateMillis);
             // A gap resolves to the first later fragment, while a timestamp
             // inside a fragment retains its exact position.
