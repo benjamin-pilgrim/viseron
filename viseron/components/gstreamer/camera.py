@@ -441,11 +441,15 @@ class Camera(AbstractCamera):
         trigger_type: TriggerTypes,
     ) -> None:
         """Start camera recorder."""
-        self._recorder.start(shared_frame, objects_in_fov or [], trigger_type)
+        with self._camera_state_lock:
+            if self.stopped.is_set():
+                return
+            self._recorder.start(shared_frame, objects_in_fov or [], trigger_type)
 
     def stop_recorder(self) -> None:
         """Stop camera recorder."""
-        self._recorder.stop(self.recorder.active_recording)
+        with self._camera_state_lock:
+            self._recorder.stop_current()
 
     @property
     def output_fps(self):

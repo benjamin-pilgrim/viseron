@@ -8,6 +8,7 @@ import os
 import secrets
 import shutil
 import stat
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from time import sleep
@@ -234,6 +235,7 @@ class AbstractRecorder(ABC, RecorderBase):
 
         self.is_recording = False
         self._active_recording: Recording | None = None
+        self._recording_lock = threading.RLock()
 
         create_directory(self._camera.event_clips_folder)
         create_directory(self._camera.segments_folder)
@@ -346,7 +348,18 @@ class AbstractRecorder(ABC, RecorderBase):
         objects_in_fov: list[DetectedObject],
         trigger_type: TriggerTypes,
     ) -> Recording:
-        """Start recording."""
+        """Start one recording at a time."""
+        with self._recording_lock:
+            if self._active_recording is not None:
+                return self._active_recording
+            return self._start_recording(shared_frame, objects_in_fov, trigger_type)
+
+    def _start_recording(
+        self,
+        shared_frame: SharedFrame,
+        objects_in_fov: list[DetectedObject],
+        trigger_type: TriggerTypes,
+    ) -> Recording:
         self._logger.info("Starting recorder")
         self.is_recording = True
         start_time = utcnow()
@@ -421,8 +434,20 @@ class AbstractRecorder(ABC, RecorderBase):
     ):
         """Start the recorder."""
 
+    def stop_current(self) -> None:
+        """Stop the recording active after any concurrent transition finishes."""
+        with self._recording_lock:
+            self.stop(self._active_recording)
+
     def stop(self, recording: Recording | None) -> None:
-        """Stop recording."""
+        """Stop a recording only if it is still active."""
+        with self._recording_lock:
+            if recording is not None and recording is not self._active_recording:
+                self._logger.debug("Ignoring stop for an inactive recording")
+                return
+            self._stop_recording(recording)
+
+    def _stop_recording(self, recording: Recording | None) -> None:
         self._logger.info("Stopping recorder")
         if recording is None:
             self._logger.error("No active recording to stop")

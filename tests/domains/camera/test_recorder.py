@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import time
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import MagicMock, Mock, call, patch
@@ -14,7 +15,12 @@ from sqlalchemy.orm import Session
 
 from viseron.components.storage.models import Files, Recordings, TriggerTypes
 from viseron.domains.camera import AbstractCamera
-from viseron.domains.camera.const import CONFIG_CREATE_EVENT_CLIP, CONFIG_RECORDER
+from viseron.domains.camera.const import (
+    CONFIG_CREATE_EVENT_CLIP,
+    CONFIG_RECORDER,
+    CONFIG_SAVE_TO_DISK,
+    CONFIG_THUMBNAIL,
+)
 from viseron.domains.camera.recorder import (
     AbstractRecorder,
     RecorderBase,
@@ -468,7 +474,9 @@ class TestAbstractRecorder:
             ) as restartable_thread,
         ):
             shutdown_event.is_set.return_value = shutting_down
-            recorder.stop(create_recording())
+            recording = create_recording()
+            recorder._active_recording = recording
+            recorder.stop(recording)
 
         assert [
             thread_call.kwargs["daemon"]
@@ -521,3 +529,72 @@ class TestAbstractRecorder:
 
             assert result == expected
             assert result == expected
+
+
+def test_concurrent_stops_retire_a_recording_once(recorder, create_recording, vis):
+    """Camera shutdown and a run boundary cannot retire the same event twice."""
+    recording = create_recording()
+    recorder._active_recording = recording
+    recorder.is_recording = True
+    recorder._config = {CONFIG_RECORDER: {CONFIG_CREATE_EVENT_CLIP: False}}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_stop(_recording):
+        entered.set()
+        release.wait(5)
+
+    with (
+        patch.object(recorder._storage, "get_session"),
+        patch.object(recorder, "_stop", side_effect=slow_stop) as stopped,
+        patch.object(vis, "dispatch_event") as dispatched,
+    ):
+        first = threading.Thread(target=recorder.stop, args=(recording,))
+        second = threading.Thread(target=recorder.stop, args=(recording,))
+        first.start()
+        assert entered.wait(2)
+        second.start()
+        time.sleep(0.1)
+        release.set()
+        first.join(3)
+        second.join(3)
+        assert not first.is_alive() and not second.is_alive()
+        assert stopped.call_count == 1
+        assert dispatched.call_count == 1
+
+
+def test_stop_waits_for_inflight_recording_start(recorder, vis):
+    """Shutdown closes an event even if recording start is still in progress."""
+    recorder._config = {
+        CONFIG_RECORDER: {
+            CONFIG_THUMBNAIL: {CONFIG_SAVE_TO_DISK: False},
+            CONFIG_CREATE_EVENT_CLIP: False,
+        }
+    }
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_start(*_args):
+        entered.set()
+        release.wait(5)
+
+    with (
+        patch.object(recorder._storage, "get_session"),
+        patch.object(recorder, "create_thumbnail", return_value=(None, None)),
+        patch.object(recorder, "_start", side_effect=slow_start),
+        patch.object(vis, "dispatch_event") as dispatched,
+    ):
+        start = threading.Thread(
+            target=recorder.start, args=(None, [], TriggerTypes.MANUAL)
+        )
+        stop = threading.Thread(target=recorder.stop_current)
+        start.start()
+        assert entered.wait(2)
+        stop.start()
+        release.set()
+        start.join(3)
+        stop.join(3)
+        assert not start.is_alive() and not stop.is_alive()
+        assert recorder.active_recording is None
+        assert not recorder.is_recording
+        assert dispatched.call_count == 2

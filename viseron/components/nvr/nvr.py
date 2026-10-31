@@ -907,11 +907,12 @@ class NVR(AbstractNVR):
             return
         if self._recording_run_id == run_id:
             return
-        self._recording_run_id = run_id
         self._start_recorder = False
         self._trigger_type = None
         if self._camera.is_recording:
             self.stop_recorder(force=True)
+        # A failed stop must remain retryable on the next iteration.
+        self._recording_run_id = run_id
         if self._manual_recording is not None:
             if (
                 self._manual_recording_deadline
