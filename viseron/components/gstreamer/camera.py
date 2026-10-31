@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import time
-from threading import Event
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -296,6 +295,8 @@ class Camera(AbstractCamera):
 
         super().__init__(vis, COMPONENT, config, identifier)
         self._capture_frames = False
+        self._capture_stop = Event()
+        self._capture_lock = Lock()
         self._thread_stuck = False
         self.resolution = None
         self.decode_error = Event()
@@ -337,17 +338,25 @@ class Camera(AbstractCamera):
         empty_frames = 0
         self._thread_stuck = False
 
-        self.stream.start_pipe()
+        with self._capture_lock:
+            if not self._capture_frames:
+                return
+            self.stream.start_pipe()
 
         while self._capture_frames:
             if self.decode_error.is_set():
                 self._poll_timer = utcnow().timestamp()
                 self.connected = False
                 self.still_image_available = self.still_image_configured
-                time.sleep(5)
+                if self._capture_stop.wait(5):
+                    break
                 self._logger.error("Restarting frame pipe")
                 self.stream.close_pipe()
-                self.stream.start_pipe()
+                with self._capture_lock:
+                    if not self._capture_frames:
+                        self._logger.debug("Frame reader stopped")
+                        return
+                    self.stream.start_pipe()
                 self.decode_error.clear()
                 empty_frames = 0
 
@@ -418,7 +427,9 @@ class Camera(AbstractCamera):
     def _start_camera(self) -> None:
         """Start capturing frames from camera."""
         self._logger.debug("Starting capture thread")
-        self._capture_frames = True
+        with self._capture_lock:
+            self._capture_stop.clear()
+            self._capture_frames = True
         if not self._frame_reader or not self._frame_reader.is_alive():
             self._frame_reader = self._create_frame_reader()
             self._frame_reader.start()
@@ -426,7 +437,9 @@ class Camera(AbstractCamera):
     def _stop_camera(self) -> None:
         """Release the connection to the camera."""
         self._logger.debug("Stopping capture thread")
-        self._capture_frames = False
+        with self._capture_lock:
+            self._capture_frames = False
+            self._capture_stop.set()
         if self._frame_reader:
             self._frame_reader.stop()
             self._frame_reader.join(timeout=5)
