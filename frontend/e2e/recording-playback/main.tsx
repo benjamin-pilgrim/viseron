@@ -19,7 +19,52 @@ const players = videos.map((video) => {
   player.loadSource("/playback-fixture/index.m3u8");
   return player;
 });
+const debugTrace: unknown[] = [];
+const recordState = (event: string) => {
+  const state = useReferencePlayerStore.getState();
+  debugTrace.push({
+    event,
+    at: performance.now(),
+    requested: state.requestedTimestamp,
+    generation: state.seekGeneration,
+    playing: state.isPlaying,
+    reference: players.indexOf(state.referencePlayer!),
+    players: players.map((player, i) => ({
+      time: videos[i].currentTime,
+      paused: videos[i].paused,
+      seeking: videos[i].seeking,
+      rate: videos[i].playbackRate,
+      ready: videos[i].readyState,
+      ended: videos[i].ended,
+      date: player.playingDate?.getTime(),
+      buffered: Array.from({ length: videos[i].buffered.length }, (_, j) => [
+        videos[i].buffered.start(j),
+        videos[i].buffered.end(j),
+      ]),
+    })),
+  });
+};
+videos.forEach((video, i) =>
+  [
+    "seeking",
+    "seeked",
+    "ratechange",
+    "waiting",
+    "playing",
+    "pause",
+    "ended",
+  ].forEach((event) =>
+    video.addEventListener(event, () => recordState(`${i}:${event}`)),
+  ),
+);
+players.forEach((player, i) =>
+  player.on(Hls.Events.ERROR, (_, data) =>
+    recordState(`${i}:hls:${data.details}`),
+  ),
+);
+setInterval(() => recordState("tick"), 250);
 Object.assign(window, {
+  debugTrace,
   playbackVideos: videos,
   playbackPlayers: players,
   seekForTest: (timestamp: number, target: number) => {
@@ -36,16 +81,19 @@ Object.assign(window, {
     ) => {
       if (type !== "seeked") return add(type, listener, options);
       wrapped = (event) => {
+        recordState("wrapped seeked");
         const before = video.currentTime;
         const poll = setInterval(() => {
           if (video.currentTime - before <= 3) return;
           clearInterval(poll);
+          recordState("advanced 3");
           useReferencePlayerStore.getState().setPlaybackSpeed(0.5);
           video.playbackRate = 0.5;
           setTimeout(() => {
             Object.assign(window, {
               delayedSeekAdvance: video.currentTime - before,
             });
+            recordState("deliver seeked");
             listener.call(video, event);
           }, 1300);
         }, 50);

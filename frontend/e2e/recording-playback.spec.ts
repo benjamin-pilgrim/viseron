@@ -210,9 +210,16 @@ test("a seek stays eligible when 10x playback slows before delayed seeked", asyn
       fragment.start + 5,
     );
   });
-  await expect
-    .poll(() => page.evaluate(() => (window as any).delayedSeekAdvance ?? -1))
-    .toBeGreaterThan(2);
+  try {
+    await expect
+      .poll(() => page.evaluate(() => (window as any).delayedSeekAdvance ?? -1))
+      .toBeGreaterThan(2);
+  } catch (error) {
+    console.log(
+      JSON.stringify(await page.evaluate(() => (window as any).debugTrace)),
+    );
+    throw error;
+  }
   await expect
     .poll(
       () =>

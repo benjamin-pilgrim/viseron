@@ -618,6 +618,32 @@ describe("multi-camera playback", () => {
     expect(useHlsStore.getState().hlsRefsError.get(player)).toBe("unavailable");
     expect(player.current.media!.pause).toHaveBeenCalled();
   });
+  it("does not pause a seeking camera when hls aborts an obsolete fragment", () => {
+    const first = makePlayer(1_700_000_020_000);
+    const second = makePlayer(1_700_000_020_000);
+    useHlsStore.setState({ hlsRefs: [first, second] });
+    useReferencePlayerStore.setState({ isPlaying: true });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    const handler = vi
+      .mocked(first.current.on)
+      .mock.calls.find(
+        ([event]) => event === Hls.Events.ERROR,
+      )![1] as unknown as (
+      event: string,
+      data: { details: string; fatal: boolean },
+    ) => void;
+    act(() =>
+      handler(Hls.Events.ERROR, {
+        details: Hls.ErrorDetails.INTERNAL_ABORTED,
+        fatal: false,
+      }),
+    );
+    expect(first.current.media!.pause).not.toHaveBeenCalled();
+  });
   it("removes only its own error listener when a player is removed", () => {
     const player = makePlayer(1_700_000_020_000);
     useHlsStore.setState({ hlsRefs: [player] });
