@@ -41,6 +41,7 @@ from viseron.components.storage.source_move_intent import (
 )
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX, require_tier_markers
 from viseron.domains.camera.const import MP4BOX_PATH
+from viseron.domains.camera.playlist_timing import read_playlist_time
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
 from viseron.helpers.logs import LogPipe
@@ -478,7 +479,11 @@ class FragmenterWork(ChildProcessWork):
             self._logger.debug(f"{file} not found")
 
     def _move_to_segments_folder(
-        self, file: str, orig_ctime: datetime.datetime, duration: float | None = None
+        self,
+        file: str,
+        orig_ctime: datetime.datetime,
+        duration: float | None = None,
+        expected_identity: list[int] | None = None,
     ) -> None:
         """Move fragmented mp4 created by encoder to segments folder."""
         self._segment_hook(file, orig_ctime)
@@ -523,11 +528,22 @@ class FragmenterWork(ChildProcessWork):
                     with camera_lock("/tmp/viseron-run-locks", source_camera):
                         # Idempotent only if the entire previous source snapshot
                         # matches. A partial/conflicting intent fails closed.
+                        source_stat = os.stat(source, follow_symlinks=False)
+                        source_identity = [
+                            source_stat.st_dev,
+                            source_stat.st_ino,
+                            source_stat.st_size,
+                            source_stat.st_mtime_ns,
+                        ]
+                        if (
+                            expected_identity is not None
+                            and source_identity != expected_identity
+                        ):
+                            raise OSError(  # noqa: TRY301
+                                "staged fragment changed after timing capture"
+                            )
                         source_intent = prepare_source_intent(
-                            source,
-                            destination,
-                            os.stat(source, follow_symlinks=False),
-                            None,
+                            source, destination, source_stat, None
                         )
                     temporary = os.path.join(
                         destination_dir, TIER_MOVE_TEMP_PREFIX + uuid.uuid4().hex
@@ -537,6 +553,17 @@ class FragmenterWork(ChildProcessWork):
                         digest = hashlib.sha256()
                         with open(source, "rb") as inp, open(temporary, "xb") as out:
                             before = os.fstat(inp.fileno())
+                            if (
+                                expected_identity is not None
+                                and [
+                                    before.st_dev,
+                                    before.st_ino,
+                                    before.st_size,
+                                    before.st_mtime_ns,
+                                ]
+                                != expected_identity
+                            ):
+                                raise OSError("staged fragment changed before copy")
                             while chunk := inp.read(1024 * 1024):
                                 out.write(chunk)
                                 digest.update(chunk)
@@ -676,8 +703,13 @@ class FragmenterWork(ChildProcessWork):
             except FileNotFoundError:
                 m3u8 = ""
             name = os.path.basename(file)
+            expected_identity = None
             extinf = _extract_extinf_number(m3u8, name)
             program_date_time = _extract_program_date_time(m3u8, name)
+            if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
+                timing = read_playlist_time(Path(self.temp_segments_folder) / file)
+                if timing is not None:
+                    program_date_time, extinf, expected_identity = timing
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 now = time.monotonic()
                 if (
@@ -700,7 +732,9 @@ class FragmenterWork(ChildProcessWork):
                 self._send_files_metadata(
                     os.path.join(self.segments_folder, file), orig_ctime, extinf
                 )
-                self._move_to_segments_folder(file, orig_ctime, extinf)
+                self._move_to_segments_folder(
+                    file, orig_ctime, extinf, expected_identity
+                )
             else:
                 self._logger.warning(
                     "No known duration for %s; leaving fragment and init in staging for recovery.",  # noqa: E501

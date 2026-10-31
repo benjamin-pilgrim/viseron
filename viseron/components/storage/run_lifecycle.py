@@ -126,6 +126,28 @@ def reclaim_spool_run(lock_root: str, camera_key: str, run_dir: str) -> bool:
                     return False
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 entries = list(run.iterdir())
+                # A timing record is useful only while its staged fragment is
+                # retained. Capture and reclamation share the camera lock.
+                timing_name = re.compile(
+                    r"^\.viseron-timing-(\d{9,}-\d+-\d{13,}\.m4s)\.json$"
+                )
+                timing_temp = re.compile(r"^\.viseron-timing-tmp-[a-z0-9_]{8}$")
+                for entry in entries:
+                    match = timing_name.fullmatch(entry.name)
+                    if (
+                        timing_temp.fullmatch(entry.name)
+                        and entry.is_file()
+                        and not entry.is_symlink()
+                    ):
+                        entry.unlink()
+                    elif (
+                        match
+                        and entry.is_file()
+                        and not entry.is_symlink()
+                        and not os.path.lexists(run / match.group(1))
+                    ):
+                        entry.unlink()
+                entries = list(run.iterdir())
                 if any(
                     e.name not in allowed or e.is_symlink() or not e.is_file()
                     for e in entries
