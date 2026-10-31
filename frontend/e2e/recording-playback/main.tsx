@@ -26,9 +26,6 @@ Object.assign(window, {
     useReferencePlayerStore.getState().setRequestedTimestamp(timestamp);
     const generation = useReferencePlayerStore.getState().seekGeneration;
     const video = videos[0];
-    // Isolate the seek acknowledgement from SyncManager recovery while the
-    // real media advances; restore the players after delivering the event.
-    useHlsStore.setState({ hlsRefs: [] });
     const add = video.addEventListener.bind(video);
     const remove = video.removeEventListener.bind(video);
     let wrapped: EventListener | undefined;
@@ -50,10 +47,7 @@ Object.assign(window, {
               delayedSeekAdvance: video.currentTime - before,
             });
             listener.call(video, event);
-            useHlsStore.setState({
-              hlsRefs: players.map((player) => ({ current: player })),
-            });
-          }, 300);
+          }, 1300);
         }, 50);
       };
       add(type, wrapped, options);

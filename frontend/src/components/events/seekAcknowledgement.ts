@@ -9,6 +9,8 @@ const seeks = new WeakMap<
     generation: number;
     complete: boolean;
     maxRate: number;
+    startedAt: number;
+    blockRecovery: boolean;
     cleanup: () => void;
   }
 >();
@@ -18,12 +20,15 @@ export function observeSeek(
   media: HTMLMediaElement,
   generation: number,
   target: number,
+  blockRecovery = true,
 ) {
   seeks.get(player)?.cleanup();
   const startedAt = performance.now();
   const seek = {
     generation,
     complete: false,
+    startedAt,
+    blockRecovery,
     maxRate: Math.max(1, media.playbackRate),
     cleanup: () => {
       media.removeEventListener("seeked", onSeeked);
@@ -64,4 +69,17 @@ export function noteSeekPlaybackRate(player: Hls, rate: number): void {
 export function hasCompletedSeek(player: Hls, generation: number): boolean {
   const seek = seeks.get(player);
   return seek?.generation === generation && seek.complete;
+}
+
+// Give an in-flight seek time to finish before recovery issues another one.
+// An upper limit preserves recovery when the browser never emits seeked.
+export function hasPendingSeek(player: Hls, generation: number): boolean {
+  const seek = seeks.get(player);
+  return (
+    !!seek &&
+    seek.generation === generation &&
+    seek.blockRecovery &&
+    !seek.complete &&
+    performance.now() - seek.startedAt < 5000
+  );
 }

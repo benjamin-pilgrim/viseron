@@ -5,6 +5,7 @@ import { useShallow } from "zustand/react/shallow";
 
 import {
   hasCompletedSeek,
+  hasPendingSeek,
   noteSeekPlaybackRate,
   observeSeek,
 } from "components/events/seekAcknowledgement";
@@ -317,7 +318,13 @@ function SyncManager({ children }: SyncManagerProps) {
     }
 
     // Recover one camera if none can provide a running, ready reference.
-    if (!referencePlayer && playersWithTime.length > 0) {
+    if (
+      !referencePlayer &&
+      playersWithTime.length > 0 &&
+      !playersWithTime.some(({ current }) =>
+        hasPendingSeek(current, state.seekGeneration),
+      )
+    ) {
       const playingDateMillis = playingDateRef.current * 1000;
 
       let playerToPlayIndex = -1;
@@ -417,6 +424,7 @@ function SyncManager({ children }: SyncManagerProps) {
               media,
               state.seekGeneration,
               target,
+              false,
             );
             media.currentTime = target;
           }

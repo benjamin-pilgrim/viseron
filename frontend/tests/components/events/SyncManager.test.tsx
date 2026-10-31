@@ -445,6 +445,45 @@ describe("multi-camera playback", () => {
     ).toBeGreaterThan(1_700_000_020);
     expect(fresh.current.media!.currentTime).toBeGreaterThan(20);
   });
+  it("does not replace a pending seek and eventually retries if it never completes", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_060_000);
+    const media = first.current.media!;
+    const events = new EventTarget();
+    media.addEventListener = events.addEventListener.bind(events);
+    media.removeEventListener = events.removeEventListener.bind(events);
+    useHlsStore.setState({ hlsRefs: [first] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_050,
+      playingDateRef: { current: 1_700_000_060 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    await act(async () => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      observeSeek(
+        first.current,
+        media,
+        useReferencePlayerStore.getState().seekGeneration,
+        10,
+      );
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(media.currentTime).toBe(12);
+    expect(media.play).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2300);
+    });
+    expect(media.currentTime).toBe(10);
+    expect(media.play).toHaveBeenCalled();
+  });
   it("does not jump over a distant unavailable gap", async () => {
     vi.useFakeTimers();
     const first = makePlayer(1_700_000_020_000);
