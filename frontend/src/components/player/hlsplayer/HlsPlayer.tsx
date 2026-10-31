@@ -12,6 +12,7 @@ import React, {
 import { v4 as uuidv4 } from "uuid";
 import { useShallow } from "zustand/react/shallow";
 
+import { observeSeek } from "components/events/seekAcknowledgement";
 import {
   findFragmentByTimestamp,
   getSeekTarget,
@@ -77,6 +78,12 @@ const onLevelLoaded = (
   const fragment = findFragmentByTimestamp(fragments, playingDateMillis);
   if (fragment) {
     const seekTarget = getSeekTarget(fragment, playingDateMillis);
+    observeSeek(
+      hlsRef.current,
+      videoRef.current,
+      useReferencePlayerStore.getState().seekGeneration,
+      seekTarget,
+    );
     videoRef.current.currentTime = seekTarget;
     videoRef.current.play().catch(() => {
       // Ignore play errors
@@ -319,6 +326,7 @@ const useSeekToTimestamp = (
 
     if (fragment) {
       const seekTarget = getSeekTarget(fragment, requestedTimestampMillis);
+      observeSeek(hlsRef.current, videoRef.current, seekGeneration, seekTarget);
       videoRef.current.currentTime = seekTarget;
       if (useReferencePlayerStore.getState().isPlaying) {
         const video = videoRef.current;

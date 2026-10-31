@@ -3,6 +3,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 
 import SyncManager from "components/events/SyncManager";
+import { observeSeek } from "components/events/seekAcknowledgement";
 import { useHlsStore, useReferencePlayerStore } from "components/events/utils";
 
 const videos = [0, 1].map((index) => {
@@ -21,6 +22,23 @@ const players = videos.map((video) => {
 Object.assign(window, {
   playbackVideos: videos,
   playbackPlayers: players,
+  seekForTest: (timestamp: number, target: number) => {
+    useReferencePlayerStore.getState().setRequestedTimestamp(timestamp);
+    const generation = useReferencePlayerStore.getState().seekGeneration;
+    observeSeek(players[0], videos[0], generation, target);
+    videos[0].currentTime = target;
+    videos[0].addEventListener(
+      "seeked",
+      () => {
+        const until = performance.now() + 1300;
+        while (performance.now() < until) {
+          /* simulate a stalled main thread */
+        }
+      },
+      { once: true },
+    );
+  },
+  referenceForTest: () => useReferencePlayerStore.getState().referencePlayer,
   setPlaybackSpeed: (speed: number) =>
     useReferencePlayerStore.getState().setPlaybackSpeed(speed),
 });

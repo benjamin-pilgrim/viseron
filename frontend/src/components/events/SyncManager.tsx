@@ -4,6 +4,10 @@ import { useCallback, useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import {
+  hasCompletedSeek,
+  observeSeek,
+} from "components/events/seekAcknowledgement";
+import {
   HlsErrorCodes,
   LIVE_EDGE_DELAY,
   findClosestFragment,
@@ -100,6 +104,12 @@ function SyncManager({ children }: SyncManagerProps) {
 
     for (let i = 0; i < seekable.length; i++) {
       if (seekTarget >= seekable.start(i) && seekTarget <= seekable.end(i)) {
+        observeSeek(
+          player,
+          player.media,
+          useReferencePlayerStore.getState().seekGeneration,
+          seekTarget,
+        );
         player.media.currentTime = seekTarget;
         return true;
       }
@@ -142,20 +152,28 @@ function SyncManager({ children }: SyncManagerProps) {
     );
     if (seekFence.current) {
       playersWithTime.forEach(({ current }) => {
-        if (
-          current.playingDate &&
+        const date = current.playingDate;
+        const fragments =
+          current.levels[current.currentLevel]?.details?.fragments;
+        const fragment =
+          date &&
+          fragments &&
+          findFragmentByTimestamp(fragments, date.getTime());
+        const completedAndConsistent =
+          date &&
+          fragment &&
+          current.media &&
+          hasCompletedSeek(current, state.seekGeneration) &&
           Math.abs(
-            current.playingDate.getTime() / 1000 - state.playingDateRef.current,
-          ) <= HARD_SEEK_DRIFT
-        ) {
+            getSeekTarget(fragment, date.getTime()) - current.media.currentTime,
+          ) <= HARD_SEEK_DRIFT;
+        if (completedAndConsistent) {
           seekFence.current?.eligible.add(current);
         }
       });
     }
 
-    // Observe a player reaching the target during the settling period. At
-    // high speeds it can be well past the fixed target by the time it ends.
-    // Do not use it as a reference until the settle period has elapsed.
+    // Let media settle before choosing a reference, even if a seek completed.
     if (now - (lastSeek.current.at ?? -Infinity) < SEEK_SETTLE_MS) return;
 
     // Sync mute state
@@ -390,6 +408,12 @@ function SyncManager({ children }: SyncManagerProps) {
             const target = getSeekTarget(closestFragment, playingDateMillis);
             // A gap resolves to the first later fragment, while a timestamp
             // inside a fragment retains its exact position.
+            observeSeek(
+              playerToPlay.current,
+              media,
+              state.seekGeneration,
+              target,
+            );
             media.currentTime = target;
           }
           media

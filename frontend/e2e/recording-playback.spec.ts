@@ -178,3 +178,49 @@ test("two actual HLS players converge smoothly and seek large drift", async ({
   expect(fastBefore.rate).toBeGreaterThan(10);
   expect(fastAfter.drift).toBeLessThan(fastBefore.drift - 0.1);
 });
+
+test("a 10x seek remains eligible after main-thread stalls", async ({
+  page,
+}) => {
+  await page.route("**/playback-fixture/*", async (route) => {
+    const filename = basename(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      status: 200,
+      contentType: filename.endsWith(".m3u8")
+        ? "application/vnd.apple.mpegurl"
+        : "video/mp4",
+      body: readFileSync(join(mediaDirectory, filename)),
+    });
+  });
+  await page.goto("/e2e/recording-playback/index.html");
+  await page.waitForFunction(
+    () =>
+      (window as any).playbackReady &&
+      (window as any).playbackPlayers.every(
+        (player: any) => player.playingDate,
+      ),
+  );
+  await page.evaluate(() => {
+    const state = window as any;
+    state.setPlaybackSpeed(10);
+    state.playbackVideos[0].playbackRate = 10;
+    const fragment = state.playbackPlayers[0].levels[0].details.fragments[0];
+    state.seekForTest(
+      Math.floor(fragment.programDateTime / 1000) + 5,
+      fragment.start + 5,
+    );
+  });
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const state = window as any;
+          return (
+            state.referenceForTest() === state.playbackPlayers[0] &&
+            state.playbackVideos[0].currentTime > 8
+          );
+        }),
+      { timeout: 10000 },
+    )
+    .toBe(true);
+});

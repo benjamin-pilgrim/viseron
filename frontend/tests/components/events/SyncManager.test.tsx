@@ -3,6 +3,7 @@ import Hls from "hls.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import SyncManager from "components/events/SyncManager";
+import { observeSeek } from "components/events/seekAcknowledgement";
 import { useHlsStore, useReferencePlayerStore } from "components/events/utils";
 
 const makePlayer = (date: number) => ({
@@ -19,6 +20,8 @@ const makePlayer = (date: number) => ({
       seekable: { length: 1, start: () => 0, end: () => 100 },
       play: vi.fn().mockResolvedValue(undefined),
       pause: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
     },
     levels: [
       {
@@ -404,13 +407,34 @@ describe("multi-camera playback", () => {
       await vi.advanceTimersByTimeAsync(200);
     });
     const seekAt = performance.now();
+    let elapsedWithoutTicks = 0;
+    const media = fresh.current.media!;
+    const events = new EventTarget();
+    media.addEventListener = events.addEventListener.bind(events);
+    media.removeEventListener = events.removeEventListener.bind(events);
+    Object.defineProperty(media, "currentTime", {
+      configurable: true,
+      get: () => 10 + (performance.now() - seekAt + elapsedWithoutTicks) / 100,
+    });
     Object.defineProperty(fresh.current, "playingDate", {
       configurable: true,
       get: () =>
-        new Date(1_700_000_010_000 + (performance.now() - seekAt) * 10),
+        new Date(
+          1_700_000_010_000 +
+            (performance.now() - seekAt + elapsedWithoutTicks) * 10,
+        ),
     });
     await act(async () => {
       useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      observeSeek(
+        fresh.current,
+        media,
+        useReferencePlayerStore.getState().seekGeneration,
+        10,
+      );
+      events.dispatchEvent(new Event("seeked"));
+      // Media advances while the main thread misses the early sync ticks.
+      elapsedWithoutTicks = 2000;
       await vi.advanceTimersByTimeAsync(1500);
     });
     expect(useReferencePlayerStore.getState().referencePlayer).toBe(
@@ -419,7 +443,7 @@ describe("multi-camera playback", () => {
     expect(
       useReferencePlayerStore.getState().playingDateRef.current,
     ).toBeGreaterThan(1_700_000_020);
-    expect(fresh.current.media!.currentTime).toBe(12);
+    expect(fresh.current.media!.currentTime).toBeGreaterThan(20);
   });
   it("does not jump over a distant unavailable gap", async () => {
     vi.useFakeTimers();
