@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   hasCompletedSeek,
+  noteSeekPlaybackRate,
   observeSeek,
 } from "components/events/seekAcknowledgement";
 
@@ -53,5 +54,42 @@ describe("seek acknowledgement", () => {
     seeking = false;
     media.dispatchEvent(new Event("seeked"));
     expect(hasCompletedSeek(player, 2)).toBe(true);
+  });
+  it("remembers earlier speed changes even when rate events are delayed", () => {
+    vi.useFakeTimers();
+    try {
+      const player = {} as Hls;
+      const media = document.createElement("video");
+      media.playbackRate = 0.5;
+      observeSeek(player, media, 10, 10);
+      noteSeekPlaybackRate(player, 10);
+      vi.advanceTimersByTime(1000);
+      media.currentTime = 18;
+      media.dispatchEvent(new Event("seeked"));
+      expect(hasCompletedSeek(player, 10)).toBe(true);
+      observeSeek(player, media, 11, 10);
+      media.currentTime = 30;
+      media.dispatchEvent(new Event("seeked"));
+      expect(hasCompletedSeek(player, 11)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("remembers the initial 10x speed after slowing before seeked", () => {
+    vi.useFakeTimers();
+    try {
+      const player = {} as Hls;
+      const media = document.createElement("video");
+      media.playbackRate = 10;
+      observeSeek(player, media, 12, 10);
+      vi.advanceTimersByTime(1000);
+      media.currentTime = 18;
+      media.playbackRate = 0.5;
+      media.dispatchEvent(new Event("ratechange"));
+      media.dispatchEvent(new Event("seeked"));
+      expect(hasCompletedSeek(player, 12)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -9,6 +9,7 @@ import { useShallow } from "zustand/react/shallow";
 import { CameraNameOverlay } from "components/camera/CameraNameOverlay";
 import { useFilteredCameras } from "components/camera/useCameraStore";
 import SyncManager from "components/events/SyncManager";
+import { noteSeekPlaybackRate } from "components/events/seekAcknowledgement";
 import {
   LIVE_EDGE_DELAY,
   getSrc,
@@ -128,6 +129,7 @@ const usePlayerCardCallbacks = (
       setPlaybackSpeed(speed);
       hlsRefs.forEach((player) => {
         if (player) {
+          noteSeekPlaybackRate(player.current!, speed);
           player.current!.media!.playbackRate = speed;
         }
       });

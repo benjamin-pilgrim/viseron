@@ -5,6 +5,7 @@ import { useShallow } from "zustand/react/shallow";
 
 import {
   hasCompletedSeek,
+  noteSeekPlaybackRate,
   observeSeek,
 } from "components/events/seekAcknowledgement";
 import {
@@ -222,6 +223,7 @@ function SyncManager({ children }: SyncManagerProps) {
       players.forEach((player) => {
         const media = player.current.media;
         if (!media) return;
+        noteSeekPlaybackRate(player.current, state.playbackSpeed);
         media.playbackRate = state.playbackSpeed;
         if (player === referencePlayer) {
           bufferingSince.current.delete(player.current);
@@ -251,7 +253,9 @@ function SyncManager({ children }: SyncManagerProps) {
           !media.paused &&
           !buffering
         ) {
-          media.playbackRate = state.playbackSpeed * (1 + RATE_NUDGE_FRACTION);
+          const correctedRate = state.playbackSpeed * (1 + RATE_NUDGE_FRACTION);
+          noteSeekPlaybackRate(player.current, correctedRate);
+          media.playbackRate = correctedRate;
           return;
         }
         if (drift <= MAX_DRIFT && !media.paused && !buffering) return;

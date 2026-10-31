@@ -5,7 +5,12 @@ import Hls from "hls.js";
 // briefly after the media element has moved.
 const seeks = new WeakMap<
   Hls,
-  { generation: number; complete: boolean; cleanup: () => void }
+  {
+    generation: number;
+    complete: boolean;
+    maxRate: number;
+    cleanup: () => void;
+  }
 >();
 
 export function observeSeek(
@@ -19,14 +24,22 @@ export function observeSeek(
   const seek = {
     generation,
     complete: false,
-    cleanup: () => media.removeEventListener("seeked", onSeeked),
+    maxRate: Math.max(1, media.playbackRate),
+    cleanup: () => {
+      media.removeEventListener("seeked", onSeeked);
+      media.removeEventListener("ratechange", onRateChange);
+    },
   };
   seeks.set(player, seek);
+  const onRateChange = () => {
+    seek.maxRate = Math.max(seek.maxRate, media.playbackRate);
+  };
   const onSeeked = () => {
     // A superseded seek can still have a queued event. Keep listening until
     // the current seek has actually settled at a plausible media position.
     const elapsed = Math.max(0, (performance.now() - startedAt) / 1000);
-    const furthest = target + elapsed * Math.max(1, media.playbackRate) + 2;
+    const furthest =
+      target + elapsed * Math.max(seek.maxRate, media.playbackRate) + 2;
     if (
       seeks.get(player) === seek &&
       !media.seeking &&
@@ -38,6 +51,14 @@ export function observeSeek(
     }
   };
   media.addEventListener("seeked", onSeeked);
+  media.addEventListener("ratechange", onRateChange);
+}
+
+// Record application-controlled changes synchronously: ratechange events can
+// be queued until after a subsequent rate change has already occurred.
+export function noteSeekPlaybackRate(player: Hls, rate: number): void {
+  const seek = seeks.get(player);
+  if (seek && !seek.complete) seek.maxRate = Math.max(seek.maxRate, rate);
 }
 
 export function hasCompletedSeek(player: Hls, generation: number): boolean {

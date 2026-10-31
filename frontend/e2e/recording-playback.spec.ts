@@ -179,7 +179,7 @@ test("two actual HLS players converge smoothly and seek large drift", async ({
   expect(fastAfter.drift).toBeLessThan(fastBefore.drift - 0.1);
 });
 
-test("a 10x seek remains eligible after delayed seeked delivery", async ({
+test("a seek stays eligible when 10x playback slows before delayed seeked", async ({
   page,
 }) => {
   await page.route("**/playback-fixture/*", async (route) => {
