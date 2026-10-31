@@ -23,6 +23,7 @@ const RATE_NUDGE_FRACTION = 0.1;
 const SEEK_SETTLE_MS = 1000;
 const BUFFER_RECOVERY_MS = 2000;
 const BUFFER_RETRY_MS = 5000;
+const MAX_RECOVERY_GAP_MS = 2000;
 
 interface SyncManagerProps {
   children: React.ReactNode;
@@ -58,6 +59,14 @@ function SyncManager({ children }: SyncManagerProps) {
   const lastCorrection = useRef(new WeakMap<Hls, number>());
   const bufferingSince = useRef(new WeakMap<Hls, number>());
   const lastBufferCorrection = useRef(new WeakMap<Hls, number>());
+  const seekFence = useRef<{
+    generation: number;
+    timestamp: number;
+    eligible: WeakSet<Hls>;
+  } | null>(null);
+  const seekGeneration = useRef(
+    useReferencePlayerStore.getState().seekGeneration,
+  );
 
   const seekSafely = useCallback((player: Hls, referenceDate: Dayjs) => {
     if (!player.levels || player.levels.length === 0 || !player.media) {
@@ -108,8 +117,20 @@ function SyncManager({ children }: SyncManagerProps) {
           ? now
           : -Infinity;
     }
-    if (lastSeek.current.timestamp !== state.requestedTimestamp) {
+    if (
+      lastSeek.current.timestamp !== state.requestedTimestamp ||
+      seekGeneration.current !== state.seekGeneration
+    ) {
       lastSeek.current = { timestamp: state.requestedTimestamp, at: now };
+      seekGeneration.current = state.seekGeneration;
+      seekFence.current =
+        state.requestedTimestamp > 0
+          ? {
+              generation: state.seekGeneration,
+              timestamp: state.requestedTimestamp,
+              eligible: new WeakSet(),
+            }
+          : null;
     }
     // Do not let an older player position override a fresh timeline seek.
     // Unlike an awaited delay, each tick reads the latest play and seek state.
@@ -123,6 +144,18 @@ function SyncManager({ children }: SyncManagerProps) {
     const playersWithTime = players.filter(
       (player) => player.current.playingDate !== null,
     );
+    if (seekFence.current) {
+      playersWithTime.forEach(({ current }) => {
+        if (
+          current.playingDate &&
+          Math.abs(
+            current.playingDate.getTime() / 1000 - state.playingDateRef.current,
+          ) <= HARD_SEEK_DRIFT
+        ) {
+          seekFence.current?.eligible.add(current);
+        }
+      });
+    }
 
     // Sync mute state
     players.forEach((player) => {
@@ -137,6 +170,11 @@ function SyncManager({ children }: SyncManagerProps) {
     const referencePlayer =
       playersWithTime.reduce<React.MutableRefObject<Hls> | null>(
         (prev, current) => {
+          if (
+            seekFence.current &&
+            !seekFence.current.eligible.has(current.current)
+          )
+            return prev;
           if (prev === null) {
             return !current.current.media?.paused &&
               (current.current.media?.readyState ?? 0) >=
@@ -213,7 +251,10 @@ function SyncManager({ children }: SyncManagerProps) {
             .then(() => {
               const latest = useReferencePlayerStore.getState();
               if (!latest.isPlaying) media.pause();
-              else if (latest.requestedTimestamp === state.requestedTimestamp) {
+              else if (
+                latest.requestedTimestamp === state.requestedTimestamp &&
+                latest.seekGeneration === state.seekGeneration
+              ) {
                 setHlsRefsError(player, null);
               }
             })
@@ -241,7 +282,10 @@ function SyncManager({ children }: SyncManagerProps) {
           .then(() => {
             const latest = useReferencePlayerStore.getState();
             if (!latest.isPlaying) media.pause();
-            else if (latest.requestedTimestamp === state.requestedTimestamp) {
+            else if (
+              latest.requestedTimestamp === state.requestedTimestamp &&
+              latest.seekGeneration === state.seekGeneration
+            ) {
               setHlsRefsError(first, null);
             }
           })
@@ -250,19 +294,12 @@ function SyncManager({ children }: SyncManagerProps) {
     }
 
     // Recover one camera if none can provide a running, ready reference.
-    if (
-      !referencePlayer &&
-      playersWithTime.every(
-        (player) =>
-          player.current.media?.paused ||
-          (player.current.media?.readyState ?? 0) <
-            HTMLMediaElement.HAVE_FUTURE_DATA,
-      )
-    ) {
+    if (!referencePlayer && playersWithTime.length > 0) {
       const playingDateMillis = playingDateRef.current * 1000;
 
       let playerToPlayIndex = -1;
       let smallestDifference = Infinity;
+      let oldestAttempt = Infinity;
 
       playersWithTime.forEach((player, index) => {
         const fragments =
@@ -283,7 +320,29 @@ function SyncManager({ children }: SyncManagerProps) {
           0,
           closestFragment.programDateTime - playingDateMillis,
         );
-        if (difference < smallestDifference) {
+        if (difference > MAX_RECOVERY_GAP_MS) return;
+        const media = player.current.media;
+        if (!media) return;
+        const target = getSeekTarget(closestFragment, playingDateMillis);
+        const seekable = media.seekable;
+        if (
+          !Array.from({ length: seekable.length }, (_, i) => i).some(
+            (i) => target >= seekable.start(i) && target <= seekable.end(i),
+          )
+        )
+          return;
+        const buffering = media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+        if (buffering && !bufferingSince.current.has(player.current))
+          bufferingSince.current.set(player.current, now);
+        const last =
+          (buffering ? lastBufferCorrection : lastCorrection).current.get(
+            player.current,
+          ) ?? -Infinity;
+        if (
+          last < oldestAttempt ||
+          (last === oldestAttempt && difference < smallestDifference)
+        ) {
+          oldestAttempt = last;
           smallestDifference = difference;
           playerToPlayIndex = index;
         }
@@ -337,7 +396,10 @@ function SyncManager({ children }: SyncManagerProps) {
             .then(() => {
               const latest = useReferencePlayerStore.getState();
               if (!latest.isPlaying) media.pause();
-              else if (latest.requestedTimestamp === state.requestedTimestamp) {
+              else if (
+                latest.requestedTimestamp === state.requestedTimestamp &&
+                latest.seekGeneration === state.seekGeneration
+              ) {
                 setHlsRefsError(playerToPlay, null);
               }
             })

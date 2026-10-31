@@ -264,6 +264,7 @@ interface ReferencePlayerStore {
   playbackSpeed: number;
   setPlaybackSpeed: (speed: number) => void;
   requestedTimestamp: number;
+  seekGeneration: number;
   setRequestedTimestamp: (timestamp: number) => void;
   playingDateRef: React.MutableRefObject<number>;
 }
@@ -280,10 +281,15 @@ export const useReferencePlayerStore = create<ReferencePlayerStore>((set) => ({
   playbackSpeed: 1,
   setPlaybackSpeed: (playbackSpeed) => set({ playbackSpeed }),
   requestedTimestamp: getDayjs().unix() - LIVE_EDGE_DELAY,
+  seekGeneration: 0,
   setRequestedTimestamp: (requestedTimestamp) =>
     set((state) => {
       state.playingDateRef.current = requestedTimestamp;
-      return { ...state, requestedTimestamp };
+      return {
+        ...state,
+        requestedTimestamp,
+        seekGeneration: state.seekGeneration + 1,
+      };
     }),
   playingDateRef: { current: getDayjs().unix() - LIVE_EDGE_DELAY },
 }));

@@ -336,6 +336,100 @@ describe("multi-camera playback", () => {
     });
     expect(first.current.media!.currentTime).toBe(30);
   });
+  it("tries another camera when the first remains buffering", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_020_000);
+    const second = makePlayer(1_700_000_019_000);
+    Object.defineProperty(first.current.media!, "readyState", { value: 2 });
+    Object.defineProperty(second.current.media!, "readyState", { value: 2 });
+    useHlsStore.setState({ hlsRefs: [first, second] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3500);
+    });
+    expect(first.current.media!.play).toHaveBeenCalled();
+    expect(second.current.media!.play).toHaveBeenCalled();
+  });
+  it("does not let an old player overwrite a slow backward seek", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_060_000);
+    useHlsStore.setState({ hlsRefs: [first] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_050,
+      playingDateRef: { current: 1_700_000_060 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    await act(async () => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(useReferencePlayerStore.getState().playingDateRef.current).toBe(
+      1_700_000_010,
+    );
+  });
+  it("does not jump over a distant unavailable gap", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_020_000);
+    Object.defineProperty(first.current.media!, "paused", { value: true });
+    first.current.levels[0].details!.fragments[0].programDateTime = 1_700_000_100_000;
+    useHlsStore.setState({ hlsRefs: [first] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(first.current.media!.currentTime).toBe(12);
+    expect(first.current.media!.play).not.toHaveBeenCalled();
+  });
+  it("does not recover to a fragment outside the seekable range", async () => {
+    vi.useFakeTimers();
+    const first = makePlayer(1_700_000_020_000);
+    Object.defineProperty(first.current.media!, "paused", { value: true });
+    Object.defineProperty(first.current.media!, "seekable", {
+      value: { length: 1, start: () => 0, end: () => 5 },
+    });
+    useHlsStore.setState({ hlsRefs: [first] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      requestedTimestamp: 1_700_000_000,
+      playingDateRef: { current: 1_700_000_010 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(first.current.media!.currentTime).toBe(12);
+    expect(first.current.media!.play).not.toHaveBeenCalled();
+  });
   it("does not resume a user-paused player on HLS errors", async () => {
     vi.useFakeTimers();
     const player = makePlayer(1_700_000_020_000);

@@ -278,20 +278,24 @@ const useSeekToTimestamp = (
   camera: types.Camera | types.FailedCamera,
   reInitPlayer: () => void,
 ) => {
-  const { requestedTimestamp } = useReferencePlayerStore(
+  const { requestedTimestamp, seekGeneration } = useReferencePlayerStore(
     useShallow((state) => ({
       requestedTimestamp: state.requestedTimestamp,
+      seekGeneration: state.seekGeneration,
     })),
   );
   // The effect also re-runs when other deps change, like a camera refetch,
   // which must not snap the player back to a stale requestedTimestamp.
-  const handledTimestampRef = useRef(requestedTimestamp);
+  const handledTimestampRef = useRef({ requestedTimestamp, seekGeneration });
 
   useEffect(() => {
-    if (requestedTimestamp === handledTimestampRef.current) {
+    if (
+      requestedTimestamp === handledTimestampRef.current.requestedTimestamp &&
+      seekGeneration === handledTimestampRef.current.seekGeneration
+    ) {
       return;
     }
-    handledTimestampRef.current = requestedTimestamp;
+    handledTimestampRef.current = { requestedTimestamp, seekGeneration };
 
     if (!hlsRef.current || !videoRef.current || !hlsRef.current.media) {
       return;
@@ -316,9 +320,15 @@ const useSeekToTimestamp = (
     if (fragment) {
       const seekTarget = getSeekTarget(fragment, requestedTimestampMillis);
       videoRef.current.currentTime = seekTarget;
-      videoRef.current.play().catch(() => {
-        // Ignore play errors
-      });
+      if (useReferencePlayerStore.getState().isPlaying) {
+        const video = videoRef.current;
+        video
+          .play()
+          .then(() => {
+            if (!useReferencePlayerStore.getState().isPlaying) video.pause();
+          })
+          .catch(() => {});
+      }
     } else {
       // If the fragment is not found, reinitialize the player to load the correct source
       reInitPlayer();
@@ -330,6 +340,7 @@ const useSeekToTimestamp = (
     initialProgramDateTime,
     reInitPlayer,
     requestedTimestamp,
+    seekGeneration,
     videoRef,
   ]);
 };
