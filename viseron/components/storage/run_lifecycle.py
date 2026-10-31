@@ -138,7 +138,12 @@ def reclaim_spool_run(lock_root: str, camera_key: str, run_dir: str) -> bool:
     launch until exit. Missing/inaccessible leases and any other file fail closed.
     """
     lease_name = ".viseron-writer-lease"
-    allowed = {lease_name, "init.mp4", "index.m3u8"}
+    allowed = {
+        lease_name,
+        "init.mp4",
+        "index.m3u8",
+        ".viseron-playlist-timing-contract",
+    }
     try:
         with camera_lock(lock_root, camera_key):
             run = Path(run_dir)
@@ -152,6 +157,28 @@ def reclaim_spool_run(lock_root: str, camera_key: str, run_dir: str) -> bool:
                     return False
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 entries = list(run.iterdir())
+                # A timing record is useful only while its staged fragment is
+                # retained. Capture and reclamation share the camera lock.
+                timing_name = re.compile(
+                    r"^\.viseron-timing-(\d{9,}-\d+-\d{13,}\.m4s)\.json$"
+                )
+                timing_temp = re.compile(r"^\.viseron-timing-tmp-[a-z0-9_]{8}$")
+                for entry in entries:
+                    match = timing_name.fullmatch(entry.name)
+                    if (
+                        timing_temp.fullmatch(entry.name)
+                        and entry.is_file()
+                        and not entry.is_symlink()
+                    ):
+                        entry.unlink()
+                    elif (
+                        match
+                        and entry.is_file()
+                        and not entry.is_symlink()
+                        and not os.path.lexists(run / match.group(1))
+                    ):
+                        entry.unlink()
+                entries = list(run.iterdir())
                 if any(
                     e.name not in allowed or e.is_symlink() or not e.is_file()
                     for e in entries
@@ -159,7 +186,11 @@ def reclaim_spool_run(lock_root: str, camera_key: str, run_dir: str) -> bool:
                     return False
                 # Delete the lease last. An interrupted cleanup with no lease
                 # never authorizes a later cleanup to guess that the run ended.
-                for name in ("index.m3u8", "init.mp4"):
+                for name in (
+                    "index.m3u8",
+                    "init.mp4",
+                    ".viseron-playlist-timing-contract",
+                ):
                     try:
                         (run / name).unlink()
                     except FileNotFoundError:

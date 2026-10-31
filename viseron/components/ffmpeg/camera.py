@@ -26,6 +26,7 @@ from viseron.helpers.child_process_context import (
     CHILD_PROCESS_START_METHOD,
     get_child_process_context,
 )
+from viseron.helpers.recording_timing_contract import permits_timing_capture
 from viseron.helpers.logs import SensitiveInformationFilter
 from viseron.helpers.validators import (
     UNDEFINED,
@@ -395,6 +396,7 @@ class Camera(AbstractCamera):
 
         frame_reader_config = FrameReaderConfig(
             camera_identifier=self.identifier,
+            timing_capture_safe=permits_timing_capture(self._config),
             decoder_command=self.stream.build_command(),
             dedicated_rawvideo_fd=self.stream.use_rawvideo_fd,
             segment_command=(

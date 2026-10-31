@@ -41,6 +41,7 @@ class FrameReaderConfig:
     sensitive_strings: tuple[str, ...]
     log_level: int
     dedicated_rawvideo_fd: bool = False
+    timing_capture_safe: bool = False
 
 
 def frame_reader_logger_name(camera_identifier: str) -> str:
@@ -72,6 +73,7 @@ def run_frame_reader(
         decoder_command=config.decoder_command,
         segment_command=config.segment_command,
         dedicated_rawvideo_fd=config.dedicated_rawvideo_fd,
+        timing_capture_safe=config.timing_capture_safe,
     )
 
     decode_error.clear()

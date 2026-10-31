@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import pickle
 import queue
+import threading
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
@@ -126,8 +127,8 @@ def test_sets_decode_error_after_max_empty_frames() -> None:
 
 def test_decode_error_restarts_the_same_pipe() -> None:
     """The frame reader remains the sole owner of decode-error retries."""
-    capture_frames = MagicMock()
-    capture_frames.is_set.side_effect = [True, False]
+    capture_frames = threading.Event()
+    capture_frames.set()
     decode_error = MagicMock()
     decode_error.is_set.return_value = True
     frame_queue = _FakeQueue(maxsize=2)
@@ -135,7 +136,12 @@ def test_decode_error_restarts_the_same_pipe() -> None:
     with ExitStack() as stack:
         ffmpeg_pipe, _ = _enter_patches(stack)
         stack.enter_context(patch("viseron.components.ffmpeg.frame_reader.time.sleep"))
-        ffmpeg_pipe.return_value.read.return_value = b"1234"
+
+        def read_once(_size):
+            capture_frames.clear()
+            return b"1234"
+
+        ffmpeg_pipe.return_value.read.side_effect = read_once
         run_frame_reader(_config(), frame_queue, capture_frames, decode_error)
 
     assert ffmpeg_pipe.return_value.start.call_count == 2

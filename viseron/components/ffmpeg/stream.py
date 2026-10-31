@@ -20,6 +20,7 @@ from viseron.const import (
 )
 from viseron.exceptions import FFprobeError, FFprobeTimeout, StreamInformationError
 from viseron.helpers import escape_string
+from viseron.helpers.recording_timing_contract import permits_timing_capture
 from viseron.helpers.logs import LogPipe, UnhelpfullLogFilter
 from viseron.helpers.validators import UNDEFINED
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
@@ -660,6 +661,7 @@ class Stream:
             self._logger,
             FFMPEG_LOGLEVELS[self._config[CONFIG_FFMPEG_LOGLEVEL]],
             segment_command=self.build_segment_command(),
+            timing_capture_safe=permits_timing_capture(self._camera.config),
         )
         self._ffmpeg_pipe.start()
 

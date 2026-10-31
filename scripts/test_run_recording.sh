@@ -95,6 +95,64 @@ wait_runs() {
   return 1
 }
 wait_runs 1
+# Optional destructive actions affect only this disposable test container. Pause
+# its consumer until recorded media leaves the playlist, then kill/restart it.
+if [[ ${VISERON_TEST_BACKLOG_RESTART:-0} == 1 ]]; then
+podman exec "$app" python3 -c '
+import os, signal
+for p in os.listdir("/proc"):
+ if not p.isdigit(): continue
+ try: cmd=open("/proc/"+p+"/cmdline","rb").read()
+ except OSError: continue
+ if cmd.startswith(b"viseron.child_process.fragmenter.vertical_camera.process"):
+  os.kill(int(p),signal.SIGSTOP); print("Stopped fragment consumer",p); break
+else: raise SystemExit("No fragment consumer found")
+'
+python3 - "$root" "${VISERON_TEST_BACKLOG_IDENTITY_DRIFT:-0}" <<'PYCHECK'
+from pathlib import Path
+import json, sys, time
+root=Path(sys.argv[1])
+stage=root/'segments/.viseron-spool/vertical_camera'
+for _ in range(100):
+    runs=list(stage.iterdir()) if stage.exists() else []
+    if runs:
+        run=runs[0]; files=sorted(run.glob('*.m4s'))
+        playlist=(run/'index.m3u8').read_text() if (run/'index.m3u8').exists() else ''
+        eligible=[p for p in files if p.name not in playlist and (run/('.viseron-timing-'+p.name+'.json')).exists()]
+        if eligible:
+            file=eligible[0]
+            rec=json.loads((run/('.viseron-timing-'+file.name+'.json')).read_text())
+            if sys.argv[2] == '1':
+                rec['identity'][0] += 1
+                (run/('.viseron-timing-'+file.name+'.json')).write_text(json.dumps(rec))
+            (root/'backlog-test.json').write_text(json.dumps({'run':run.name,'file':file.name,'time':rec['program_date_time']}))
+            print('Pending outside playlist before container kill:',file.name,'timestamp',rec['program_date_time'])
+            break
+    time.sleep(1)
+else: raise SystemExit('No captured backlog outside playlist')
+PYCHECK
+podman kill "$app" >/dev/null
+podman start "$app" >/dev/null
+python3 - "$root" "$app" <<'PYCHECK'
+import datetime, json, subprocess, sys, time
+from pathlib import Path
+root=Path(sys.argv[1]); app=sys.argv[2]
+rec=json.loads((root/'backlog-test.json').read_text())
+path=f"/segments/vertical_camera/{rec['run']}/{rec['file']}"
+sql="select orig_ctime from files where path = '%s'" % path
+for _ in range(120):
+    result=subprocess.run(['podman','exec',app,'psql','-U','postgres','-d','viseron','-Atc',sql],capture_output=True,text=True)
+    if result.returncode == 0 and result.stdout.strip():
+        actual=datetime.datetime.fromisoformat(result.stdout.strip()).replace(tzinfo=datetime.timezone.utc)
+        expected=datetime.datetime.fromisoformat(rec['time'])
+        if actual != expected: raise SystemExit(f'Wrong timestamp: {actual} != {expected}')
+        if not (root/'segments/vertical_camera'/rec['run']/rec['file']).is_file(): raise SystemExit('Indexed file missing')
+        print('PASS: pending fragment recovered after container kill with original timestamp:',actual)
+        break
+    time.sleep(1)
+else: raise SystemExit('Backlog fragment not indexed after container restart')
+PYCHECK
+fi
 # Check the actual running recorder arguments, as opposed to just the config.
 podman exec -i "$app" python3 - "$mode" <<'PYTHON'
 import os, sys
@@ -113,7 +171,8 @@ for pid in os.listdir('/proc'):
     except (FileNotFoundError, ProcessLookupError, PermissionError): pass
 else: raise SystemExit('FAIL: no recorder process found')
 PYTHON
-run1=$(list_runs | head -1)
+mapfile -t initial_runs < <(list_runs | sort)
+run1=${initial_runs[0]}
 # Exercise the same nginx route used by the browser, not just the backend.
 # Files can precede database indexing, so allow the route to become ready.
 podman exec -i "$app" python3 - "${run1##*/}" <<'PYTHON'
@@ -148,6 +207,7 @@ find "$run1" -maxdepth 1 -type f \( -name init.mp4 -o -name '*.m4s' \) -print0 |
 echo "First run: $run1"
 if [[ -n ${VISERON_TEST_DEBUG_PAUSE:-} ]]; then sleep "$VISERON_TEST_DEBUG_PAUSE"; fi
 # Kill only the HLS-writing ffmpeg process in this disposable container.
+runs_before_ffmpeg_restart=$(list_runs | wc -l)
 podman exec "$app" python3 -c '
 import os, signal
 for item in os.listdir("/proc"):
@@ -161,7 +221,7 @@ for item in os.listdir("/proc"):
     except (FileNotFoundError, ProcessLookupError, PermissionError): pass
 else: raise SystemExit("FAIL: no HLS-writing FFmpeg process found")
 '
-wait_runs 2
+wait_runs "$((runs_before_ffmpeg_restart + 1))"
 mapfile -t runs < <(list_runs | sort)
 run2=${runs[-1]}
 [[ "$run1" < "$run2" ]] || { echo 'FAIL: restarted run is not ordered after the first run'; exit 1; }
@@ -178,9 +238,10 @@ kill -CONT "$publisher"
 wait_runs "$((runs_before_outage + 1))"
 echo "Camera publisher reconnected and recording resumed."
 # Restart Viseron against the same persisted storage and database, then stop it.
+runs_before_container_restart=$(list_runs | wc -l)
 podman stop -t 60 "$app" >/dev/null
 podman start "$app" >/dev/null
-wait_runs 4
+wait_runs "$((runs_before_container_restart + 1))"
 mapfile -t runs < <(list_runs | sort)
 echo "Runs after container restart:"; printf '%s\n' "${runs[@]}"
 [[ "$run2" < "${runs[-1]}" ]] || { echo 'FAIL: container restart did not create a later run'; exit 1; }
