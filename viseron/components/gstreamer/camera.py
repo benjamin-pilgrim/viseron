@@ -429,8 +429,9 @@ class Camera(AbstractCamera):
         """Start a reader once the previous owner has released the pipe."""
         self._logger.debug("Starting capture thread")
         with self._capture_lock:
-            if self._capture_frames:
+            if self._capture_frames and self._frame_reader and self._frame_reader.is_alive():
                 return
+            self._capture_stop.set()
             self._capture_frames = True
             stop_event = Event()
             self._capture_stop = stop_event

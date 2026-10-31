@@ -116,3 +116,17 @@ def test_queue_timeouts_do_not_trigger_empty_frame_restart():
     assert reads == 12
     assert camera.stream.start_pipe.call_count == 1
     assert not camera.decode_error.is_set()
+
+
+def test_watchdog_restarts_dead_reader():
+    """A dead registered reader can be replaced while capture is enabled."""
+    camera = _camera()
+    old_reader = MagicMock()
+    old_reader.is_alive.return_value = False
+    camera._frame_reader = old_reader
+    old_stop = camera._capture_stop
+    camera._create_frame_reader = MagicMock(return_value=MagicMock())
+    Camera._start_camera(camera)
+    assert old_stop.is_set()
+    assert camera._frame_reader is not old_reader
+    camera._frame_reader.start.assert_called_once()
