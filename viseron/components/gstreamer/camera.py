@@ -314,17 +314,32 @@ class Camera(AbstractCamera):
             name="viseron.camera." + self.identifier,
             target=self.read_frames,
             args=(stop_event,),
-            poll_method=self.poll_method,
-            poll_target=self.poll_target,
+            poll_method=lambda: self._watchdog_poll(stop_event),
+            poll_target=lambda: self._watchdog_poll_target(stop_event),
             daemon=True,
             register=True,
-            restart_method=self._watchdog_restart,
+            restart_method=lambda: self._watchdog_restart(stop_event),
         )
 
-    def _watchdog_restart(self) -> None:
-        """Respect an explicit camera stop while handling a watchdog restart."""
+    def _watchdog_poll(self, stop_event: Event) -> bool:
+        """Ignore watchdog snapshots belonging to an obsolete reader."""
         with self._camera_state_lock:
-            if not self.stopped.is_set():
+            return (
+                self._capture_stop is stop_event
+                and not self.stopped.is_set()
+                and self.poll_method()
+            )
+
+    def _watchdog_poll_target(self, stop_event: Event) -> None:
+        """Stop only the reader inspected by the watchdog."""
+        with self._camera_state_lock:
+            if self._capture_stop is stop_event and not self.stopped.is_set():
+                self.poll_target()
+
+    def _watchdog_restart(self, stop_event: Event) -> None:
+        """Respect an explicit stop and ignore obsolete reader snapshots."""
+        with self._camera_state_lock:
+            if self._capture_stop is stop_event and not self.stopped.is_set():
                 self.start_camera()
 
     def initialize_camera(self) -> None:

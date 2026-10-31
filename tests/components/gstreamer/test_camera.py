@@ -180,7 +180,8 @@ def test_watchdog_unregisters_dead_reader_before_replacement_and_respects_stop()
     old.is_alive.return_value = False
     old.poll_method = None
     old.thread_store_category = None
-    old.restart_method = lambda: Camera._watchdog_restart(camera)
+    old_token = camera._capture_stop
+    old.restart_method = lambda: Camera._watchdog_restart(camera, old_token)
     camera._frame_reader = old
     new = MagicMock()
     new.is_alive.return_value = True
@@ -193,7 +194,26 @@ def test_watchdog_unregisters_dead_reader_before_replacement_and_respects_stop()
     assert old not in watchdog.registered_items
     assert camera._frame_reader is new
     camera.stopped.set()
-    Camera._watchdog_restart(camera)
+    Camera._watchdog_restart(camera, old_token)
     assert camera._create_frame_reader.call_count == 1
     watchdog.watchdog()
     assert camera._create_frame_reader.call_count == 1
+
+
+def test_obsolete_watchdog_snapshot_cannot_stop_new_reader():
+    """Stale callbacks after stop and start do not control the new reader."""
+    from threading import RLock
+
+    camera = _camera()
+    camera._camera_state_lock = RLock()
+    camera.stopped = Event()
+    old_token = camera._capture_stop
+    camera._capture_stop = Event()
+    camera.poll_method = MagicMock(return_value=True)
+    camera.poll_target = MagicMock()
+    camera.start_camera = MagicMock()
+    assert not Camera._watchdog_poll(camera, old_token)
+    Camera._watchdog_poll_target(camera, old_token)
+    Camera._watchdog_restart(camera, old_token)
+    camera.poll_target.assert_not_called()
+    camera.start_camera.assert_not_called()
