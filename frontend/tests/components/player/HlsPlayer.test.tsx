@@ -177,6 +177,41 @@ describe("HlsPlayer requestedTimestamp seeking", () => {
     return { ...view, hls, video };
   };
 
+  it("does not resume when a level arrives after the user pauses", () => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockReturnValue();
+    useReferencePlayerStore.setState({
+      isPlaying: false,
+      playingDateRef: { current: PLAYLIST_START + 15 },
+    });
+    renderWithContext(<HlsPlayer camera={mockCamera} />);
+    const hls = latestHls();
+    act(() => hls.handlers.hlsLevelLoaded(null, { details: { fragments } }));
+    expect(hls.media.play).not.toHaveBeenCalled();
+  });
+
+  it("restores pause if level-load play resolves after a pause", async () => {
+    let resolvePlay!: () => void;
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolvePlay = resolve;
+      }),
+    );
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockReturnValue();
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playingDateRef: { current: PLAYLIST_START + 15 },
+    });
+    renderWithContext(<HlsPlayer camera={mockCamera} />);
+    const hls = latestHls();
+    act(() => hls.handlers.hlsLevelLoaded(null, { details: { fragments } }));
+    useReferencePlayerStore.setState({ isPlaying: false });
+    await act(async () => {
+      resolvePlay();
+    });
+    expect(hls.media.pause).toHaveBeenCalled();
+  });
+
   it.each([
     { id: "second render with unchanged props", camera: mockCamera },
     {

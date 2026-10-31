@@ -179,7 +179,7 @@ test("two actual HLS players converge smoothly and seek large drift", async ({
   expect(fastAfter.drift).toBeLessThan(fastBefore.drift - 0.1);
 });
 
-test("a 10x seek remains eligible after main-thread stalls", async ({
+test("a 10x seek remains eligible after delayed seeked delivery", async ({
   page,
 }) => {
   await page.route("**/playback-fixture/*", async (route) => {
@@ -210,6 +210,9 @@ test("a 10x seek remains eligible after main-thread stalls", async ({
       fragment.start + 5,
     );
   });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).delayedSeekAdvance ?? -1))
+    .toBeGreaterThan(2);
   await expect
     .poll(
       () =>

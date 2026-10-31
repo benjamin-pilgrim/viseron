@@ -23,15 +23,21 @@ export function observeSeek(
   };
   seeks.set(player, seek);
   const onSeeked = () => {
-    media.removeEventListener("seeked", onSeeked);
+    // A superseded seek can still have a queued event. Keep listening until
+    // the current seek has actually settled at a plausible media position.
+    const elapsed = Math.max(0, (performance.now() - startedAt) / 1000);
+    const furthest = target + elapsed * Math.max(1, media.playbackRate) + 2;
     if (
       seeks.get(player) === seek &&
-      Math.abs(media.currentTime - target) < 2
+      !media.seeking &&
+      media.currentTime >= target - 2 &&
+      media.currentTime <= furthest
     ) {
       seek.complete = true;
+      seek.cleanup();
     }
   };
-  media.addEventListener("seeked", onSeeked, { once: true });
+  media.addEventListener("seeked", onSeeked);
 }
 
 export function hasCompletedSeek(player: Hls, generation: number): boolean {

@@ -25,18 +25,36 @@ Object.assign(window, {
   seekForTest: (timestamp: number, target: number) => {
     useReferencePlayerStore.getState().setRequestedTimestamp(timestamp);
     const generation = useReferencePlayerStore.getState().seekGeneration;
-    observeSeek(players[0], videos[0], generation, target);
+    const video = videos[0];
+    const add = video.addEventListener.bind(video);
+    const remove = video.removeEventListener.bind(video);
+    let wrapped: EventListener | undefined;
+    video.addEventListener = ((
+      type: string,
+      listener: EventListener,
+      options?: AddEventListenerOptions,
+    ) => {
+      if (type !== "seeked") return add(type, listener, options);
+      wrapped = (event) => {
+        const before = video.currentTime;
+        setTimeout(() => {
+          Object.assign(window, {
+            delayedSeekAdvance: video.currentTime - before,
+          });
+          listener.call(video, event);
+        }, 1300);
+      };
+      add(type, wrapped, options);
+    }) as typeof video.addEventListener;
+    video.removeEventListener = ((
+      type: string,
+      listener: EventListener,
+      options?: EventListenerOptions,
+    ) => {
+      remove(type, type === "seeked" && wrapped ? wrapped : listener, options);
+    }) as typeof video.removeEventListener;
+    observeSeek(players[0], video, generation, target);
     videos[0].currentTime = target;
-    videos[0].addEventListener(
-      "seeked",
-      () => {
-        const until = performance.now() + 1300;
-        while (performance.now() < until) {
-          /* simulate a stalled main thread */
-        }
-      },
-      { once: true },
-    );
   },
   referenceForTest: () => useReferencePlayerStore.getState().referencePlayer,
   setPlaybackSpeed: (speed: number) =>

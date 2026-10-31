@@ -85,9 +85,17 @@ const onLevelLoaded = (
       seekTarget,
     );
     videoRef.current.currentTime = seekTarget;
-    videoRef.current.play().catch(() => {
-      // Ignore play errors
-    });
+    const video = videoRef.current;
+    if (useReferencePlayerStore.getState().isPlaying) {
+      video
+        .play()
+        .then(() => {
+          if (!useReferencePlayerStore.getState().isPlaying) video.pause();
+        })
+        .catch(() => {
+          // Ignore play errors
+        });
+    }
   } else {
     videoRef.current.pause();
   }
