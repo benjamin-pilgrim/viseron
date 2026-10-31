@@ -555,7 +555,7 @@ def test_changed_content_after_remount_recheck_is_not_published(tmp_path):
 
 
 def test_slow_timelapse_does_not_hold_publication_lock(tmp_path, monkeypatch):
-    """A stalled thumbnail process must not block storage operations."""
+    """A stalled timelapse process must not block storage operations."""
     stage = tmp_path / "stage"
     run = stage / "20261031T143215.482000Z-a7c93e12ab34"
     run.mkdir(parents=True)
