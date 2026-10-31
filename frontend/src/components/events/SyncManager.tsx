@@ -18,7 +18,9 @@ import { sleep } from "lib/helpers";
 import { getDayjsFromDate } from "lib/helpers/dates";
 
 const SYNC_INTERVAL = 100; // Sync interval in milliseconds
-const MAX_DRIFT = 0.5; // Maximum allowed drift in seconds
+const MAX_DRIFT = 0.5; // Maximum drift before correcting playback
+const HARD_SEEK_DRIFT = 4; // Seek only when rate correction would take too long
+const RATE_NUDGE = 0.05;
 
 interface SyncManagerProps {
   children: React.ReactNode;
@@ -38,6 +40,7 @@ function SyncManager({ children }: SyncManagerProps) {
     setIsPlaying,
     setIsLive,
     isMuted,
+    playbackSpeed,
     requestedTimestamp,
     playingDateRef,
   } = useReferencePlayerStore(
@@ -47,6 +50,7 @@ function SyncManager({ children }: SyncManagerProps) {
       setIsPlaying: state.setIsPlaying,
       setIsLive: state.setIsLive,
       isMuted: state.isMuted,
+      playbackSpeed: state.playbackSpeed,
       requestedTimestamp: state.requestedTimestamp,
       playingDateRef: state.playingDateRef,
     })),
@@ -138,13 +142,24 @@ function SyncManager({ children }: SyncManagerProps) {
         ? getDayjsFromDate(referencePlayer.current.playingDate).unix()
         : requestedTimestamp;
       playersWithTime.forEach((player) => {
+        if (player.current.media) {
+          player.current.media.playbackRate = playbackSpeed;
+        }
         if (player !== referencePlayer) {
           const timeDiff =
             (getDayjsFromDate(referencePlayer.current.playingDate!).valueOf() -
               getDayjsFromDate(player.current.playingDate!).valueOf()) /
             1000;
 
-          if (Math.abs(timeDiff) > MAX_DRIFT) {
+          if (
+            Math.abs(timeDiff) > MAX_DRIFT &&
+            Math.abs(timeDiff) < HARD_SEEK_DRIFT &&
+            !player.current.media?.paused
+          ) {
+            if (player.current.media) {
+              player.current.media.playbackRate = playbackSpeed + RATE_NUDGE;
+            }
+          } else if (Math.abs(timeDiff) > MAX_DRIFT) {
             const seeked = seekSafely(
               player.current,
               getDayjsFromDate(referencePlayer.current.playingDate!),
@@ -258,6 +273,7 @@ function SyncManager({ children }: SyncManagerProps) {
     hlsRefs,
     isMuted,
     isPlaying,
+    playbackSpeed,
     playingDateRef,
     requestedTimestamp,
     seekSafely,
