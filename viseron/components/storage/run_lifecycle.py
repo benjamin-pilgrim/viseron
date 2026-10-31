@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import re
 import stat
@@ -71,7 +72,8 @@ def is_run_directory(name: str) -> bool:
 
 TEMP_MAX_AGE_SECONDS = 60 * 60
 _PRIVATE_TEMP = re.compile(
-    r"^\.viseron-tier-move-(?:pending-)?(?:[a-z0-9_]{8}|[0-9a-f]{32})$"
+    r"^\.viseron-tier-move-(?:(?:pending-)?(?:[a-z0-9_]{8}|[0-9a-f]{32})|"
+    r"init-(?:marker-)?[a-z0-9_]{8})$"
 )
 
 
@@ -92,6 +94,30 @@ def remove_stale_temporary(path: str, check_tier) -> bool:
             for name in os.listdir(os.path.dirname(path))
         ):
             return False
+        if os.path.basename(path).startswith(".viseron-tier-move-init-"):
+            marker = os.path.join(os.path.dirname(path), ".viseron-tier-move-run-init.json")
+            if os.path.lexists(marker):
+                try:
+                    with open(marker, encoding="utf-8") as stream:
+                        record = json.load(stream)
+                    owned = record["temp"]
+                    if (
+                        record.get("version") not in (1, 2)
+                        or not all(
+                            isinstance(record.get(key), list)
+                            and len(record[key]) == 4
+                            and all(isinstance(item, int) for item in record[key])
+                            for key in ("source", "destination")
+                        )
+                        or (record["version"] == 2 and not isinstance(record.get("digest"), str))
+                        or not isinstance(owned, str)
+                        or os.path.basename(owned) != owned
+                        or not owned.startswith(".viseron-tier-move-init-")
+                        or owned == os.path.basename(path)
+                    ):
+                        return False
+                except (OSError, ValueError, KeyError, TypeError):
+                    return False
         entry = os.lstat(path)
         if (
             not stat.S_ISREG(entry.st_mode)

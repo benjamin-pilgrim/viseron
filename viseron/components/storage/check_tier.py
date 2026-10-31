@@ -5,8 +5,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import datetime
-import ctypes
-import errno
 import logging
 import os
 import re
@@ -976,46 +974,14 @@ def publish_run_init(src: str, dst: str, tier_markers: dict[str, str]) -> None:
     destination_init = os.path.join(destination_dir, "init.mp4")
     require_tier_markers(source_init, tier_markers)
     require_tier_markers(destination_init, tier_markers)
-    with open(source_init, "rb") as source:
-        data = source.read()
-    if not data:
-        raise OSError("Refusing to publish an empty run init")
-    os.makedirs(destination_dir, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=TIER_MOVE_TEMP_PREFIX, dir=destination_dir)
-    try:
-        with os.fdopen(fd, "wb") as target:
-            target.write(data)
-            target.flush()
-            os.fsync(target.fileno())
-        require_tier_markers(source_init, tier_markers)
-        require_tier_markers(destination_init, tier_markers)
-        try:
-            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-        except AttributeError as exc:
-            raise OSError(errno.ENOSYS, "renameat2 unavailable") from exc
-        renameat2.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            -100, os.fsencode(temp_path), -100, os.fsencode(destination_init), 1
-        )
-        if result != 0:
-            error = ctypes.get_errno()
-            if error != errno.EEXIST:
-                raise OSError(error, os.strerror(error), destination_init)
-            with open(destination_init, "rb") as target:
-                if target.read() != data:
-                    raise OSError("Conflicting run init at destination")
-    finally:
-        try:
-            os.remove(temp_path)
-        except FileNotFoundError:
-            pass
+    # The marker ties the published init to this source and allows later
+    # fragments to reuse it without a routine network readback. Existing
+    # unmarked inits are adopted only after an exceptional content check.
+    from viseron.components.storage.run_init_prototype import ensure_init
+
+    ensure_init(source_init, destination_dir, adopt_existing=True)
+    require_tier_markers(source_init, tier_markers)
+    require_tier_markers(destination_init, tier_markers)
 
 
 def move_file(
