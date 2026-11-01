@@ -141,9 +141,13 @@ def run() -> int:
         lines.extend([f"#EXTINF:{end - start:.6f},", uri(path)])
         previous_end = end
     lines.append("#EXT-X-ENDLIST")
-    if args.output.exists():
-        raise SystemExit(f"Output exists: {args.output}")
-    args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        # Exclusive creation also rejects dangling symlinks and closes the
+        # race between checking the path and writing the playlist.
+        with args.output.open("x", encoding="utf-8") as output:
+            output.write("\n".join(lines) + "\n")
+    except FileExistsError as error:
+        raise SystemExit(f"Output exists: {args.output}") from error
     print(
         "Warning: init association is assumed from the directory, not verified.",
         file=sys.stderr,
