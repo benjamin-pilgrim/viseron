@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -48,3 +49,46 @@ def test_rejects_symlink_init(fragment, tmp_path):
     init.symlink_to(target)
     with pytest.raises(OSError):
         extract_run_thumbnail(str(fragment), RUN)
+
+
+def test_offline_command_recovers_a_jpeg(fragment, tmp_path):
+    output = tmp_path / "recovered.jpg"
+    result = subprocess.run(
+        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+         "--run-id", RUN, "--output", str(output)],
+        capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert output.read_bytes().startswith(b"\xff\xd8")
+
+
+@pytest.mark.parametrize("occupied", ["file", "symlink"])
+def test_offline_command_preserves_existing_output(fragment, tmp_path, occupied):
+    output = tmp_path / "recovered.jpg"
+    target = tmp_path / "original.jpg"
+    target.write_bytes(b"original")
+    if occupied == "symlink":
+        output.symlink_to(target)
+    else:
+        output.write_bytes(b"original")
+    result = subprocess.run(
+        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+         "--run-id", RUN, "--output", str(output)],
+        capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert output.read_bytes() == b"original"
+    assert target.read_bytes() == b"original"
+    assert not list(tmp_path.glob(".viseron-thumbnail-*"))
+
+
+def test_offline_command_leaves_no_output_without_run_init(fragment, tmp_path):
+    (fragment.parent / "init.mp4").unlink()
+    output = tmp_path / "recovered.jpg"
+    result = subprocess.run(
+        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+         "--run-id", RUN, "--output", str(output)],
+        capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert not output.exists()

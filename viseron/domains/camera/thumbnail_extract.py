@@ -64,3 +64,35 @@ def extract_run_thumbnail(segment: str, expected_run: str, *, timeout: float = 3
     if result.returncode or not result.stdout.startswith(b"\xff\xd8"):
         raise ValueError("Could not decode thumbnail from recorder run")
     return result.stdout
+
+
+def main() -> int:
+    """Recover a preview to a new file without changing the recording database."""
+    import argparse  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("segment", help="absolute path of a run's m4s fragment")
+    parser.add_argument("--run-id", required=True, help="expected recorder run ID")
+    parser.add_argument("--output", required=True, type=Path, help="new JPEG path")
+    args = parser.parse_args()
+    temporary = None
+    try:
+        jpeg = extract_run_thumbnail(args.segment, args.run_id)
+        fd, temporary = tempfile.mkstemp(prefix=".viseron-thumbnail-", dir=args.output.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(jpeg)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, args.output, follow_symlinks=False)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(f"Thumbnail recovery failed: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
