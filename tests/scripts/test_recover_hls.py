@@ -127,6 +127,24 @@ class RecoveryTest(unittest.TestCase):
         assert "No init.mp4" in result.stderr
         assert not self.output.exists()
 
+    def test_refuses_dangling_output_symlink(self):
+        """Recovery never creates or overwrites a symlink target."""
+        target = self.root / "unrelated.m3u8"
+        self.output.symlink_to(target)
+        result = self.run_recovery(self.a)
+        assert result.returncode != 0
+        assert "Output exists" in result.stderr
+        assert not target.exists()
+        assert self.output.is_symlink()
+
+    def test_refuses_existing_output(self):
+        """A previous recovery or other file remains unchanged."""
+        self.output.write_text("keep me")
+        result = self.run_recovery(self.a)
+        assert result.returncode != 0
+        assert "Output exists" in result.stderr
+        assert self.output.read_text() == "keep me"
+
     def test_gap_and_truncated_segment_are_reported(self):
         """Report missing and truncated media while retaining good fragments."""
         segments = sorted(self.a.glob("*.m4s"))
