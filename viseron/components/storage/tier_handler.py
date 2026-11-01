@@ -12,12 +12,13 @@ import stat
 import threading
 import time
 from datetime import timedelta
+from functools import partial
 from queue import Queue
 from threading import Timer
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from apscheduler.jobstores.base import JobLookupError
-from sqlalchemy import Delete, delete, func, select, update
+from sqlalchemy import Delete, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import NoResultFound, SQLAlchemyError
 from watchdog.events import (
@@ -161,6 +162,25 @@ def _src_path(event: FileSystemEvent) -> str:
     given as bytes. Viseron always schedules str paths, so it is always a str.
     """
     return cast("str", event.src_path)
+
+
+class _EventRetentionBatch:
+    """Release one event batch only after all source changes have committed."""
+
+    def __init__(self, paths: set[str], on_complete: Callable[[], None]) -> None:
+        self._paths = paths.copy()
+        self._on_complete = on_complete
+        self._lock = threading.Lock()
+
+    def completed(self, path: str) -> None:
+        """Coalesce repeated and concurrently delivered commit acknowledgements."""
+        with self._lock:
+            if path not in self._paths:
+                return
+            self._paths.remove(path)
+            finished = not self._paths
+        if finished:
+            self._on_complete()
 
 
 class TierHandler(FileSystemEventHandler):
@@ -1169,6 +1189,7 @@ class TierHandler(FileSystemEventHandler):
                             )
                         self._schedule_journal_retry(src_path)
                     elif pending is not None:
+                        completed_pending = None
                         with self._storage.pending_moves_lock:
                             source_path = record["source_snapshot"]["source"]
                             if (
@@ -1178,6 +1199,12 @@ class TierHandler(FileSystemEventHandler):
                                 and pending_moves.get(source_path) is pending
                             ):
                                 pending_moves.pop(source_path, None)
+                                completed_pending = pending
+                        if (
+                            completed_pending is not None
+                            and completed_pending.on_complete is not None
+                        ):
+                            completed_pending.on_complete()
         except BlockingIOError:
             self._logger.debug("Publication busy; retrying %s", src_path)
             self._schedule_journal_retry(src_path)
@@ -1409,6 +1436,9 @@ class TierHandler(FileSystemEventHandler):
             session.execute(stmt)
             session.commit()
 
+        if pending_move is not None and pending_move.on_complete is not None:
+            pending_move.on_complete()
+
         self._vis.dispatch_event(
             EVENT_FILE_DELETED.format(
                 camera_identifier=self._camera.identifier,
@@ -1636,6 +1666,7 @@ class SegmentsTierHandler(TierHandler):
         get_session: Callable[[], Session],
         data: np.ndarray,
         events_next_tier: SegmentsTierHandler | None,
+        on_complete: Callable[[str], None] | None = None,
     ) -> list[int]:
         # A file can be in multiple recordings, so we need to keep track of which
         # files we have already processed using processed_paths
@@ -1668,6 +1699,11 @@ class SegmentsTierHandler(TierHandler):
                 file["tier_path"],
                 self._logger,
                 force_delete=force_delete,
+                on_complete=(
+                    partial(on_complete, str(file["path"]))
+                    if on_complete is not None
+                    else None
+                ),
             )
             processed_paths.append(file["path"])
             files_processed += 1
@@ -1707,6 +1743,7 @@ class SegmentsTierHandler(TierHandler):
         data: np.ndarray,
         events_next_tier: SegmentsTierHandler | None,
         continuous_next_tier: SegmentsTierHandler | None,
+        on_complete: Callable[[str], None] | None = None,
     ) -> list[int]:
         # A file can be in multiple recordings, so we need to keep track of which
         # files we have already processed using processed_paths
@@ -1760,6 +1797,11 @@ class SegmentsTierHandler(TierHandler):
                 file["tier_path"],
                 self._logger,
                 force_delete=force_delete,
+                on_complete=(
+                    partial(on_complete, str(file["path"]))
+                    if on_complete is not None
+                    else None
+                ),
             )
             processed_paths.append(file["path"])
             files_processed += 1
@@ -1767,12 +1809,43 @@ class SegmentsTierHandler(TierHandler):
 
     def _check_tier(self, get_session: Callable[[], Session], data: np.ndarray) -> None:
         events_next_tier = None
-        recording_ids: list[int] = []
+        recording_ids = (
+            sorted(
+                {int(row["recording_id"]) for row in data if row["recording_id"] >= 0}
+            )
+            if self._events_enabled
+            else []
+        )
+        paths = {
+            str(row["path"])
+            for row in data
+            if self._events_enabled and row["recording_id"] >= 0
+        }
+
+        def schedule_completion() -> None:
+            # Commit callbacks can run under a publication lock. Queue the
+            # finalization so asset checks never perform remote I/O under it.
+            if not getattr(self, "_tier_check_stopping", False):
+                try:
+                    self._vis.background_scheduler.add_job(
+                        self._complete_event_retention,
+                        args=[get_session, recording_ids, paths, events_next_tier],
+                    )
+                except RuntimeError:
+                    self._logger.warning(
+                        "Could not schedule event finalization; keeping metadata",
+                        exc_info=True,
+                    )
+
+        batch = (
+            _EventRetentionBatch(paths, schedule_completion) if recording_ids else None
+        )
+        on_complete = batch.completed if batch is not None else None
         if self._events_enabled and not self.continuous_enabled:
             events_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "events"
             )
-            recording_ids = self._handle_events(get_session, data, events_next_tier)
+            self._handle_events(get_session, data, events_next_tier, on_complete)
         elif self.continuous_enabled and not self._events_enabled:
             continuous_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "continuous"
@@ -1785,8 +1858,57 @@ class SegmentsTierHandler(TierHandler):
             continuous_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "continuous"
             )
-            recording_ids = self._handle_events_and_continuous(
-                get_session, data, events_next_tier, continuous_next_tier
+            self._handle_events_and_continuous(
+                get_session, data, events_next_tier, continuous_next_tier, on_complete
+            )
+
+    def _complete_event_retention(
+        self,
+        get_session: Callable[[], Session],
+        recording_ids: list[int],
+        paths: set[str],
+        events_next_tier: SegmentsTierHandler | None,
+    ) -> None:
+        """Finalize only committed segment batches belonging to ended events."""
+        if getattr(self, "_tier_check_stopping", False):
+            return
+        with get_session() as session:
+            # A stale or early callback cannot retire an event whose source
+            # rows still exist, including a new publication at the same path.
+            if session.execute(
+                select(Files.id).where(Files.path.in_(paths)).limit(1)
+            ).first():
+                return
+            remaining_source = (
+                select(Files.id)
+                .where(
+                    Files.camera_identifier == Recordings.camera_identifier,
+                    Files.tier_id == self._tier_id,
+                    Files.category == TIER_CATEGORY_RECORDER,
+                    Files.subcategory == TIER_SUBCATEGORY_SEGMENTS,
+                    Files.orig_ctime < Recordings.end_time,
+                    or_(
+                        Files.duration.is_(None),
+                        Files.orig_ctime
+                        + func.make_interval(0, 0, 0, 0, 0, 0, Files.duration)
+                        >= Recordings.adjusted_start_time,
+                    ),
+                    or_(
+                        Recordings.recorder_run_id.is_(None),
+                        Files.directory.endswith("/" + Recordings.recorder_run_id),
+                    ),
+                )
+                .exists()
+            )
+            recording_ids = list(
+                session.execute(
+                    select(Recordings.id).where(
+                        Recordings.id.in_(recording_ids),
+                        Recordings.camera_identifier == self._camera.identifier,
+                        Recordings.end_time.is_not(None),
+                        ~remaining_source,
+                    )
+                ).scalars()
             )
 
         # Signal to the thumbnail tier that the recording has been moved
@@ -1821,7 +1943,11 @@ class SegmentsTierHandler(TierHandler):
         if recording_ids and events_next_tier is None:
             self._logger.debug("Deleting recordings: %s", recording_ids)
             with get_session() as _session:
-                stmt = delete(Recordings).where(Recordings.id.in_(recording_ids))
+                stmt = delete(Recordings).where(
+                    Recordings.id.in_(recording_ids),
+                    Recordings.camera_identifier == self._camera.identifier,
+                    Recordings.end_time.is_not(None),
+                )
                 _session.execute(stmt)
                 _session.commit()
 
@@ -2085,6 +2211,7 @@ def handle_file(
     logger: logging.Logger,
     *,
     force_delete: bool = False,
+    on_complete: Callable[[], None] | None = None,
 ) -> None:
     """Move file if there is a succeeding tier, else delete the file."""
     if not storage.tier_available(path):
@@ -2120,6 +2247,8 @@ def handle_file(
                     path,
                     logger,
                 )
+            elif item.error is None and on_complete is not None:
+                on_complete()
 
         try:
             delete_file(storage, path, callback=on_delete)
@@ -2157,6 +2286,7 @@ def handle_file(
                 new_path,
                 next_tier[CONFIG_PATH],
                 logger,
+                on_complete=on_complete,
             )
 
     # Delete the file from the database if:
@@ -2249,6 +2379,8 @@ def move_file(
     dst: str,
     dst_tier_path: str,
     logger: logging.Logger,
+    *,
+    on_complete: Callable[[], None] | None = None,
 ) -> None:
     """Move file from src to dst.
 
@@ -2276,7 +2408,10 @@ def move_file(
                 file_key=res.file_key,
             )
             pending_move = PendingMove(
-                dst=dst, tier_id=curr_tier_id + 1, tier_path=dst_tier_path
+                dst=dst,
+                tier_id=curr_tier_id + 1,
+                tier_path=dst_tier_path,
+                on_complete=on_complete,
             )
             with storage.pending_moves_lock:
                 if src in storage.pending_moves:

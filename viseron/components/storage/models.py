@@ -186,6 +186,7 @@ class PendingMove:
     dst: str
     tier_id: int
     tier_path: str
+    on_complete: Callable[[], None] | None = None
 
 
 class TriggerTypes(Enum):

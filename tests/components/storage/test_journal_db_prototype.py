@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 from sqlalchemy import select
 from watchdog.events import FileCreatedEvent
 from viseron.components.storage.check_tier import move_file
-from viseron.components.storage.models import Files
+from viseron.components.storage.models import Files, PendingMove
 from viseron.components.storage.pending_journal import (
     marker_for_path,
     prepare,
@@ -181,11 +181,29 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         get_session=get_db_session,
         tier_available=lambda _: True,
     )
-    pending = SimpleNamespace(
-        dst=str(dest), tier_id=1, tier_path=str(dest.parent.parent.parent)
+    completed = Mock()
+
+    def acknowledged():
+        with get_db_session() as session:
+            assert session.execute(
+                select(Files).where(Files.path == str(src))
+            ).scalar_one_or_none() is None
+            assert session.execute(
+                select(Files.file_key).where(Files.path == str(dest))
+            ).scalar_one() == 42
+        completed()
+
+    pending = PendingMove(
+        dst=str(dest),
+        tier_id=1,
+        tier_path=str(dest.parent.parent.parent),
+        on_complete=acknowledged,
     )
-    newer_pending = SimpleNamespace(
-        dst=str(dest), tier_id=1, tier_path=str(dest.parent.parent.parent)
+    newer_pending = PendingMove(
+        dst=str(dest),
+        tier_id=1,
+        tier_path=str(dest.parent.parent.parent),
+        on_complete=Mock(),
     )
     handler._storage.pending_moves = {str(src): pending}
     handler._storage.pending_moves_lock = threading.Lock()
@@ -325,6 +343,8 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
             is not None
         )
 
+    completed.assert_not_called()
+
     def replace_during_release(*args, **kwargs):
         result = real_release(*args, **kwargs)
         if replace_pending and result == "released":
@@ -339,8 +359,11 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         handler._on_created(event)
     if replace_pending:
         assert handler._storage.pending_moves[str(src)] is newer_pending
+        completed.assert_not_called()
     else:
         assert str(src) not in handler._storage.pending_moves
+        completed.assert_called_once()
+    newer_pending.on_complete.assert_not_called()
     with get_db_session() as session:
         row = session.execute(select(Files).where(Files.path == str(dest))).scalar_one()
         assert row.file_key == 42

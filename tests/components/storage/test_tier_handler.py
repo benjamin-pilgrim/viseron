@@ -10,11 +10,11 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import numpy as np
 import pytest
-from sqlalchemy import event, insert, select, text
+from sqlalchemy import delete, event, insert, select, text, update
 from sqlalchemy.exc import NoResultFound
 from watchdog.events import FileCreatedEvent, FileDeletedEvent
 
@@ -126,6 +126,7 @@ def test_handle_file_move(mock_move_file: Mock, vis: MockViseron) -> None:
     storage = MagicMock()
     session = MagicMock()
     logger = MagicMock()
+    completed = Mock()
     handle_file(
         vis,
         session,
@@ -139,6 +140,7 @@ def test_handle_file_move(mock_move_file: Mock, vis: MockViseron) -> None:
         tier_1_file,
         "/tmp/tier1/",
         logger,
+        on_complete=completed,
     )
     mock_move_file.assert_called_once_with(
         vis,
@@ -152,6 +154,7 @@ def test_handle_file_move(mock_move_file: Mock, vis: MockViseron) -> None:
         tier_2_file,
         "/tmp/tier2/",
         logger,
+        on_complete=completed,
     )
 
 
@@ -330,8 +333,8 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                         ]
                     ),
                 ),
-                2,
                 3,
+                1,
             ),
             (
                 _get_tier_config(events=True, continuous=True),
@@ -359,8 +362,8 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                         ]
                     ),
                 ),
-                2,
                 3,
+                1,
             ),
             (
                 _get_tier_config(events=False, continuous=True),
@@ -542,9 +545,16 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
             }
         }
 
-        with patch(
-            "viseron.components.storage.tier_handler.handle_file"
-        ) as mock_handle_file:
+        with (
+            patch(
+                "viseron.components.storage.tier_handler.handle_file"
+            ) as mock_handle_file,
+            patch.object(
+                vis.background_scheduler,
+                "add_job",
+                side_effect=lambda func, **kwargs: func(*kwargs["args"]),
+            ),
+        ):
             data = np.array(
                 [
                     (
@@ -576,7 +586,30 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 "/tmp/",
                 tier_handlers[0]._logger,
                 force_delete=force_delete,
+                on_complete=ANY,
             )
+            thumbnail_tier_handler.move_thumbnail.assert_not_called()
+            recordings_tier_handler.move_event_clip.assert_not_called()
+            completed = mock_handle_file.call_args.kwargs["on_complete"]
+            if completed is not None:
+                # Simulate the committed source handoff before acknowledging it.
+                with self._get_db_session() as session:
+                    source_rows = (
+                        Files.camera_identifier == "test",
+                        Files.tier_id == 0,
+                        Files.category == TIER_CATEGORY_RECORDER,
+                        Files.subcategory == TIER_SUBCATEGORY_SEGMENTS,
+                    )
+                    if next_tier_index is None:
+                        session.execute(delete(Files).where(*source_rows))
+                    else:
+                        session.execute(
+                            update(Files)
+                            .where(*source_rows)
+                            .values(tier_id=next_tier_index)
+                        )
+                    session.commit()
+                completed()
             if move_thumbnail_called:
                 thumbnail_tier_handler.move_thumbnail.assert_called_once_with(
                     1, tier_handlers[next_tier_index].tier if next_tier_index else None
