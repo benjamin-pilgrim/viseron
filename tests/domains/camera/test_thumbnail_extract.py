@@ -54,7 +54,7 @@ def test_rejects_symlink_init(fragment, tmp_path):
 def test_offline_command_recovers_a_jpeg(fragment, tmp_path):
     output = tmp_path / "recovered.jpg"
     result = subprocess.run(
-        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+        [sys.executable, "viseron/domains/camera/thumbnail_extract.py", str(fragment),
          "--run-id", RUN, "--output", str(output)],
         capture_output=True, check=False,
     )
@@ -72,7 +72,7 @@ def test_offline_command_preserves_existing_output(fragment, tmp_path, occupied)
     else:
         output.write_bytes(b"original")
     result = subprocess.run(
-        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+        [sys.executable, "viseron/domains/camera/thumbnail_extract.py", str(fragment),
          "--run-id", RUN, "--output", str(output)],
         capture_output=True, check=False,
     )
@@ -86,7 +86,7 @@ def test_offline_command_leaves_no_output_without_run_init(fragment, tmp_path):
     (fragment.parent / "init.mp4").unlink()
     output = tmp_path / "recovered.jpg"
     result = subprocess.run(
-        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+        [sys.executable, "viseron/domains/camera/thumbnail_extract.py", str(fragment),
          "--run-id", RUN, "--output", str(output)],
         capture_output=True, check=False,
     )
@@ -100,7 +100,7 @@ def test_rejects_fifo_without_waiting(fragment):
     fragment.unlink()
     os.mkfifo(fragment)
     result = subprocess.run(
-        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+        [sys.executable, "viseron/domains/camera/thumbnail_extract.py", str(fragment),
          "--run-id", RUN, "--output", str(fragment.parent / "recovered.jpg")],
         capture_output=True, check=False, timeout=5,
     )
