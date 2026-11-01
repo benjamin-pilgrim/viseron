@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import cv2
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.orm import aliased
 
 from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
 from viseron.components.storage.models import Recordings
@@ -139,6 +140,10 @@ class ManualRecording:
     duration: int | None = None
 
 
+class RecordingInProgressError(Exception):
+    """A deletion request includes a recording that is still active."""
+
+
 class RecorderBase:
     """Base recorder."""
 
@@ -152,6 +157,7 @@ class RecorderBase:
         self._vis = vis
         self._config = config
         self._camera = camera
+        self._recording_lock = threading.RLock()
 
         self._storage = vis.data[STORAGE_COMPONENT]
 
@@ -209,15 +215,16 @@ class RecorderBase:
         We dont have to delete the segments as they will be deleted by the tier
         handler the next time it runs.
         """
-        return bool(
-            delete_recordings(
-                self._storage.get_session,
-                self._camera.identifier,
-                utc_offset,
-                date=date,
-                recording_id=recording_id,
+        with self._recording_lock:
+            return bool(
+                delete_recordings(
+                    self._storage.get_session,
+                    self._camera.identifier,
+                    utc_offset,
+                    date=date,
+                    recording_id=recording_id,
+                )
             )
-        )
 
     @property
     @abstractmethod
@@ -235,7 +242,6 @@ class AbstractRecorder(ABC, RecorderBase):
 
         self.is_recording = False
         self._active_recording: Recording | None = None
-        self._recording_lock = threading.RLock()
 
         create_directory(self._camera.event_clips_folder)
         create_directory(self._camera.segments_folder)
@@ -676,17 +682,25 @@ def delete_recordings(
 
     Returns the deleted recordings so that they can be deleted from disk.
     """
-    stmt = (
-        delete(Recordings)
-        .where(Recordings.camera_identifier == camera_identifier)
-        .returning(Recordings)
-    )
+    conditions = [Recordings.camera_identifier == camera_identifier]
+    active = aliased(Recordings)
+    active_conditions = [active.camera_identifier == camera_identifier, active.end_time.is_(None)]
     if date:
-        stmt = stmt.where(func.date(Recordings.start_time.local(utc_offset)) == date)
+        conditions.append(func.date(Recordings.start_time.local(utc_offset)) == date)
+        active_conditions.append(func.date(active.start_time.local(utc_offset)) == date)
     if recording_id:
-        stmt = stmt.where(Recordings.id == recording_id)
+        conditions.append(Recordings.id == recording_id)
+        active_conditions.append(active.id == recording_id)
     with get_session() as session:
+        active_query = select(active.id).where(*active_conditions)
+        stmt = (
+            delete(Recordings)
+            .where(*conditions, ~active_query.exists())
+            .returning(Recordings)
+        )
         _deleted_recordings = session.execute(stmt).scalars().all()
+        if not _deleted_recordings and session.execute(active_query.limit(1)).first():
+            raise RecordingInProgressError
         session.commit()
     return _deleted_recordings
 
