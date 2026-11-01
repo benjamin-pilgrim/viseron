@@ -290,3 +290,22 @@ class TestRecordingsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
                 method="DELETE",
             )
             assert response.code == 500
+
+    def test_delete_active_recording_returns_conflict(self):
+        """An active event blocks a deletion request without a server error."""
+        from viseron.domains.camera.recorder import RecordingInProgressError
+
+        mock_camera = MockCamera(identifier="test")
+        mock_camera.recorder = MagicMock()
+        mock_camera.recorder.delete_recording.side_effect = RecordingInProgressError()
+        with patch(
+            "viseron.components.webserver.request_handler.ViseronRequestHandler"
+            "._get_camera", return_value=mock_camera,
+        ):
+            for path in (
+                "/api/v1/recordings/test/1",
+                "/api/v1/recordings/test/2024-06-22",
+                "/api/v1/recordings/test",
+            ):
+                response = self.fetch(path, method="DELETE")
+                assert response.code == 409

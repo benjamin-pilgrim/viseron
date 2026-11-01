@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 def test_manual_delete_waits_until_recording_ends(get_db_session):
     """Deleting a recording must not remove an event still in progress."""
+    from viseron.domains.camera.recorder import RecordingInProgressError
+
     now = datetime.datetime.now(datetime.timezone.utc)
     with get_db_session() as session:
         event = Recordings(
@@ -48,9 +50,10 @@ def test_manual_delete_waits_until_recording_ends(get_db_session):
         session.add(event)
         session.commit()
         event_id = event.id
-    assert not delete_recordings(
-        get_db_session, "cam", datetime.timedelta(), recording_id=event_id
-    )
+    with pytest.raises(RecordingInProgressError):
+        delete_recordings(
+            get_db_session, "cam", datetime.timedelta(), recording_id=event_id
+        )
     with get_db_session() as session:
         event = session.get(Recordings, event_id)
         assert event is not None
@@ -61,6 +64,81 @@ def test_manual_delete_waits_until_recording_ends(get_db_session):
             get_db_session, "cam", datetime.timedelta(), recording_id=event_id
         )
     ) == 1
+
+
+def test_bulk_delete_preserves_all_events_if_any_is_active(get_db_session):
+    """A rejected bulk request must not silently remove only some events."""
+    from viseron.domains.camera.recorder import RecordingInProgressError
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_session() as session:
+        session.add_all(
+            [
+                Recordings(camera_identifier="cam", start_time=now,
+                           adjusted_start_time=now, end_time=now),
+                Recordings(camera_identifier="cam", start_time=now,
+                           adjusted_start_time=now, end_time=None),
+            ]
+        )
+        session.commit()
+    with pytest.raises(RecordingInProgressError):
+        delete_recordings(get_db_session, "cam", datetime.timedelta())
+    with get_db_session() as session:
+        assert len(session.query(Recordings).filter_by(camera_identifier="cam").all()) == 2
+
+
+def test_delete_serializes_with_recorder_stop(vis, get_db_session):
+    """Deletion waits for the stop transition, including work after DB end time."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_session() as session:
+        event = Recordings(
+            camera_identifier="cam", start_time=now, adjusted_start_time=now, end_time=None
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+    recorder = object.__new__(ConcreteTestRecorder)
+    RecorderBase.__init__(
+        recorder, vis, {CONFIG_RECORDER: {CONFIG_CREATE_EVENT_CLIP: False}},
+        MockCamera(identifier="cam"),
+    )
+    recorder._storage = MagicMock(get_session=get_db_session)
+    recording = MagicMock(id=event_id)
+    recorder._active_recording = recording
+    stop_entered, allow_stop = threading.Event(), threading.Event()
+    started, finished = threading.Event(), threading.Event()
+    result = []
+
+    def slow_stop(_recording):
+        stop_entered.set()
+        assert allow_stop.wait(5)
+
+    recorder._stop = slow_stop
+
+    def delete():
+        started.set()
+        result.append(
+            recorder.delete_recording(datetime.timedelta(), recording_id=event_id)
+        )
+        finished.set()
+
+    stopping = threading.Thread(target=recorder.stop, args=(recording,))
+    stopping.start()
+    try:
+        assert stop_entered.wait(5)
+        with get_db_session() as session:
+            assert session.get(Recordings, event_id).end_time is not None
+        worker = threading.Thread(target=delete)
+        worker.start()
+        assert started.wait(5)
+        assert not finished.wait(0.2)
+    finally:
+        allow_stop.set()
+        stopping.join(5)
+    worker.join(5)
+    assert not stopping.is_alive()
+    assert finished.is_set() and result == [True]
+
 
 @pytest.fixture(scope="function")
 def get_db_session_recordings(get_db_session: Callable[[], Session]):
