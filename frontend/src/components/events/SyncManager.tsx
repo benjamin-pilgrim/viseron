@@ -240,6 +240,8 @@ function SyncManager({ children }: SyncManagerProps) {
           bufferingSince.current.delete(player.current);
           return;
         }
+        // A user-initiated seek takes precedence over synchronization.
+        if (hasPendingSeek(player.current, state.seekGeneration)) return;
         // Give transient buffering time to resolve before seeking, and avoid
         // repeatedly disrupting a camera while its network is unavailable.
         const buffering = media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
@@ -259,17 +261,18 @@ function SyncManager({ children }: SyncManagerProps) {
             1000
           : Infinity;
         if (
-          drift > MAX_DRIFT &&
-          drift < HARD_SEEK_DRIFT &&
+          Math.abs(drift) > MAX_DRIFT &&
+          Math.abs(drift) < HARD_SEEK_DRIFT &&
           !media.paused &&
           !buffering
         ) {
-          const correctedRate = state.playbackSpeed * (1 + RATE_NUDGE_FRACTION);
+          const correctedRate =
+            state.playbackSpeed * (1 + Math.sign(drift) * RATE_NUDGE_FRACTION);
           noteSeekPlaybackRate(player.current, correctedRate);
           media.playbackRate = correctedRate;
           return;
         }
-        if (drift <= MAX_DRIFT && !media.paused && !buffering) return;
+        if (Math.abs(drift) <= MAX_DRIFT && !media.paused && !buffering) return;
         const correctionTimes = buffering
           ? lastBufferCorrection
           : lastCorrection;
