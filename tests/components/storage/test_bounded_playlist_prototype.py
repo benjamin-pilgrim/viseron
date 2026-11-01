@@ -7,7 +7,7 @@ from viseron.domains.camera.fragmenter_process import FragmenterWork, _filename_
 
 RUN='20261031T143215.482000Z-a7c93e12ab34'
 
-def test_expired_playlist_entry_is_preserved_without_fabricating_pdt(tmp_path, caplog):
+def test_expired_playlist_entry_is_preserved_without_fabricating_pdt(tmp_path, caplog, monkeypatch):
     stage=tmp_path/'stage'; run=stage/RUN; run.mkdir(parents=True)
     subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc2=size=96x96:rate=10',
                     '-t','15','-c:v','libx264','-g','10','-f','hls','-hls_time','1','-hls_list_size','2',
@@ -19,10 +19,15 @@ def test_expired_playlist_entry_is_preserved_without_fabricating_pdt(tmp_path, c
     assert playlist.count('#EXTINF:')==2 and files[0].name not in playlist
     worker=FragmenterWork('cam',str(stage),str(tmp_path/'segments'/'cam'),None,None,None)
     worker._send_files_metadata=Mock()
+    now=[100.0]
+    monkeypatch.setattr('viseron.domains.camera.fragmenter_process.time.monotonic',lambda:now[0])
     with caplog.at_level('WARNING'):
         worker._handle_m4s(f'{RUN}/{files[0].name}')
+        assert not caplog.records
+        now[0]=131.0
+        worker._handle_m4s(f'{RUN}/{files[0].name}')
     worker._send_files_metadata.assert_not_called()
-    assert 'unindexed in persistent staging' in caplog.text
+    assert 'unindexed in staging' in caplog.text
     assert _filename_duration(files[0].name) == 1.0
     assert files[0].exists()
     assert not (tmp_path/'segments'/'cam'/RUN/files[0].name).exists()
@@ -68,12 +73,35 @@ def test_missing_timestamp_warning_is_coalesced_and_repeats(tmp_path, caplog, mo
     (run/'index.m3u8').write_text('#EXTM3U\n')
     worker=FragmenterWork('cam',str(stage),str(tmp_path/'segments'/'cam'),None,None,None)
     now=[100.0]
-    worker._missing_timing_count=5
     monkeypatch.setattr('viseron.domains.camera.fragmenter_process.time.monotonic',lambda:now[0])
     filename=f'{RUN}/000000000-1760000000-0000001000000.m4s'
     with caplog.at_level('WARNING'):
         worker._handle_m4s(filename); worker._handle_m4s(filename)
+        assert len(caplog.records)==0
+        now[0]=130.0; worker._handle_m4s(filename)
         assert len(caplog.records)==1
-        assert '5 staged fragments' in caplog.text and filename in caplog.text
-        now[0]=160.0; worker._handle_m4s(filename)
+        assert filename in caplog.text and 'configured storage' in caplog.text
+        now[0]=190.0; worker._handle_m4s(filename)
         assert len(caplog.records)==2
+
+
+def test_timing_arriving_within_grace_is_processed_without_warning(tmp_path, caplog, monkeypatch):
+    stage=tmp_path/'stage'; run=stage/RUN; run.mkdir(parents=True)
+    name='000000000-1760000000-0000001000000.m4s'
+    (run/name).write_bytes(b'fragment')
+    playlist=run/'index.m3u8'; playlist.write_text('#EXTM3U\n')
+    worker=FragmenterWork('cam',str(stage),str(tmp_path/'segments'/'cam'),None,None,None)
+    worker._send_files_metadata=Mock()
+    worker._move_to_segments_folder=Mock()
+    now=[100.0]
+    monkeypatch.setattr('viseron.domains.camera.fragmenter_process.time.monotonic',lambda:now[0])
+    filename=f'{RUN}/{name}'
+    with caplog.at_level('WARNING'):
+        worker._handle_m4s(filename)
+        playlist.write_text('#EXTM3U\n#EXTINF:1.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n'+name+'\n')
+        now[0]=105.0
+        worker._handle_m4s(filename)
+    assert not caplog.records
+    assert filename not in worker._first_missing_timing
+    worker._send_files_metadata.assert_called_once()
+    worker._move_to_segments_folder.assert_called_once()

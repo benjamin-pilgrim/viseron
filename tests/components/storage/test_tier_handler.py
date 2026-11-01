@@ -1637,6 +1637,101 @@ def test_missing_move_metadata_does_not_schedule_deletion_or_move(
     assert not storage.pending_moves
 
 
+@pytest.mark.parametrize(
+    ("source_present", "destination_present", "destination_indexed", "warn"),
+    [
+        (False, True, True, False),
+        (True, True, True, True),
+        (False, False, True, True),
+        (False, True, False, True),
+        (False, True, "wrong-camera", True),
+    ],
+)
+def test_stale_move_selection_requires_an_indexed_destination(
+    vis, get_db_session, tmp_path, caplog,
+    source_present, destination_present, destination_indexed, warn,
+):
+    """A completed move is quiet; uncertain or unindexed data still warns."""
+    src = tmp_path / "local" / "run" / "one.m4s"
+    dst = tmp_path / "nas" / "run" / "one.m4s"
+    src.parent.mkdir(parents=True)
+    dst.parent.mkdir(parents=True)
+    if source_present:
+        src.write_bytes(b"source footage")
+    if destination_present:
+        dst.write_bytes(b"destination footage")
+    if destination_indexed:
+        with get_db_session() as session:
+            record = Files(
+                tier_id=1, tier_path=str(tmp_path / "nas"),
+                camera_identifier=(
+                    "other_camera" if destination_indexed == "wrong-camera" else "test"
+                ), category="recorder", subcategory="segments",
+                path=str(dst), directory=str(dst.parent), filename=dst.name,
+                size=19, duration=5.0, orig_ctime=utcnow(),
+            )
+            session.add(record)
+            session.commit()
+    storage = Mock(spec=Storage)
+    storage.temporary_files_meta = {}
+    storage.pending_moves = {}
+    storage.pending_moves_lock = threading.Lock()
+    with caplog.at_level(logging.WARNING):
+        move_file(
+            vis, storage, get_db_session, "test", 0, "recorder", "segments",
+            str(src), str(dst), str(tmp_path / "nas"), logging.getLogger(__name__),
+        )
+    assert ("source metadata is missing" in caplog.text) is warn
+    assert src.exists() is source_present
+    assert dst.exists() is destination_present
+    storage.tier_check_worker_send_command.assert_not_called()
+
+
+def test_tier_selection_can_outlive_a_completed_move(vis, get_db_session, tmp_path, caplog):
+    """A batch selected before promotion can be processed after it commits."""
+    local, nas = tmp_path / "local", tmp_path / "nas"
+    src, dst = local / "run" / "one.m4s", nas / "run" / "one.m4s"
+    src.parent.mkdir(parents=True)
+    dst.parent.mkdir(parents=True)
+    src.write_bytes(b"recording")
+    with get_db_session() as session:
+        row = Files(
+            tier_id=0, tier_path=str(local), camera_identifier="test",
+            category="recorder", subcategory="segments", path=str(src),
+            directory=str(src.parent), filename=src.name, size=9, duration=5.0,
+            orig_ctime=utcnow(),
+        )
+        session.add(row)
+        session.commit()
+        selected = np.array(
+            [(row.path, row.tier_path)], dtype=[("path", "U512"), ("tier_path", "U512")]
+        )
+        src.rename(dst)
+        row.path, row.directory, row.tier_path, row.tier_id = (
+            str(dst), str(dst.parent), str(nas), 1
+        )
+        session.commit()
+
+    storage = Mock(spec=Storage)
+    storage.temporary_files_meta = {}
+    storage.pending_moves = {}
+    storage.pending_moves_lock = threading.Lock()
+    storage.file_batch_size = 100
+    storage.tier_available.return_value = True
+    storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+    handler = TierHandler.__new__(TierHandler)
+    handler._vis, handler._storage = vis, storage
+    handler._camera = Mock(identifier="test")
+    handler._tier_id, handler._category, handler._subcategory = 0, "recorder", "segments"
+    handler._tier, handler._next_tier = {"path": str(local)}, {"path": str(nas)}
+    handler._logger = logging.getLogger(__name__)
+    with caplog.at_level(logging.WARNING):
+        handler._check_tier(get_db_session, selected)
+    assert "source metadata is missing" not in caplog.text
+    assert dst.read_bytes() == b"recording"
+    storage.tier_check_worker_send_command.assert_not_called()
+
+
 def test_deferred_move_clears_own_state_and_schedules_source_retry(
     vis: MockViseron, tmp_path: Path
 ) -> None:

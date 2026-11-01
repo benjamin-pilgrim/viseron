@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
 TIMELAPSE_FFMPEG_TIMEOUT = 10
+MISSING_TIMING_GRACE_SECONDS = 30
 
 
 def _get_open_files(path: str, process: psutil.Process) -> list[str]:
@@ -198,7 +199,7 @@ class FragmenterWork(ChildProcessWork):
         self._last_fragment: str | None = None
         self._last_recent: str | None = None
         self._last_missing_timestamp_warning: float | None = None
-        self._missing_timing_count = 0
+        self._first_missing_timing: dict[str, float] = {}
         self._last_reaped_run: str | None = None
 
     @property
@@ -236,6 +237,14 @@ class FragmenterWork(ChildProcessWork):
                 )
             )
         ]
+        # Forget resolved or removed entries rather than keeping a per-file
+        # timer for the lifetime of the camera.
+        staged = set(mp4s)
+        self._first_missing_timing = {
+            name: first_seen
+            for name, first_seen in self._first_missing_timing.items()
+            if name in staged
+        }
         if cmd == "fragment" and mp4s:
             # Keep current playlist entries moving even if old unindexed
             # fragments accumulate. Revisit one old item per pass to report it.
@@ -263,7 +272,6 @@ class FragmenterWork(ChildProcessWork):
                     recent.append(name)
                 else:
                     retained.append(name)
-            self._missing_timing_count = len(retained)
             batch: list[str] = []
             if recent:
                 start = next(
@@ -792,19 +800,23 @@ class FragmenterWork(ChildProcessWork):
                 program_date_time = None
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 now = time.monotonic()
+                first_seen = self._first_missing_timing.setdefault(file, now)
                 if (
-                    self._last_missing_timestamp_warning is None
-                    or now - self._last_missing_timestamp_warning >= 60  # noqa: PLR2004
+                    now - first_seen >= MISSING_TIMING_GRACE_SECONDS
+                    and (
+                        self._last_missing_timestamp_warning is None
+                        or now - self._last_missing_timestamp_warning >= 60  # noqa: PLR2004
+                    )
                 ):
                     self._logger.warning(
-                        "Playlist timing unavailable for %s staged fragments "
-                        "(for example %s); retaining them and init unindexed in "
-                        "persistent staging. Filename wall times are approximate, not exact.",  # noqa: E501
-                        max(1, self._missing_timing_count),
+                        "Playlist timing remains unavailable for staged fragment %s; "
+                        "retaining it and its init unindexed in staging. "
+                        "Staging durability depends on its configured storage.",
                         file,
                     )
                     self._last_missing_timestamp_warning = now
                 return
+            self._first_missing_timing.pop(file, None)
             if extinf is None:
                 extinf = _filename_duration(name)
             if extinf:

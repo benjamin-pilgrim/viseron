@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import stat
 import threading
 import time
 from datetime import timedelta
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from apscheduler.jobstores.base import JobLookupError
 from sqlalchemy import Delete, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy.exc import NoResultFound, SQLAlchemyError
 from watchdog.events import (
     FileCreatedEvent,
     FileDeletedEvent,
@@ -2284,6 +2285,30 @@ def move_file(
                 storage.temporary_files_meta[dst] = file_meta
                 storage.pending_moves[src] = pending_move
     except NoResultFound:
+        # A previously selected batch can outlive another completed move. Only
+        # downgrade the warning when the old file is absent and the expected
+        # destination is both indexed for this camera/tier and present on disk.
+        try:
+            try:
+                os.lstat(src)
+            except FileNotFoundError:
+                with get_session() as session:
+                    destination = session.execute(
+                        select(Files).where(
+                            Files.path == dst,
+                            Files.camera_identifier == camera_identifier,
+                            Files.category == curr_tier_category,
+                            Files.subcategory == curr_tier_subcategory,
+                            Files.tier_id == curr_tier_id + 1,
+                            Files.tier_path == dst_tier_path,
+                        )
+                    ).scalar_one_or_none()
+                    if destination is not None and stat.S_ISREG(os.lstat(dst).st_mode):
+                        logger.debug("Move already completed for %s", src)
+                        return
+        except (OSError, SQLAlchemyError):
+            # An unavailable destination is not evidence of a completed move.
+            pass
         logger.warning(
             "Cannot move %s: source metadata is missing; leaving the file in place",
             src,
