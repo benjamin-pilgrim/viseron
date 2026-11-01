@@ -679,6 +679,7 @@ def delete_recordings(
     stmt = (
         delete(Recordings)
         .where(Recordings.camera_identifier == camera_identifier)
+        .where(Recordings.end_time.is_not(None))
         .returning(Recordings)
     )
     if date:

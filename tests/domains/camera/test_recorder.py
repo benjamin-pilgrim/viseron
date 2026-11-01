@@ -35,6 +35,33 @@ if TYPE_CHECKING:
     from viseron import Viseron
 
 
+def test_manual_delete_waits_until_recording_ends(get_db_session):
+    """Deleting a recording must not remove an event still in progress."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_session() as session:
+        event = Recordings(
+            camera_identifier="cam",
+            start_time=now,
+            adjusted_start_time=now,
+            end_time=None,
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+    assert not delete_recordings(
+        get_db_session, "cam", datetime.timedelta(), recording_id=event_id
+    )
+    with get_db_session() as session:
+        event = session.get(Recordings, event_id)
+        assert event is not None
+        event.end_time = now + datetime.timedelta(seconds=1)
+        session.commit()
+    assert len(
+        delete_recordings(
+            get_db_session, "cam", datetime.timedelta(), recording_id=event_id
+        )
+    ) == 1
+
 @pytest.fixture(scope="function")
 def get_db_session_recordings(get_db_session: Callable[[], Session]):
     """Fixture to test recordings with timezone edge cases."""
