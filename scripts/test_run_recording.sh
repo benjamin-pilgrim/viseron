@@ -22,6 +22,19 @@ mtx="${suffix}-mtx"
 pod="${suffix}-pod"
 port=${VISERON_TEST_RTSP_PORT:-29474}
 mode=${VISERON_TEST_TIMESTAMP_MODE:-wallclock}
+browser_check=${VISERON_TEST_BROWSER_CHECK:-0}
+http_port=${VISERON_TEST_HTTP_PORT:-29475}
+frontend_dir=${VISERON_TEST_FRONTEND_DIR:-}
+pod_ports=(-p "127.0.0.1:$port:8554/tcp")
+frontend_mount=()
+if [[ "$browser_check" == 1 ]]; then
+  [[ "$frontend_dir" = /* && -f "$frontend_dir/index.html" ]] || {
+    echo 'Set VISERON_TEST_FRONTEND_DIR to an absolute path containing a built frontend' >&2; exit 2;
+  }
+  command -v node >/dev/null || { echo 'Node.js is required for the browser check' >&2; exit 2; }
+  pod_ports+=(-p "127.0.0.1:$http_port:8888/tcp")
+  frontend_mount=(-v "$frontend_dir:/src/viseron/frontend:ro")
+fi
 [[ "$mode" == wallclock || "$mode" == source ]] || { echo "Invalid timestamp mode" >&2; exit 2; }
 cleanup() {
   [[ -z ${publisher:-} ]] || kill -CONT "$publisher" 2>/dev/null || true
@@ -58,7 +71,7 @@ ffmpeg:
         continuous_recording: true
 ${mode_config}
 CONFIG
-podman pod create --name "$pod" -p "127.0.0.1:$port:8554/tcp" >/dev/null
+podman pod create --name "$pod" "${pod_ports[@]}" >/dev/null
 podman run -d --pod "$pod" --name "$mtx" -e MTX_HLS=no "$rtsp_image" >/dev/null
 # Retry publisher startup because MediaMTX needs time to listen.
 (
@@ -69,7 +82,7 @@ podman run -d --pod "$pod" --name "$mtx" -e MTX_HLS=no "$rtsp_image" >/dev/null
 ) > "$root/publisher.log" 2>&1 &
 publisher=$!
 podman run -d --pod "$pod" --name "$app" -e S6_KILL_GRACETIME=3000 \
-  -v "$repo/viseron:/src/viseron:ro" \
+  -v "$repo/viseron:/src/viseron:ro" "${frontend_mount[@]}" \
   -v "$root/config:/config" -v "$root/segments:/segments" \
   -v "$root/recordings:/recordings" -v "$root/snapshots:/snapshots" \
   -v "$root/thumbnails:/thumbnails" -v "$root/event_clips:/event_clips" \
@@ -203,6 +216,9 @@ for _ in range(30):
 else:
     raise SystemExit(f'FAIL: nginx run-init route did not become ready: {last_error}')
 PYTHON
+if [[ "$browser_check" == 1 ]]; then
+  node "$repo/scripts/test_recording_browser.cjs" "$repo" "http://127.0.0.1:$http_port"
+fi
 find "$run1" -maxdepth 1 -type f \( -name init.mp4 -o -name '*.m4s' \) -print0 | sort -z | xargs -0 sha256sum > "$root/pre-restart.sha256"
 echo "First run: $run1"
 if [[ -n ${VISERON_TEST_DEBUG_PAUSE:-} ]]; then sleep "$VISERON_TEST_DEBUG_PAUSE"; fi
