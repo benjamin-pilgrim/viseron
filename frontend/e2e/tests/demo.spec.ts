@@ -153,3 +153,59 @@ test("plays the mocked events timeline", async ({ page }: { page: Page }) => {
 
   await expect.poll(() => currentTime(video)).toBeGreaterThan(start + 5);
 });
+
+test("selecting an event seeks all camera players without returning to live", async ({
+  page,
+}) => {
+  const today = new Date();
+  const startOfToday = Date.UTC(
+    today.getUTCFullYear(),
+    today.getUTCMonth(),
+    today.getUTCDate(),
+  );
+  const date = new Date(startOfToday - 86400_000).toISOString().slice(0, 10);
+  const timestamp = Math.floor(startOfToday / 1000) - 1;
+  await page.goto(`/#/events?tab=events&date=${date}&timestamp=${timestamp}`, {
+    waitUntil: "domcontentloaded",
+  });
+  const players = page.locator("video");
+  await expect(players).toHaveCount(3);
+  await expect
+    .poll(async () =>
+      players.evaluateAll<boolean, void, HTMLVideoElement>((videos) =>
+        videos.every((video) => video.readyState >= 3 && !video.paused),
+      ),
+    )
+    .toBe(true);
+  const before = await players.evaluateAll<number[], void, HTMLVideoElement>(
+    (videos) => videos.map((video) => video.currentTime),
+  );
+  await page.getByRole("img", { name: "Event snapshot" }).first().click();
+  await expect
+    .poll(
+      async () =>
+        players.evaluateAll<boolean, number[], HTMLVideoElement>(
+          (videos, initial) =>
+            videos.every(
+              (video, index) => video.currentTime < initial[index] - 60,
+            ),
+          before,
+        ),
+      { timeout: 20000 },
+    )
+    .toBe(true);
+  const selected = await players.evaluateAll<number[], void, HTMLVideoElement>(
+    (videos) => videos.map((video) => video.currentTime),
+  );
+  expect(Math.max(...selected) - Math.min(...selected)).toBeLessThan(2);
+  await page.waitForTimeout(4000);
+  const after = await players.evaluateAll<number[], void, HTMLVideoElement>(
+    (videos) => videos.map((video) => video.currentTime),
+  );
+  expect(
+    after.every(
+      (time, index) => time > selected[index] && time < before[index] - 30,
+    ),
+  ).toBe(true);
+  expect(Math.max(...after) - Math.min(...after)).toBeLessThan(2);
+});

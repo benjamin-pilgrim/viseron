@@ -13,6 +13,10 @@ export default defineConfig({
     locale: "en-US",
     timezoneId: "UTC",
     video: "off",
+    launchOptions: {
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH,
+      args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"],
+    },
   },
   expect: {
     timeout: 30000,

@@ -34,12 +34,8 @@ export function observeSeek(
     alignedAtStart: Math.abs(media.currentTime - target) <= 0.5,
     target,
     maxRate: Math.max(1, media.playbackRate),
-    cleanup: () => {
-      media.removeEventListener("seeked", onSeeked);
-      media.removeEventListener("ratechange", onRateChange);
-    },
+    cleanup: () => {},
   };
-  seeks.set(player, seek);
   const onRateChange = () => {
     seek.maxRate = Math.max(seek.maxRate, media.playbackRate);
   };
@@ -59,6 +55,11 @@ export function observeSeek(
       seek.cleanup();
     }
   };
+  seek.cleanup = () => {
+    media.removeEventListener("seeked", onSeeked);
+    media.removeEventListener("ratechange", onRateChange);
+  };
+  seeks.set(player, seek);
   media.addEventListener("seeked", onSeeked);
   media.addEventListener("ratechange", onRateChange);
 }
