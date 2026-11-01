@@ -40,6 +40,40 @@ const { chromium } = requireFrontend("@playwright/test");
       throw new Error(`Expected successful playlist and run-init responses: ${JSON.stringify(mediaResponses)}`);
     }
     console.log(`PASS: browser played ${last.width}x${last.height} video: ${first.time.toFixed(2)} to ${last.time.toFixed(2)} seconds, ${first.frames} to ${last.frames} decoded frames; playlist and run init HTTP 200`);
+    if (process.env.VISERON_TEST_PLAYLIST_RESYNC === "1") {
+      let previousClient;
+      let injected = false;
+      let replacementClient;
+      await page.route("**/api/v1/hls/vertical_camera/index.m3u8**", async (route) => {
+        const client = route.request().headers()["hls-client-id"];
+        if (!injected && client) {
+          previousClient = client;
+          injected = true;
+          await route.fulfill({ status: 410, body: "Playlist changed; reload required" });
+        } else {
+          if (client && previousClient && client !== previousClient) replacementClient = client;
+          await route.continue();
+        }
+      });
+      await page.waitForFunction(() => {
+        const video = document.querySelector("video");
+        return video && !video.paused;
+      });
+      await page.waitForTimeout(1000);
+      const deadline = Date.now() + 45000;
+      while (!replacementClient && Date.now() < deadline) await page.waitForTimeout(250);
+      if (!replacementClient) throw new Error("Playlist recovery did not create a new HLS client");
+      await page.waitForFunction(() => {
+        const video = document.querySelector("video");
+        return video && !video.paused && video.readyState >= 2 && video.videoWidth > 0;
+      }, null, { timeout: 30000 });
+      const resumed = await video.evaluate((v) => ({ time: v.currentTime, frames: v.getVideoPlaybackQuality().totalVideoFrames }));
+      await page.waitForFunction(({ time, frames }) => {
+        const video = document.querySelector("video");
+        return video && video.currentTime > time + 2 && video.getVideoPlaybackQuality().totalVideoFrames > frames;
+      }, resumed, { timeout: 20000 });
+      console.log("PASS: browser recovered from playlist change with a new client and resumed decoding");
+    }
   } finally {
     await browser.close();
   }

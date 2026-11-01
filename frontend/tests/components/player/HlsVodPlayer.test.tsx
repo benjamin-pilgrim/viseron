@@ -25,6 +25,7 @@ vi.mock("hls.js", () => {
     BUFFER_SEEK_OVER_HOLE: "bufferSeekOverHole",
     MANIFEST_LOAD_ERROR: "manifestLoadError",
     LEVEL_LOAD_ERROR: "levelLoadError",
+    LEVEL_PARSING_ERROR: "levelParsingError",
   };
   const ErrorTypes = {
     NETWORK_ERROR: "networkError",
@@ -37,6 +38,8 @@ vi.mock("hls.js", () => {
     levels: any[] = [];
 
     currentLevel = 0;
+
+    url: string | null = null;
 
     // Stores the handlers so tests can invoke them manually.
     handlers: Record<string, (...callbackArgs: any[]) => void> = {};
@@ -55,7 +58,9 @@ vi.mock("hls.js", () => {
       this.media = media;
     });
 
-    loadSource = vi.fn();
+    loadSource = vi.fn((url: string) => {
+      this.url = url;
+    });
 
     startLoad = vi.fn();
 
@@ -139,6 +144,30 @@ beforeEach(() => {
 });
 
 describe("HlsVodPlayer", () => {
+  it("reloads the recording after its playlist changes", () => {
+    vi.useFakeTimers();
+    try {
+      const hls = renderAndPlay();
+      act(() => {
+        hls.handlers.hlsError("hlsError", {
+          type: "networkError",
+          details: "levelLoadError",
+          response: { code: 410 },
+          fatal: true,
+          error: new Error("Playlist changed"),
+        });
+      });
+      expect(hls.stopLoad).toHaveBeenCalled();
+      act(() => vi.advanceTimersByTime(1000));
+      expect(latestHls()).not.toBe(hls);
+      expect(latestHls().loadSource).toHaveBeenCalledWith(
+        mockRecording.hls_url,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["manifestLoadError", "levelLoadError"])(
     "stops playback and reports an unsupported recording on %s conflict",
     (details) => {

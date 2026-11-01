@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from math import ceil
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from viseron.domains.camera import FailedCamera
 
 LOGGER = logging.getLogger(__name__)
+_HLS_CLIENTS_LOCK = threading.RLock()
 
 
 def count_files_removed(
@@ -109,6 +111,10 @@ class HlsClient:
 
 class EventSpansRunsError(Exception):
     """An event playlist would span more than one recorder run."""
+
+
+class PlaylistChangedError(Exception):
+    """A previously published sequence can no longer describe this playlist."""
 
 
 class HlsAPIHandler(BaseAPIHandler):
@@ -204,6 +210,9 @@ class HlsAPIHandler(BaseAPIHandler):
                 "Event playback across camera runs is not supported",
             )
             return
+        except PlaylistChangedError:
+            self.response_error(HTTPStatus.GONE, "Playlist changed; reload required")
+            return
         if not playlist:
             self.response_error(
                 HTTPStatus.NOT_FOUND, f"Recording with id {recording_id} not found"
@@ -230,18 +239,22 @@ class HlsAPIHandler(BaseAPIHandler):
 
         hls_client_id = self.request.headers.get("Hls-Client-Id", None)
         subpath = self.get_subpath()
-        playlist = await self.run_in_executor(
-            _generate_playlist_time_period,
-            self._get_session,
-            camera,
-            hls_client_id,
-            self.utc_offset,
-            self.request_arguments["start_timestamp"],
-            self.request_arguments["end_timestamp"],
-            self.request_arguments["date"],
-            subpath,
-            self.request_arguments["_HLS_skip"] is not None,
-        )
+        try:
+            playlist = await self.run_in_executor(
+                _generate_playlist_time_period,
+                self._get_session,
+                camera,
+                hls_client_id,
+                self.utc_offset,
+                self.request_arguments["start_timestamp"],
+                self.request_arguments["end_timestamp"],
+                self.request_arguments["date"],
+                subpath,
+                self.request_arguments["_HLS_skip"] is not None,
+            )
+        except PlaylistChangedError:
+            self.response_error(HTTPStatus.GONE, "Playlist changed; reload required")
+            return
         if not playlist:
             self.response_error(
                 HTTPStatus.NOT_FOUND, "HLS playlist could not be generated"
@@ -340,6 +353,29 @@ def update_hls_client(
     hls_client = HlsAPIHandler.hls_client_ids.get(hls_client_id, None)
     if hls_client:
         removed = count_files_removed(hls_client.fragments, fragments)
+        previous = hls_client.fragments
+        if previous and not fragments:
+            raise PlaylistChangedError
+        if previous and fragments:
+            previous_ids = {old.identity or old.filename for old in previous}
+            if removed < len(previous):
+                # Prefix eviction and appending are valid. Removing, inserting,
+                # or reordering an already published fragment would reuse a
+                # sequence number for different media.
+                if count_matching_fragments(previous[removed:], fragments) != len(
+                    previous[removed:]
+                ):
+                    raise PlaylistChangedError
+            elif (
+                any(
+                    (new.identity or new.filename) in previous_ids
+                    for new in fragments
+                )
+                or fragments[0].creation_time <= previous[-1].creation_time
+            ):
+                # No prefix overlap is only safe when the new window is wholly
+                # later than the last published segment.
+                raise PlaylistChangedError
         hls_client.discontinuity_sequence += count_removed_discontinuities(
             hls_client.fragments, fragments, removed
         )
@@ -398,20 +434,22 @@ def _render_client_playlist(
     if hls_client_id is None:
         return generate_playlist(fragments, init_file, end=end, file_directive=False)
 
-    hls_client, received = update_hls_client(hls_client_id, fragments)
-    return generate_playlist(
-        fragments,
-        init_file,
-        media_sequence=hls_client.media_sequence,
-        discontinuity_sequence=hls_client.discontinuity_sequence,
-        target_duration=hls_client.target_duration,
-        end=end,
-        file_directive=False,
-        can_skip_until=hls_client.target_duration * HLS_SKIP_BOUNDARY_TARGET_DURATIONS,
-        # The client restores skipped segments from its previous playlist, which
-        # new or evicted clients lack and stale clients only partially have
-        max_skipped_segments=received if skip_requested else 0,
-    )
+    # Requests are generated in executor threads. Keep each client's state
+    # update and rendering together so overlapping requests cannot interleave.
+    with _HLS_CLIENTS_LOCK:
+        hls_client, received = update_hls_client(hls_client_id, fragments)
+        return generate_playlist(
+            fragments,
+            init_file,
+            media_sequence=hls_client.media_sequence,
+            discontinuity_sequence=hls_client.discontinuity_sequence,
+            target_duration=hls_client.target_duration,
+            end=end,
+            file_directive=False,
+            can_skip_until=hls_client.target_duration * HLS_SKIP_BOUNDARY_TARGET_DURATIONS,
+            # The client restores skipped segments from its previous playlist.
+            max_skipped_segments=received if skip_requested else 0,
+        )
 
 
 def _generate_playlist(

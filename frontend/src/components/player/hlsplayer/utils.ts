@@ -77,24 +77,25 @@ export function setupHlsErrorHandling(
   } = options;
 
   let unsupportedRecording = false;
+  let resyncPending = false;
 
   // Reset error state when a fragment is loaded successfully
   hls.on(Hls.Events.FRAG_LOADED, () => {
-    if (!unsupportedRecording) {
+    if (!unsupportedRecording && !resyncPending && hlsRef.current === hls) {
       setHlsRefsError(hlsRef, null);
     }
   });
 
   // Delayed initialization retry for fatal errors
-  const delayedInitialization = () => {
+  const delayedInitialization = (delay = 5000) => {
     if (delayedInitializationTimeoutRef.current) {
       return;
     }
 
     delayedInitializationTimeoutRef.current = setTimeout(() => {
-      onReinitialize();
       delayedInitializationTimeoutRef.current = undefined;
-    }, 5000);
+      if (hlsRef.current === hls) onReinitialize();
+    }, delay);
   };
 
   // Delayed recovery for media errors
@@ -111,6 +112,7 @@ export function setupHlsErrorHandling(
 
   // Main error handler
   hls.on(Hls.Events.ERROR, (_event, data) => {
+    if (hlsRef.current !== hls || resyncPending) return;
     // Recording playlists return 409 when their fragments span camera runs.
     // Stop loading (including live-playlist refreshes) and prevent buffered
     // playback; retrying cannot make this recording compatible.
@@ -138,6 +140,21 @@ export function setupHlsErrorHandling(
       return;
     }
     if (unsupportedRecording) return;
+
+    // A changed playlist cannot safely reuse previously published sequence
+    // numbers. Start a fresh client rather than retrying the incompatible one.
+    if (
+      (data.response?.code === 410 &&
+        (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+          data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR)) ||
+      (data.fatal && data.details === Hls.ErrorDetails.LEVEL_PARSING_ERROR)
+    ) {
+      resyncPending = true;
+      hls.stopLoad();
+      setHlsRefsError(hlsRef, "Recording playlist changed; reconnecting.");
+      delayedInitialization(1000);
+      return;
+    }
 
     // Check if this is an ignorable error
     if (!IGNORABLE_ERROR_DETAILS.has(data.details)) {

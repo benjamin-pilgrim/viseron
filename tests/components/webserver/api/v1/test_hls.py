@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, insert, select, update
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.webserver.api.v1.hls import (
     HlsAPIHandler,
+    PlaylistChangedError,
     _get_init_file,
     count_files_removed,
     update_hls_client,
@@ -64,7 +65,8 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
             response = self.fetch("/api/v1/hls/test/1/index.m3u8")
         assert response.code == 200
         response_string = response.body.decode()
-        assert response_string.count("#EXTINF") == 3
+        # A segment starting at the recording end is outside its interval.
+        assert response_string.count("#EXTINF") == 2
         assert response_string.count("#EXT-X-ENDLIST") == 1
 
     def _fetch_recording_playlist_uris(self) -> list[str]:
@@ -109,7 +111,7 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
 
         uris = self._fetch_recording_playlist_uris()
 
-        assert len(uris) == 3
+        assert len(uris) == 2
         assert set(uris) <= expected_uris
 
     def test_segment_uris_survive_tier_move(self):
@@ -426,6 +428,38 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
         assert second_playlist.count("#EXT-X-MAP") == 1
         assert second_playlist.count("#EXT-X-MEDIA-SEQUENCE:0") == 1
 
+    def test_changed_playlist_requires_a_new_client(self):
+        """An interior deletion cannot reassign already published sequences."""
+        url = self._time_period_url("_HLS_skip=YES")
+        client_id = str(uuid.uuid4())
+        assert self._fetch_playlist(url, self._simulated_now, client_id).code == 200
+        with self._get_db_session() as session:
+            file = session.execute(
+                select(Files)
+                .where(Files.camera_identifier == "test")
+                .where(Files.subcategory == "segments")
+                .order_by(Files.orig_ctime)
+                .offset(5)
+                .limit(1)
+            ).scalar_one()
+            file_id, original_time = file.id, file.orig_ctime
+            file.orig_ctime -= datetime.timedelta(days=7)
+            session.commit()
+        try:
+            assert self._fetch_playlist(url, self._simulated_now, client_id).code == 410
+            assert (
+                self._fetch_playlist(url, self._simulated_now, str(uuid.uuid4())).code
+                == 200
+            )
+        finally:
+            with self._get_db_session() as session:
+                session.execute(
+                    update(Files)
+                    .where(Files.id == file_id)
+                    .values(orig_ctime=original_time)
+                )
+                session.commit()
+
     def test_get_hls_playlist_time_period_skip_after_failed_request(self):
         """Test that a client is only tracked once it has received a playlist."""
         url = self._time_period_url(
@@ -575,7 +609,6 @@ def _named_fragments(names: list[int]) -> list[Fragment]:
         pytest.param([[1, 2, 3]], [1, 2, 3, 4], 3, 0, id="fragments_appended"),
         pytest.param([[1, 2, 3]], [2, 3, 4], 2, 1, id="head_removed"),
         pytest.param([[1, 2, 3]], [4, 5], 0, 3, id="no_overlap"),
-        pytest.param([[1, 2, 3, 4]], [1, 3, 4], 1, 0, id="middle_removed"),
         pytest.param([[1, 2], [2, 3]], [3, 4], 1, 2, id="media_sequence_accumulates"),
     ],
 )
@@ -595,6 +628,24 @@ def test_update_hls_client(
     assert received == expected_received
     assert hls_client.media_sequence == expected_media_sequence
     assert HlsAPIHandler.hls_client_ids[hls_client_id] is hls_client
+
+
+@pytest.mark.parametrize(
+    "current",
+    [[1, 3, 4], [1, 4, 2, 3], [0, 1, 2, 3], [1, 2], [2, 1, 3]],
+    ids=[
+        "middle_removed", "middle_inserted", "head_inserted", "tail_removed", "reordered"
+    ],
+)
+def test_update_hls_client_rejects_changed_published_sequences(current):
+    """A changed timeline must use a fresh client and full playlist."""
+    client_id = str(uuid.uuid4())
+    previous = _named_fragments([1, 2, 3])
+    client, _ = update_hls_client(client_id, previous)
+    with pytest.raises(PlaylistChangedError):
+        update_hls_client(client_id, _named_fragments(current))
+    assert client.fragments == previous
+    assert client.media_sequence == 0
 
 
 def test_count_files_removed_no_files_removed():

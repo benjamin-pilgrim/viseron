@@ -93,6 +93,9 @@ const initializePlayer = (
     delayedInitializationTimeoutRef,
     delayedRecoveryTimeoutRef,
     onReinitialize: () => {
+      const source = hlsRef.current?.url;
+      const resumeTime = videoRef.current?.currentTime;
+      const wasPlaying = videoRef.current ? !videoRef.current.paused : false;
       initializePlayer(
         hlsRef,
         hlsClientIdRef,
@@ -102,6 +105,18 @@ const initializePlayer = (
         delayedInitializationTimeoutRef,
         delayedRecoveryTimeoutRef,
       );
+      if (source && hlsRef.current) {
+        hlsClientIdRef.current = uuidv4();
+        hlsRef.current.once(Hls.Events.MANIFEST_PARSED, () => {
+          const video = videoRef.current;
+          if (!video) return;
+          if (resumeTime !== undefined && Number.isFinite(resumeTime)) {
+            video.currentTime = resumeTime;
+          }
+          if (wasPlaying) video.play().catch(() => {});
+        });
+        hlsRef.current.loadSource(source);
+      }
     },
   });
 };
