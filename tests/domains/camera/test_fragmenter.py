@@ -90,6 +90,19 @@ def test_generate_playlist() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [(0.000056, "0.000056"), (0.000001, "0.000001")],
+)
+def test_generate_playlist_short_duration_is_decimal(duration, expected):
+    """HLS.js must count short fragments before merging delta updates."""
+    fragments = [Fragment("short.m4s", "/test/short.m4s", duration, utcnow())]
+
+    playlist = generate_playlist(fragments, "/test/init.mp4")
+
+    assert f"#EXTINF:{expected}," in playlist
+
+
 PLAYLIST_BASE_TIME = datetime.datetime(2024, 1, 1)
 
 

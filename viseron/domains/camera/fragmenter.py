@@ -11,6 +11,7 @@ import subprocess as sp
 import threading
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
@@ -438,7 +439,9 @@ def generate_playlist(
             tzinfo=datetime.timezone.utc
         ).isoformat(timespec="milliseconds")
         playlist.append(f"#EXT-X-PROGRAM-DATE-TIME:{program_date_time}")
-        playlist.append(f"#EXTINF:{fragment.duration},")
+        # HLS requires decimal notation. Scientific notation can make clients
+        # drop a short fragment and misalign every subsequent media sequence.
+        playlist.append(f"#EXTINF:{Decimal(str(fragment.duration)):f},")
         playlist.append(_get_file_path(fragment.path, file_directive))
         prev_fragment = fragment
     if end:
