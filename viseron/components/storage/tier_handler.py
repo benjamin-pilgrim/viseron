@@ -7,6 +7,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import timedelta
@@ -1981,7 +1982,7 @@ class EventClipTierHandler(TierHandler):
         """Initialize event clips tier."""
         self._path = get_event_clips_path(self._tier, self._camera)
         self.add_file_handler(
-            self._path, rf"{self._path}/(.*.{self._camera.identifier}$)"
+            self._path, rf"{re.escape(self._path)}/(.*\.{re.escape(self._camera.extension)}$)"
         )
 
     def check_tier(self, *, force: bool = False) -> bool:  # noqa: ARG002
