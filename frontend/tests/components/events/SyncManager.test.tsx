@@ -778,3 +778,35 @@ it("retains an already-aligned advancing seek without a seeked event", async () 
   );
   expect(media.currentTime).toBeGreaterThan(16);
 });
+
+it("ignores an error from a player that has been replaced", () => {
+  const player = makePlayer(1_700_000_020_000);
+  const replacement = makePlayer(1_700_000_020_000);
+  const other = makePlayer(1_700_000_020_000);
+  useHlsStore.setState({ hlsRefs: [player, other] });
+  useReferencePlayerStore.setState({ isPlaying: true });
+  render(
+    <SyncManager>
+      <div>players</div>
+    </SyncManager>,
+  );
+  const handler = vi
+    .mocked(player.current.on)
+    .mock.calls.find(
+      ([event]) => event === Hls.Events.ERROR,
+    )![1] as unknown as (
+    event: string,
+    data: { details: string; fatal: boolean },
+  ) => void;
+  player.current = replacement.current;
+  act(() =>
+    handler(Hls.Events.ERROR, { details: "unexpected-error", fatal: true }),
+  );
+  expect(replacement.current.media!.pause).not.toHaveBeenCalled();
+  player.current = null!;
+  expect(() =>
+    act(() =>
+      handler(Hls.Events.ERROR, { details: "unexpected-error", fatal: true }),
+    ),
+  ).not.toThrow();
+});

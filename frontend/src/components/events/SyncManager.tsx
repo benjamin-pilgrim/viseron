@@ -476,6 +476,9 @@ function SyncManager({ children }: SyncManagerProps) {
       if (player.current) {
         const instance = player.current;
         const handler = (_event: Events.ERROR, data: ErrorData) => {
+          // An old instance can emit an error before React detaches this
+          // listener. Never let it control a replacement (or removed) player.
+          if (player.current !== instance) return;
           // A delayed HLS error must not undo an explicit user pause.
           if (!useReferencePlayerStore.getState().isPlaying) return;
           // hls.js normally aborts obsolete fragment loads during a seek.
