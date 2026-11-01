@@ -38,7 +38,7 @@ def extract_run_thumbnail(segment: str, expected_run: str, *, timeout: float = 3
         pinned = os.fstat(run_fd)
         with tempfile.TemporaryFile() as media:
             for name in ("init.mp4", path.name):
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=run_fd)
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=run_fd)
                 with os.fdopen(fd, "rb") as inp:
                     before = os.fstat(inp.fileno())
                     if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:

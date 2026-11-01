@@ -92,3 +92,17 @@ def test_offline_command_leaves_no_output_without_run_init(fragment, tmp_path):
     )
     assert result.returncode != 0
     assert not output.exists()
+
+
+def test_rejects_fifo_without_waiting(fragment):
+    import os
+
+    fragment.unlink()
+    os.mkfifo(fragment)
+    result = subprocess.run(
+        [sys.executable, "-m", "viseron.domains.camera.thumbnail_extract", str(fragment),
+         "--run-id", RUN, "--output", str(fragment.parent / "recovered.jpg")],
+        capture_output=True, check=False, timeout=5,
+    )
+    assert result.returncode != 0
+    assert not (fragment.parent / "recovered.jpg").exists()
