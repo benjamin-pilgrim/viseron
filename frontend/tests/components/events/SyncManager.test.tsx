@@ -445,6 +445,90 @@ describe("multi-camera playback", () => {
     ).toBeGreaterThan(1_700_000_020);
     expect(fresh.current.media!.currentTime).toBeGreaterThan(20);
   });
+  it("brings an old camera back after another camera completes a backward seek", async () => {
+    vi.useFakeTimers();
+    const fresh = makePlayer(1_700_000_010_000);
+    const stale = makePlayer(1_700_000_060_000);
+    fresh.current.media!.currentTime = 10;
+    const freshEvents = new EventTarget();
+    fresh.current.media!.addEventListener =
+      freshEvents.addEventListener.bind(freshEvents);
+    fresh.current.media!.removeEventListener =
+      freshEvents.removeEventListener.bind(freshEvents);
+    stale.current.media!.currentTime = 60;
+    useHlsStore.setState({ hlsRefs: [fresh, stale] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_050,
+      playingDateRef: { current: 1_700_000_060 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      fresh.current.media!.currentTime = 10;
+      observeSeek(
+        fresh.current,
+        fresh.current.media!,
+        useReferencePlayerStore.getState().seekGeneration,
+        10,
+      );
+      freshEvents.dispatchEvent(new Event("seeked"));
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(useReferencePlayerStore.getState().referencePlayer).toBe(
+      fresh.current,
+    );
+    expect(stale.current.media!.currentTime).toBe(10);
+  });
+
+  it("does not override a second camera's still-pending explicit seek", async () => {
+    vi.useFakeTimers();
+    const fresh = makePlayer(1_700_000_010_000);
+    const stale = makePlayer(1_700_000_060_000);
+    fresh.current.media!.currentTime = 10;
+    const freshEvents = new EventTarget();
+    fresh.current.media!.addEventListener =
+      freshEvents.addEventListener.bind(freshEvents);
+    fresh.current.media!.removeEventListener =
+      freshEvents.removeEventListener.bind(freshEvents);
+    stale.current.media!.currentTime = 11;
+    useHlsStore.setState({ hlsRefs: [fresh, stale] });
+    useReferencePlayerStore.setState({
+      isPlaying: true,
+      playbackSpeed: 1,
+      requestedTimestamp: 1_700_000_050,
+      playingDateRef: { current: 1_700_000_060 },
+    });
+    render(
+      <SyncManager>
+        <div>players</div>
+      </SyncManager>,
+    );
+    await act(async () => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(1_700_000_010);
+      fresh.current.media!.currentTime = 10;
+      observeSeek(
+        fresh.current,
+        fresh.current.media!,
+        useReferencePlayerStore.getState().seekGeneration,
+        10,
+      );
+      freshEvents.dispatchEvent(new Event("seeked"));
+      observeSeek(
+        stale.current,
+        stale.current.media!,
+        useReferencePlayerStore.getState().seekGeneration,
+        11,
+      );
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(stale.current.media!.currentTime).toBe(11);
+  });
   it("does not replace a pending seek and eventually retries if it never completes", async () => {
     vi.useFakeTimers();
     const first = makePlayer(1_700_000_060_000);
