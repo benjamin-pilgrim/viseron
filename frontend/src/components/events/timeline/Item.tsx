@@ -12,11 +12,15 @@ export const itemEqual = (
   prevItem.item.time === nextItem.item.time &&
   prevItem.item.availableTimespan === nextItem.item.availableTimespan &&
   prevItem.item.activityLineVariant === nextItem.item.activityLineVariant &&
-  prevItem.item.timedEvent?.start_timestamp ===
-    nextItem.item.timedEvent?.start_timestamp &&
-  prevItem.item.timedEvent?.end_timestamp ===
-    nextItem.item.timedEvent?.end_timestamp &&
-  prevItem.item.snapshotEvents?.length === nextItem.item.snapshotEvents?.length;
+  prevItem.item.timedEvent === nextItem.item.timedEvent &&
+  (prevItem.item.snapshotEvents === nextItem.item.snapshotEvents ||
+    (prevItem.item.snapshotEvents != null &&
+      nextItem.item.snapshotEvents != null &&
+      prevItem.item.snapshotEvents.length ===
+        nextItem.item.snapshotEvents.length &&
+      prevItem.item.snapshotEvents.every(
+        (event, index) => event === nextItem.item.snapshotEvents?.[index],
+      )));
 
 type ItemProps = {
   item: TimelineItem;
