@@ -85,6 +85,7 @@ import { BLANK_IMAGE } from "lib/helpers";
 import {
   DATE_FORMAT,
   getDayjs,
+  getDayjsFromDateString,
   getDayjsFromUnixTimestamp,
 } from "lib/helpers/dates";
 import * as types from "lib/types";
@@ -392,14 +393,12 @@ export const calculateStart = (date: Dayjs | null) => {
     );
   }
   // Otherwise start at midnight the next day
-  return date.add(1, "day").hour(0).minute(0).second(0).millisecond(0).unix();
+  return getDayjsFromDateString(date.add(1, "day").format(DATE_FORMAT)).unix();
 };
 
 // Calculate the end time of the timeline, called on first render
 export const calculateEnd = (date: Dayjs | null) =>
-  date
-    ? date.clone().hour(0).minute(0).second(0).millisecond(0).unix()
-    : getDayjs().hour(0).minute(0).second(0).millisecond(0).unix();
+  getDayjsFromDateString((date ?? getDayjs()).format(DATE_FORMAT)).unix();
 
 // Calculate the number of items to render in the virtual list
 export const calculateItemCount = (
