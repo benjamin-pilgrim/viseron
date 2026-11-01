@@ -517,7 +517,7 @@ export const getTimelineItems = (
   availableTimespansData: types.HlsAvailableTimespan[],
   filters: Filters,
 ) => {
-  let timelineItems: TimelineItems = {};
+  const timelineItems: TimelineItems = {};
 
   const filteredEvents = eventsData.filter(
     (event) => filters.eventTypes[event.type].checked,
@@ -528,16 +528,16 @@ export const getTimelineItems = (
     const indexEnd = calculateIndexFromTime(startRef, timespan.start);
     const indexStart = calculateIndexFromTime(startRef, timespan.end);
 
-    timelineItems = {
-      ...timelineItems,
-      ...createActivityLineItem(
+    Object.assign(
+      timelineItems,
+      createActivityLineItem(
         startRef,
         indexStart,
         indexEnd,
         true,
         "availableTimespan",
       ),
-    };
+    );
   });
 
   // Loop over events where type is motion or recording
@@ -559,16 +559,16 @@ export const getTimelineItems = (
         cameraEvent.end_timestamp,
       );
 
-      timelineItems = {
-        ...timelineItems,
-        ...createActivityLineItem(
+      Object.assign(
+        timelineItems,
+        createActivityLineItem(
           startRef,
           indexStart,
           indexEnd,
           cameraEvent,
           "timedEvent",
         ),
-      };
+      );
     });
 
   filteredEvents
