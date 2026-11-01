@@ -82,6 +82,7 @@ RECORDINGS_DTYPE = np.dtype(
         ("end_time", np.int64),
         ("created_at", np.int64),
         ("recorder_run_id", "U64"),
+        ("active", np.bool_),
     ]
 )
 
@@ -621,6 +622,7 @@ def load_recordings(
                 int(row.end_time.timestamp() if row.end_time else utcnow().timestamp()),
                 int(row.created_at.timestamp()),
                 row.recorder_run_id or "",
+                row.end_time is None,
             )
             for row in result
         ]
@@ -885,7 +887,8 @@ def get_recordings_to_move(
         bytes_indices_to_move_recordings.size > 0
         or age_indices_to_move_recordings.size > 0
     ):
-        # If drain is set, move all files
+        # Active events remain protected even when a tier is draining.
+        recording_indices_to_move = np.flatnonzero(~recordings_data["active"])
         files_to_move_np = recordings_files
     else:
         # Indices of recordings_data that need to be moved
@@ -894,6 +897,9 @@ def get_recordings_to_move(
                 (bytes_indices_to_move_recordings, age_indices_to_move_recordings)
             )
         )
+        recording_indices_to_move = recording_indices_to_move[
+            ~recordings_data["active"][recording_indices_to_move]
+        ]
 
         files_to_move_list = []
 
@@ -920,6 +926,16 @@ def get_recordings_to_move(
 
         # Convert list of structured array rows to a new array
         files_to_move_np = np.array(files_to_move_list, dtype=RECORDINGS_FILES_DTYPE)
+
+    # A fragment shared with any retained event cannot be moved on behalf of
+    # an eligible event. Check the associations before deduplicating by file.
+    if files_to_move_np.size:
+        selected_ids = recordings_data[recording_indices_to_move]["id"]
+        protected = recordings_files[
+            (recordings_files["recording_id"] >= 0)
+            & ~np.isin(recordings_files["recording_id"], selected_ids)
+        ]["id"]
+        files_to_move_np = files_to_move_np[~np.isin(files_to_move_np["id"], protected)]
 
     # Ensure unique files by ID, taking the first occurrence after sorting
     if files_to_move_np.size > 0:

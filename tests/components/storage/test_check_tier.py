@@ -293,7 +293,7 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
+        assert len(files_to_move) == 11
         assert files_to_move[0]["recording_id"] == -1
         assert files_to_move[0]["id"] == 1
         assert files_to_move[1]["recording_id"] == 1
@@ -369,7 +369,7 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
+        assert len(files_to_move) == 11
         assert files_to_move[0]["recording_id"] == -1
         assert files_to_move[0]["id"] == 1
         assert files_to_move[1]["recording_id"] == 1
@@ -455,7 +455,7 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
+        assert len(files_to_move) == 11
         assert files_to_move[0]["recording_id"] == -1
         assert files_to_move[0]["id"] == 1
         assert files_to_move[1]["recording_id"] == 1
@@ -470,14 +470,10 @@ class TestCheckTier(BaseTestWithRecordings):
         assert files_to_move[5]["id"] == 11
         assert files_to_move[6]["recording_id"] == 3
         assert files_to_move[6]["id"] == 13
-        assert files_to_move[7]["recording_id"] == 3
-        assert files_to_move[7]["id"] == 15
-        assert files_to_move[8]["recording_id"] == 3
-        assert files_to_move[8]["id"] == 17
-        assert files_to_move[9]["recording_id"] == -1
-        assert files_to_move[9]["id"] == 23
-        assert files_to_move[12]["recording_id"] == -1
-        assert files_to_move[12]["id"] == 29
+        assert files_to_move[7]["recording_id"] == -1
+        assert files_to_move[7]["id"] == 23
+        assert files_to_move[10]["recording_id"] == -1
+        assert files_to_move[10]["id"] == 29
 
     def test_recordings_to_move_query_active_recording(self) -> None:
         """Test recordings_to_move_query where end_time is not set."""
@@ -494,10 +490,13 @@ class TestCheckTier(BaseTestWithRecordings):
             tier_id=0,
             camera_identifier="test",
         )
-        recordings_data = load_recordings(
-            get_session=self._get_db_session,
-            camera_identifier="test",
-        )
+        with patch(
+            "viseron.components.storage.check_tier.utcnow", return_value=self._simulated_now
+        ):
+            recordings_data = load_recordings(
+                get_session=self._get_db_session,
+                camera_identifier="test",
+            )
         files_to_move = get_recordings_to_move(
             recordings_data=recordings_data,
             files_data=files_data,
@@ -507,10 +506,52 @@ class TestCheckTier(BaseTestWithRecordings):
             max_age_timestamp=0,
             min_bytes=0,
             file_min_age_timestamp=self._simulated_now.timestamp(),
-            drain=False,
+            drain=True,
         )
 
-        assert len(files_to_move) == 13
+        # Every fragment from the active event's lookback onward is protected,
+        # even when the tier is draining.
+        assert not any(
+            row["id"] in {3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29}
+            for row in files_to_move
+        )
+
+    def test_eligible_event_does_not_move_fragment_shared_with_retained_event(self) -> None:
+        """Old-event retention leaves a shared segment for the newer event."""
+        with self._get_db_session() as session:
+            session.execute(
+                update(Recordings).where(Recordings.id == 3).values(
+                    adjusted_start_time=self._now + datetime.timedelta(seconds=7),
+                    start_time=self._now + datetime.timedelta(seconds=10),
+                    end_time=self._now + datetime.timedelta(seconds=20),
+                    created_at=self._now + datetime.timedelta(seconds=60),
+                )
+            )
+            session.commit()
+        files = load_tier(
+            get_session=self._get_db_session,
+            category="recorder",
+            subcategories=["segments"],
+            tier_id=0,
+            camera_identifier="test",
+        )
+        recordings = load_recordings(
+            get_session=self._get_db_session, camera_identifier="test"
+        )
+        selected = get_recordings_to_move(
+            recordings_data=recordings,
+            files_data=files,
+            segment_length=5,
+            max_bytes=0,
+            min_age_timestamp=self._simulated_now.timestamp(),
+            min_bytes=0,
+            max_age_timestamp=(self._now + datetime.timedelta(seconds=20)).timestamp(),
+            file_min_age_timestamp=self._simulated_now.timestamp(),
+            drain=False,
+        )
+        ids = {int(item["id"]) for item in selected}
+        assert 3 in ids  # Only the older event covers the 5-second fragment.
+        assert 5 not in ids  # The 10-second fragment is shared with the newer event.
 
     def test_recordings_to_move_query_file_min_age_timestamp(self) -> None:
         """Test recordings_to_move_query using file_min_age_timestamp.
@@ -1461,7 +1502,7 @@ def test_recording_retention_matches_recorder_run():
         dtype=FILES_DTYPE,
     )
     for run_id, expected in [(run_b, {1: -1, 2: 7}), ("", {1: 7, 2: 7})]:
-        recordings = np.array([(7, 100, 90, 110, 100, run_id)], dtype=RECORDINGS_DTYPE)
+        recordings = np.array([(7, 100, 90, 110, 100, run_id, False)], dtype=RECORDINGS_DTYPE)
         result = get_recordings_to_move(
             recordings, files.copy(), 5, 1, 200, 0, 0, 200, False
         )
