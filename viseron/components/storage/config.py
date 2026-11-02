@@ -292,7 +292,10 @@ _TIER_SCHEMA_RECORDER = vol.Schema(
                 "Maximum age (e.g. 30d) and aggregate tier size (e.g. 3TB); "
                 "either limit may be omitted."
             ),
-        ): {str: int},
+        ): {
+            vol.Optional("max_age"): int,
+            vol.Optional("max_size"): vol.Any(int, str),
+        },
         vol.Optional(
             "on_full",
             description=(

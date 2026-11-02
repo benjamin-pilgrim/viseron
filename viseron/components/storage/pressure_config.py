@@ -3,10 +3,13 @@
 import copy
 import math
 import re
+from decimal import Decimal
 
 import voluptuous as vol
 
 from viseron.components.storage.util import calculate_age, calculate_bytes
+
+PERCENT_SCALE = 100
 
 POLICIES = ("oldest_first", "ordinary_first", "preserve_events")
 
@@ -26,6 +29,41 @@ def _limit(value, units):
     if not math.isfinite(number) or number <= 0 or number != int(number):
         raise vol.Invalid("Retention limits must be positive whole base units")
     return int(number)
+
+
+def _size_limit(value):
+    if isinstance(value, str) and value.strip().endswith("%"):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)%\s*", value)
+        if not match:
+            raise vol.Invalid("Percentage size limits need a number followed by %")
+        number = Decimal(match[1])
+        if not 0 < number <= PERCENT_SCALE:
+            raise vol.Invalid(
+                "Percentage size limits must be greater than 0 and at most 100"
+            )
+        return f"{number.normalize():f}%"
+    return _limit(
+        value,
+        {
+            "kb": 1000,
+            "mb": 1000**2,
+            "gb": 1000**3,
+            "tb": 1000**4,
+            "kib": 1024,
+            "mib": 1024**2,
+            "gib": 1024**3,
+            "tib": 1024**4,
+        },
+    )
+
+
+def resolve_size_limit(value: int | str, capacity: int) -> int:
+    """Resolve percentages from total filesystem capacity in its storage worker."""
+    if isinstance(value, str):
+        if capacity <= 0:
+            raise ValueError("Cannot resolve a percentage without filesystem capacity")
+        return max(1, int(Decimal(value.removesuffix("%")) * capacity / PERCENT_SCALE))
+    return value
 
 
 def normalize_tier(value):
@@ -48,19 +86,7 @@ def normalize_tier(value):
         if normalized["max_age"] % 60:
             raise vol.Invalid("max_age must be a whole number of minutes")
     if "max_size" in retention:
-        normalized["max_size"] = _limit(
-            retention["max_size"],
-            {
-                "kb": 1000,
-                "mb": 1000**2,
-                "gb": 1000**3,
-                "tb": 1000**4,
-                "kib": 1024,
-                "mib": 1024**2,
-                "gib": 1024**3,
-                "tib": 1024**4,
-            },
-        )
+        normalized["max_size"] = _size_limit(retention["max_size"])
     # A normalized camera override may pass through the schema twice.
     for kind in ("continuous", "events"):
         expected = {}

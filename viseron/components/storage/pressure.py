@@ -14,6 +14,7 @@ from viseron.components.storage.asset_moves import asset_locks, asset_move_pendi
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.pending_journal import protected_by_pending, sync_dir
+from viseron.components.storage.pressure_config import resolve_size_limit
 from viseron.components.storage.run_lifecycle import camera_lock, is_run_directory
 from viseron.components.storage.source_move_intent import source_move_pending
 from viseron.components.storage.util import require_tier_markers
@@ -236,7 +237,7 @@ def reclaim(config, get_session, *, free_space=None):
             or os.statvfs(probe).f_favail >= initial.f_files * fraction
         )
 
-    maximum = config.get("max_size", 0)
+    maximum = resolve_size_limit(config.get("max_size", 0), capacity)
     with get_session() as session:
         used, staged = _usage(config, session)
         trigger_free = target_free if config.get("reclaim") else start_free

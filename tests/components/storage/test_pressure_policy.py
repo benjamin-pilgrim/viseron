@@ -21,6 +21,7 @@ from viseron.components.storage.check_tier import Worker
 from viseron.components.storage.config import TIER_SCHEMA_RECORDER
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.pressure import reclaim
+from viseron.components.storage.pressure_config import resolve_size_limit
 from viseron.components.storage.pressure_manager import PressureManager
 from viseron.components.storage.storage_subprocess import DataItem
 from viseron.components.storage.util import calculate_age, calculate_bytes
@@ -468,3 +469,47 @@ def test_healthy_promotion_gets_time_before_eviction_and_failure_allows_fallback
     assert not manager._can_reclaim("root", config, 116)
     manager.promotion_failed.add("root")
     assert manager._can_reclaim("root", config, 116)
+
+
+@pytest.mark.parametrize("value,expected", [("80%", "80%"), (" 80.5% ", "80.5%")])
+def test_percentage_budget_survives_camera_override_validation(value, expected):
+    """Percentages stay relative until the storage worker probes its filesystem."""
+    tier = TIER_SCHEMA_RECORDER(
+        {"path": "/recordings", "retention": {"max_size": value}}
+    )
+    assert tier["retention"]["max_size"] == expected
+    assert TIER_SCHEMA_RECORDER(tier) == tier
+
+
+@pytest.mark.parametrize("value", ["0%", "-1%", "100.1%", "NaN%", "80%%"])
+def test_invalid_percentage_budget_is_rejected(value):
+    """Do not silently disable a malformed relative storage budget."""
+    with pytest.raises(vol.Invalid):
+        TIER_SCHEMA_RECORDER({"path": "/recordings", "retention": {"max_size": value}})
+
+
+def test_percentage_budget_uses_total_capacity_and_tracks_resize(
+    get_db_session, tmp_path, monkeypatch
+):
+    """A resized filesystem changes the shared budget, not the free-space ratio."""
+    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    oldest = _record(get_db_session, tmp_path, "one", now, 4500)
+    newest = _record(
+        get_db_session, tmp_path, "two", now + datetime.timedelta(seconds=10), 4500
+    )
+    filesystem = SimpleNamespace(
+        f_blocks=20000, f_frsize=1, f_bavail=5000, f_files=0, f_favail=0
+    )
+    monkeypatch.setattr(pressure.os, "statvfs", lambda _path: filesystem)
+    config = _configuration(tmp_path, "oldest_first", ("one", "two"), maximum="80%")
+    assert reclaim(config, get_db_session)["deleted"] == 0
+    filesystem.f_blocks = 10000
+    assert reclaim(config, get_db_session)["deleted"] == 1
+    assert not oldest.exists()
+    assert newest.exists()
+
+
+def test_percentage_budget_rejects_unknown_capacity():
+    """Unknown capacity cannot silently turn a percentage budget into unlimited."""
+    with pytest.raises(ValueError, match="filesystem capacity"):
+        resolve_size_limit("80%", 0)

@@ -59,6 +59,9 @@ def main():
         required=True,
         help="Dedicated disposable server; WILL be stopped",
     )
+    parser.add_argument(
+        "--max-size", default="2MiB", help="Shared RAM budget, e.g. 2MiB or 12.5%"
+    )
     parser.add_argument("--http-port", type=int, default=29775)
     parser.add_argument("--rtsp-port", type=int, default=29774)
     parser.add_argument(
@@ -99,7 +102,7 @@ storage:
         check_interval:
           seconds: 3
         retention:
-          max_size: 2MiB
+          max_size: {json.dumps(args.max_size)}
         on_full:
           policy: {args.policy}
       - path: /cifs
@@ -129,6 +132,7 @@ ffmpeg:
         ),
         "packaged": args.packaged,
         "policy": args.policy,
+        "max_size": args.max_size,
         "root": str(root),
         "remote": str(remote),
     }
