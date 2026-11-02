@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from typing import TYPE_CHECKING
 
 import pytest
@@ -56,21 +57,23 @@ def test_capability_env_files_are_boolean(
 
 
 def test_user_abc_present(host: testinfra.host.Host) -> None:
-    """The ``abc`` user must exist with the correct uid.
-
-    The ``video`` group is added dynamically by the container init scripts only
-    if a render device is present, so we only check for membership in that group
-    when /dev/dri exists.
-    """
+    """The runtime user must have the requested uid and usable render devices."""
     user = host.user("abc")
     assert user.exists, "user 'abc' does not exist"
     assert user.uid == os.getuid(), (
         f"user 'abc' has uid {user.uid}, expected {os.getuid()}"
     )
-    # Only assert the 'video' group when a render device was actually mounted
-    # into the container
     if host.file("/dev/dri").exists:
-        assert "video" in user.groups, f"abc not in 'video' group, got {user.groups}"
+        devices = host.run("find /dev/dri -name 'renderD*' -type c")
+        assert devices.rc == 0, devices.stderr
+        for device in devices.stdout.splitlines():
+            # Device groups vary between hosts and rootless UID/GID mappings.
+            # Check the permission the recorder needs, rather than a group name.
+            path = shlex.quote(device)
+            access = host.run(
+                "su - abc -c %s", shlex.quote(f"test -r {path} && test -w {path}")
+            )
+            assert access.rc == 0, f"abc cannot read/write {device}: {access.stderr}"
 
 
 def test_ffmpeg_wrapper_resolves(host: testinfra.host.Host) -> None:
