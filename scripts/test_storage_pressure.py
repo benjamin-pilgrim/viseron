@@ -159,31 +159,58 @@ ffmpeg:
         )
         return result.stdout + result.stderr
 
-    def local_rows():
-        return sql(
-            "select path from files where tier_path='/buffer/' "
-            "and subcategory='segments' order by orig_ctime"
-        ).splitlines()
+    def local_rows(*, event_only=False):
+        if not event_only:
+            return sql(
+                "select path from files where tier_path='/buffer/' "
+                "and subcategory='segments' order by orig_ctime"
+            ).splitlines()
+        return sql("""
+            select f.path from files f
+            where f.tier_path='/buffer/' and f.subcategory='segments'
+            and exists (
+                select 1 from recordings r
+                where r.camera_identifier=f.camera_identifier
+                and r.adjusted_start_time <=
+                    f.orig_ctime + make_interval(secs => f.duration)
+                and (r.end_time is null or r.end_time > f.orig_ctime)
+                and (r.recorder_run_id is null or
+                    right(f.directory, length(r.recorder_run_id) + 1)
+                    = '/' || r.recorder_run_id)
+            )
+            order by f.orig_ctime
+        """).splitlines()
 
     def digest(path):
         return command("podman", "exec", app, "sha256sum", path).split()[0]
 
-    def snapshot_hashes():
-        # Ordinary footage may be evicted between the SQL snapshot and open().
-        # Hash open files in one exec; skip only paths already removed by policy.
+    def snapshot_hashes(*, event_only=False):
+        # Ordinary footage may be evicted between SQL selection and open().
+        # Event-owned footage must already exist at capture as well as afterward.
         code = """import hashlib,json,sys
 result={}
+allow_missing=sys.argv[1] == '1'
 for path in json.load(sys.stdin):
     try:
         with open(path, 'rb') as stream:
             result[path]=hashlib.file_digest(stream, 'sha256').hexdigest()
     except FileNotFoundError:
-        continue
+        if not allow_missing:
+            raise
 print(json.dumps(result))
 """
         result = subprocess.run(
-            ["podman", "exec", "-i", app, "python3", "-c", code],
-            input=json.dumps(local_rows()),
+            [
+                "podman",
+                "exec",
+                "-i",
+                app,
+                "python3",
+                "-c",
+                code,
+                "0" if event_only else "1",
+            ],
+            input=json.dumps(local_rows(event_only=event_only)),
             text=True,
             capture_output=True,
             timeout=10,
@@ -422,7 +449,11 @@ print(json.dumps(result))
                 lambda: "Recording storage /buffer/: blocked" in logs(),
                 timeout=150,
             )
-            preserved = snapshot_hashes()
+            # The buffer also contains ordinary footage from before pre-roll.
+            # That footage may legitimately expire; freeze the event-owned set
+            # before filling RAM, then require every one of those bytes to survive.
+            preserved = snapshot_hashes(event_only=True)
+            evidence["protected_hashes"] = preserved
             assert preserved, "No retained event footage"
             command(
                 "podman",
