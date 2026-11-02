@@ -20,8 +20,8 @@ from apscheduler.jobstores.base import JobLookupError
 
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
-    EVENT_CHECK_TIER,
     CONFIG_TIER_MARKERS,
+    EVENT_CHECK_TIER,
     TIER_CATEGORY_RECORDER,
     TIER_SUBCATEGORY_SEGMENTS,
     CleanupJobNames,
@@ -238,7 +238,14 @@ class Fragmenter:
             return
 
         try:
-            worker.input_queue.put({"cmd": "fragment"}, timeout=1)
+            command = {"cmd": "fragment"}
+            manager = getattr(self._storage, "pressure_manager", None)
+            if (
+                manager is not None
+                and manager.recording_blocked(self._camera.identifier) is True
+            ):
+                command["storage_blocked"] = True
+            worker.input_queue.put(command, timeout=1)
         except queue.Full:
             pass
 

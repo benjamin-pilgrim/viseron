@@ -68,6 +68,7 @@ from viseron.components.storage.models import (
     PendingMove,
     Recordings,
 )
+from viseron.components.storage.pressure_manager import PressureManager
 from viseron.components.storage.storage_subprocess import (
     DataItemDeleteFile,
     DataItemMoveFile,
@@ -92,8 +93,7 @@ from viseron.components.storage.util import (
     tier_markers_available,
 )
 from viseron.const import EVENT_DOMAIN_REGISTERED, VISERON_SIGNAL_STOPPING
-from viseron.domains.camera.const import CONFIG_STORAGE
-from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
+from viseron.domains.camera.const import CONFIG_STORAGE, DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import ComponentNotReady
 from viseron.helpers import utcnow
 from viseron.helpers.logs import StreamToLogger
@@ -323,6 +323,14 @@ class Storage:
                 coalesce=True,
             )
 
+        self.pressure_manager = PressureManager(self)
+        self._pressure_job = vis.background_scheduler.add_job(
+            self.pressure_manager.poll,
+            "interval",
+            seconds=2,
+            max_instances=1,
+            coalesce=True,
+        )
         self._timelapse_segment_encoder = TimelapseSegmentEncoder(
             TIMELAPSE_SEGMENT_CACHE_PATH
         )
@@ -842,6 +850,12 @@ class Storage:
 
     def _shutdown(self) -> None:
         """Shutdown."""
+        self.pressure_manager.stop()
+        if self._pressure_job is not None:
+            try:
+                self._pressure_job.remove()
+            except JobLookupError:
+                pass
         if self._tier_marker_job is not None:
             try:
                 self._tier_marker_job.remove()

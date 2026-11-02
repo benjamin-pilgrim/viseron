@@ -24,9 +24,9 @@ import psutil
 from path import Path
 
 from viseron.components.storage.pending_journal import (
+    marker_for_path,
     prepare,
     publish_or_verify,
-    marker_for_path,
 )
 from viseron.components.storage.run_init_prototype import ensure_init
 from viseron.components.storage.run_lifecycle import (
@@ -36,8 +36,8 @@ from viseron.components.storage.run_lifecycle import (
     reclaim_spool_run,
 )
 from viseron.components.storage.source_move_intent import (
-    source_move_pending,
     prepare_source_intent,
+    source_move_pending,
 )
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX, require_tier_markers
 from viseron.domains.camera.const import MP4BOX_PATH
@@ -201,6 +201,8 @@ class FragmenterWork(ChildProcessWork):
         self._last_missing_timestamp_warning: float | None = None
         self._first_missing_timing: dict[str, float] = {}
         self._last_reaped_run: str | None = None
+        self._storage_blocked = False
+        self._blocked_sequences: dict[str, int] = {}
 
     @property
     def logger_names(self) -> tuple[str, ...]:
@@ -224,6 +226,20 @@ class FragmenterWork(ChildProcessWork):
             f"Checking for new segments to fragment in {self.temp_segments_folder}"
         )
         mp4s = sorted(_get_mp4_files_to_fragment(self.temp_segments_folder))
+        if cmd == "fragment":
+            blocked = item.get("storage_blocked", False)
+            if blocked and not self._storage_blocked:
+                self._blocked_sequences = {}
+                for name in mp4s:
+                    match = _RUN_SEGMENT_NAME.fullmatch(os.path.basename(name))
+                    if match:
+                        run = os.path.dirname(name)
+                        self._blocked_sequences[run] = max(
+                            self._blocked_sequences.get(run, -1), int(match["sequence"])
+                        )
+            if not blocked:
+                self._blocked_sequences.clear()
+            self._storage_blocked = blocked
         # A durable destination journal already owns this source; the watcher
         # reconciler handles it. An intent without a journal is a crashed copy
         # and must remain discoverable for idempotent re-publication.
@@ -733,9 +749,7 @@ class FragmenterWork(ChildProcessWork):
         try:
             if not self._mp4box_command(file):
                 return
-            extinf = _extract_extinf_number(
-                self._read_m3u8_mp4box(file), "clip_1.m4s"
-            )
+            extinf = _extract_extinf_number(self._read_m3u8_mp4box(file), "clip_1.m4s")
             if not extinf:
                 self._logger.error("Failed to get extinf for %s", file)
                 return
@@ -798,15 +812,34 @@ class FragmenterWork(ChildProcessWork):
                     )
             if _RUN_SEGMENT_NAME.fullmatch(name) and expected_identity is None:
                 program_date_time = None
+            match = _RUN_SEGMENT_NAME.fullmatch(name)
+            if (
+                self._storage_blocked
+                and match
+                and program_date_time is not None
+                and int(match["sequence"])
+                > self._blocked_sequences.get(os.path.dirname(file), -1)
+            ):
+                source = os.path.join(self.temp_segments_folder, file)
+                with camera_lock(
+                    "/tmp/viseron-run-locks", os.path.abspath(self.temp_segments_folder)
+                ):
+                    if not source_move_pending(source):
+                        info = os.stat(source, follow_symlinks=False)
+                        if [
+                            info.st_dev,
+                            info.st_ino,
+                            info.st_size,
+                            info.st_mtime_ns,
+                        ] == expected_identity:
+                            os.unlink(source)
+                            return
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
                 now = time.monotonic()
                 first_seen = self._first_missing_timing.setdefault(file, now)
-                if (
-                    now - first_seen >= MISSING_TIMING_GRACE_SECONDS
-                    and (
-                        self._last_missing_timestamp_warning is None
-                        or now - self._last_missing_timestamp_warning >= 60  # noqa: PLR2004
-                    )
+                if now - first_seen >= MISSING_TIMING_GRACE_SECONDS and (
+                    self._last_missing_timestamp_warning is None
+                    or now - self._last_missing_timestamp_warning >= 60  # noqa: PLR2004
                 ):
                     self._logger.warning(
                         "Playlist timing remains unavailable for staged fragment %s; "

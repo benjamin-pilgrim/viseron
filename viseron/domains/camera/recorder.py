@@ -20,6 +20,7 @@ from sqlalchemy.orm import aliased
 
 from viseron.components.storage.const import COMPONENT as STORAGE_COMPONENT
 from viseron.components.storage.models import Recordings
+from viseron.components.storage.pressure import event_fence
 from viseron.components.storage.queries import get_recording_fragments
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX
 from viseron.const import CAMERA_SEGMENT_DURATION
@@ -368,13 +369,13 @@ class AbstractRecorder(ABC, RecorderBase):
     ) -> Recording:
         self._logger.info("Starting recorder")
         self.is_recording = True
-        start_time = utcnow()
         run_id = self._camera.recording_run_id
-        adjusted_start = start_time - datetime.timedelta(
-            seconds=self.lookback + CAMERA_SEGMENT_DURATION
-        )
-
         with self._storage.get_session() as session:
+            event_fence(session, self._camera.identifier)
+            start_time = utcnow()
+            adjusted_start = start_time - datetime.timedelta(
+                seconds=self.lookback + CAMERA_SEGMENT_DURATION
+            )
             stmt = (
                 insert(Recordings)
                 .values(
@@ -388,11 +389,20 @@ class AbstractRecorder(ABC, RecorderBase):
             )
             result = session.execute(stmt).scalars()
             recording_id = result.one()
-            thumbnail, thumbnail_path = self.create_thumbnail(
-                recording_id,
-                self._camera.shared_frames.get_decoded_frame_rgb(shared_frame).copy(),
-                objects_in_fov,
-            )
+            manager = getattr(self._storage, "pressure_manager", None)
+            if (
+                manager is not None
+                and manager.recording_blocked(self._camera.identifier) is True
+            ):
+                thumbnail, thumbnail_path = None, None
+            else:
+                thumbnail, thumbnail_path = self.create_thumbnail(
+                    recording_id,
+                    self._camera.shared_frames.get_decoded_frame_rgb(
+                        shared_frame
+                    ).copy(),
+                    objects_in_fov,
+                )
             stmt2 = (
                 update(Recordings)
                 .values(
@@ -684,7 +694,10 @@ def delete_recordings(
     """
     conditions = [Recordings.camera_identifier == camera_identifier]
     active = aliased(Recordings)
-    active_conditions = [active.camera_identifier == camera_identifier, active.end_time.is_(None)]
+    active_conditions = [
+        active.camera_identifier == camera_identifier,
+        active.end_time.is_(None),
+    ]
     if date:
         conditions.append(func.date(Recordings.start_time.local(utc_offset)) == date)
         active_conditions.append(func.date(active.start_time.local(utc_offset)) == date)

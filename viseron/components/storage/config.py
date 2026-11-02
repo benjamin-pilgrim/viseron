@@ -130,6 +130,7 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     TIER_SUBCATEGORY_THUMBNAILS,
 )
+from viseron.components.storage.pressure_config import normalize_tier
 from viseron.components.storage.util import (
     calculate_age,
     calculate_bytes,
@@ -283,8 +284,21 @@ TIER_SCHEMA_SNAPSHOTS = TIER_SCHEMA_BASE.extend(
     }
 )
 
-TIER_SCHEMA_RECORDER = vol.Schema(
+_TIER_SCHEMA_RECORDER = vol.Schema(
     {
+        vol.Optional(
+            "retention",
+            description=(
+                "Maximum age (e.g. 30d) and aggregate tier size (e.g. 3TB); "
+                "either limit may be omitted."
+            ),
+        ): {str: int},
+        vol.Optional(
+            "on_full",
+            description=(
+                "Full-tier policy: oldest_first, ordinary_first or preserve_events."
+            ),
+        ): {"policy": str},
         vol.Required(
             CONFIG_PATH,
             description=DESC_PATH,
@@ -345,6 +359,8 @@ TIER_SCHEMA_RECORDER = vol.Schema(
         ): vol.All(CoerceNoneToDict(), TIER_SCHEMA_BASE),
     }
 )
+
+TIER_SCHEMA_RECORDER = vol.All(normalize_tier, _TIER_SCHEMA_RECORDER)
 
 RECORDER_SCHEMA = {
     vol.Optional(
@@ -649,15 +665,21 @@ def _validate_recorder_tiers(
 ):
     # Check continuous and events config in first tier
     first_tier = component_config.get(CONFIG_RECORDER, {}).get(CONFIG_TIERS, [])[0]
-    continuous_enabled = _storage_type_enabled(first_tier[CONFIG_CONTINUOUS])
-    events_enabled = _storage_type_enabled(first_tier[CONFIG_EVENTS])
+    continuous_enabled = "retention" in first_tier or _storage_type_enabled(
+        first_tier[CONFIG_CONTINUOUS]
+    )
+    events_enabled = "retention" in first_tier or _storage_type_enabled(
+        first_tier[CONFIG_EVENTS]
+    )
 
     for tier in component_config.get(CONFIG_RECORDER, {}).get(CONFIG_TIERS, [])[1:]:
         if tier.get(CONFIG_CONTINUOUS, None) or tier.get(CONFIG_EVENTS, None):
-            continuous_enabled_in_tier = _storage_type_enabled(
+            continuous_enabled_in_tier = "retention" in tier or _storage_type_enabled(
                 tier.get(CONFIG_CONTINUOUS, {})
             )
-            events_enabled_in_tier = _storage_type_enabled(tier.get(CONFIG_EVENTS, {}))
+            events_enabled_in_tier = "retention" in tier or _storage_type_enabled(
+                tier.get(CONFIG_EVENTS, {})
+            )
             if not continuous_enabled and continuous_enabled_in_tier:
                 raise vol.Invalid(
                     "Continuous recordings is not enabled in the first tier and thus "

@@ -40,11 +40,14 @@ def test_unmatched_playlist_filename_does_not_publish_staged_fragment(tmp_path, 
         "cam", str(stage), str(destination), None, None, threading.Event()
     )
     work.output_queue = queue.Queue()
+    work._first_missing_timing[os.path.relpath(str(run / name), str(stage))] = (
+        time.monotonic() - 31
+    )
     with caplog.at_level("WARNING"):
         work.work_input({"cmd": "fragment"})
     assert (run / name).exists()
     assert not (destination / run_id / name).exists()
-    assert "retaining them and init unindexed" in caplog.text
+    assert "retaining it and its init unindexed" in caplog.text
 
 
 def test_captured_playlist_timing_survives_rollover_and_worker_restart(tmp_path):
@@ -105,11 +108,14 @@ def test_changed_staged_fragment_is_not_replayed_with_old_timing(tmp_path, caplo
         "cam", str(stage), str(destination), None, None, threading.Event()
     )
     work.output_queue = queue.Queue()
+    work._first_missing_timing[os.path.relpath(str(run / name), str(stage))] = (
+        time.monotonic() - 31
+    )
     with caplog.at_level("WARNING"):
         work.work_input({"cmd": "fragment"})
     assert fragment.exists()
     assert not (destination / run_id / name).exists()
-    assert "retaining them and init unindexed" in caplog.text
+    assert "retaining it and its init unindexed" in caplog.text
 
 
 def test_replacement_after_replay_decision_is_not_published(tmp_path):
@@ -471,11 +477,14 @@ def test_timing_sidecar_without_contract_is_not_replayed(tmp_path, caplog):
         "cam", str(stage), str(destination), None, None, threading.Event()
     )
     work.output_queue = queue.Queue()
+    work._first_missing_timing[os.path.relpath(str(run / name), str(stage))] = (
+        time.monotonic() - 31
+    )
     with caplog.at_level("WARNING"):
         work.work_input({"cmd": "fragment"})
     assert fragment.exists()
     assert not (destination / run.name / name).exists()
-    assert "retaining them and init unindexed" in caplog.text
+    assert "retaining it and its init unindexed" in caplog.text
 
 
 def test_replay_after_filesystem_identity_changes(tmp_path):

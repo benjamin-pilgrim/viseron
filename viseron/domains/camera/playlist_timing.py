@@ -17,15 +17,15 @@ import stat
 import tempfile
 from pathlib import Path
 
-from viseron.components.storage.source_move_intent import source_move_pending
-from viseron.helpers.recording_timing_contract import (
-    TIMING_CONTRACT_CONTENT,
-    TIMING_CONTRACT_FILE,
-)
 from viseron.components.storage.run_lifecycle import (
     CameraLockBusy,
     camera_lock,
     is_run_directory,
+)
+from viseron.components.storage.source_move_intent import source_move_pending
+from viseron.helpers.recording_timing_contract import (
+    TIMING_CONTRACT_CONTENT,
+    TIMING_CONTRACT_FILE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -228,3 +228,25 @@ def read_playlist_time(
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
+
+
+def read_live_playlist_time(fragment: Path):
+    """Read a completed entry when a full spool cannot persist a timing sidecar.
+
+    The run must advertise the timing contract. Callers must recheck the returned
+    immutable file identity under the publication lock before removing any bytes.
+    """
+    if not _SEGMENT.fullmatch(fragment.name):
+        return None
+    try:
+        if (fragment.parent / TIMING_CONTRACT_FILE).read_text(
+            encoding="utf-8"
+        ) != TIMING_CONTRACT_CONTENT:
+            return None
+        contents = (fragment.parent / "index.m3u8").read_text(encoding="utf-8")
+        for name, duration, timestamp in _records(contents):
+            if name == fragment.name:
+                return timestamp, duration, _identity(fragment), None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return None

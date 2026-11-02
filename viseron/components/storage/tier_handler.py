@@ -32,6 +32,13 @@ from watchdog.events import (
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserverVFS
 
+from viseron.components.storage.asset_moves import (
+    asset_locks,
+    asset_move_pending,
+    destination_pending,
+    is_recording_asset,
+    reserve as reserve_asset_move,
+)
 from viseron.components.storage.const import (
     COMPONENT,
     CONFIG_CHECK_INTERVAL,
@@ -66,34 +73,7 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_THUMBNAILS,
     CleanupJobNames,
 )
-from viseron.components.storage.asset_moves import (
-    asset_move_pending,
-    destination_pending,
-    is_recording_asset,
-    reserve as reserve_asset_move,
-)
 from viseron.components.storage.dispatch_fence import create_token
-from viseron.components.storage.pending_journal import (
-    PREFIX,
-    marker_for_path,
-    sync_dir,
-    publish_or_verify,
-    protected_by_pending,
-    assign_file_key,
-    assign_destination_id,
-    release_indexed_source,
-)
-from viseron.components.storage.source_move_intent import (
-    is_source_move_marker,
-    marker_for_source,
-    source_move_pending,
-)
-from viseron.components.storage.source_move_intent import scan_source_intents
-from viseron.components.storage.run_lifecycle import (
-    CameraLockBusy,
-    camera_lock,
-    is_run_directory,
-)
 from viseron.components.storage.models import (
     FILE_KEY_SEQUENCE,
     Files,
@@ -104,6 +84,27 @@ from viseron.components.storage.models import (
     PendingMove,
     PostProcessorResults,
     Recordings,
+)
+from viseron.components.storage.pending_journal import (
+    PREFIX,
+    assign_destination_id,
+    assign_file_key,
+    marker_for_path,
+    protected_by_pending,
+    publish_or_verify,
+    release_indexed_source,
+    sync_dir,
+)
+from viseron.components.storage.run_lifecycle import (
+    CameraLockBusy,
+    camera_lock,
+    is_run_directory,
+)
+from viseron.components.storage.source_move_intent import (
+    is_source_move_marker,
+    marker_for_source,
+    scan_source_intents,
+    source_move_pending,
 )
 from viseron.components.storage.storage_subprocess import (
     DataItem,
@@ -1675,11 +1676,10 @@ class SegmentsTierHandler(TierHandler):
             self._events_min_age,
         ]
 
-        self._events_enabled = any(self._events_params)
+        self._events_enabled = "retention" in self._tier or any(self._events_params)
         self._continuous_configured = (
-            any(self._continuous_params)
-            and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
-        )
+            "retention" in self._tier or any(self._continuous_params)
+        ) and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
 
         if (
             self._next_tier is None
@@ -2558,7 +2558,14 @@ def move_file(
     pending_move = None
     asset_target = None
     try:
-        with get_session() as session:
+        reservation_lock = (
+            asset_locks(src)
+            if curr_tier_category == TIER_CATEGORY_RECORDER
+            and curr_tier_subcategory
+            in (TIER_SUBCATEGORY_THUMBNAILS, TIER_SUBCATEGORY_EVENT_CLIPS)
+            else contextlib.nullcontext()
+        )
+        with reservation_lock, get_session() as session:
             _lock_path(session, src)
             sel = select(Files).where(Files.path == src).with_for_update()
             res = session.execute(sel).scalar_one()
@@ -2663,6 +2670,9 @@ def move_file(
                 on_complete()
             return
         if item.error:
+            manager = getattr(storage, "pressure_manager", None)
+            if manager is not None and source_db is not None:
+                manager.promotion_failed.add(source_db["tier_path"])
             logger.error(f"Error moving file {src} to {dst}: {item.error}")
             with storage.pending_moves_lock:
                 if storage.pending_moves.get(src) is pending_move:
