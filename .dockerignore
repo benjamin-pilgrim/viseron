@@ -23,4 +23,6 @@
 frontend/node_modules
 frontend/build
 
-**.pyc
+**/__pycache__
+**/*.pyc
+**/*.pyo
