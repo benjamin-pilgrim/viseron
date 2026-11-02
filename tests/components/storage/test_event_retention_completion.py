@@ -10,12 +10,16 @@ from unittest.mock import MagicMock, Mock
 import numpy as np
 import pytest
 from sqlalchemy import event as sqlalchemy_event
-from sqlalchemy import select, update
+from sqlalchemy import delete, func, select, update
 from watchdog.events import FileDeletedEvent
 
+from viseron.components.storage.check_tier import Worker
 from viseron.components.storage.check_tier import delete_file as delete_segment
 from viseron.components.storage.models import Files, Recordings
-from viseron.components.storage.storage_subprocess import StorageCallbackCapacityError
+from viseron.components.storage.storage_subprocess import (
+    DataItem,
+    StorageCallbackCapacityError,
+)
 from viseron.components.storage.tier_handler import SegmentsTierHandler, move_file
 
 
@@ -415,3 +419,296 @@ def test_rejected_terminal_asset_cleanup_leaves_files_for_orphan_recovery(
     assert path.read_bytes() == b"asset"
     with get_db_session() as session:
         assert session.execute(select(Files.path)).scalar_one() == str(path)
+
+
+@pytest.mark.parametrize("late_event", ["active", "ended", "pre-roll"])
+@pytest.mark.parametrize("run_scoped", [False, True])
+def test_queued_segment_delete_preserves_a_new_overlapping_event(
+    tmp_path, get_db_session, late_event, run_scoped
+):
+    """An event created after selection must keep its only segment and metadata."""
+    run_id = "20261102T000000.000000Z-012345abcdef" if run_scoped else None
+    root = tmp_path / run_id if run_id else tmp_path
+    root.mkdir(exist_ok=True)
+    case = _case(root, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    item = command.args[0]
+    with get_db_session() as session:
+        fragment = session.execute(select(Files)).scalar_one()
+        start = fragment.orig_ctime + datetime.timedelta(
+            seconds=3 if late_event == "pre-roll" else 0
+        )
+        new_event = Recordings(
+            camera_identifier="test",
+            recorder_run_id=run_id,
+            start_time=start,
+            adjusted_start_time=fragment.orig_ctime,
+            end_time=(
+                None
+                if late_event == "active"
+                else start + datetime.timedelta(seconds=5)
+            ),
+        )
+        session.add(new_event)
+        session.commit()
+        new_id = new_event.id
+    worker = Worker.__new__(Worker)
+    worker._get_session = get_db_session
+    worker.work_input(item)
+    command.kwargs["callback"](item)
+    assert case.paths[0].exists(), "Queued cleanup deleted a new event's only footage"
+    with get_db_session() as session:
+        assert session.execute(select(Files.path)).scalar_one() == str(case.paths[0])
+    assert _recording(get_db_session, new_id) is not None
+    assert item.deferred
+    case.handler._vis.background_scheduler.add_job.assert_not_called()
+
+
+def _selected_expired_case(tmp_path, get_session, count=1):
+    case = _case(tmp_path, get_session)
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    with get_session() as session:
+        session.execute(update(Files).values(orig_ctime=old))
+        session.execute(
+            update(Recordings).values(
+                start_time=old,
+                adjusted_start_time=old,
+                end_time=old + datetime.timedelta(seconds=2),
+                created_at=old - datetime.timedelta(days=2),
+            )
+        )
+        for _ in range(count - 1):
+            session.add(
+                Recordings(
+                    camera_identifier="test",
+                    start_time=old,
+                    adjusted_start_time=old,
+                    end_time=old + datetime.timedelta(seconds=2),
+                    created_at=old - datetime.timedelta(days=2),
+                )
+            )
+        session.commit()
+    item = DataItem(
+        cmd="check_tier",
+        camera_identifier="test",
+        tier_id=0,
+        category="recorder",
+        subcategories=["segments"],
+        throttle_period=datetime.timedelta(0),
+        max_bytes=0,
+        min_bytes=0,
+        min_age=datetime.timedelta(0),
+        max_age=datetime.timedelta(0),
+        drain=False,
+        files_enabled=False,
+        events_enabled=True,
+        events_max_bytes=0,
+        events_min_bytes=0,
+        events_min_age=datetime.timedelta(0),
+        events_max_age=datetime.timedelta(days=1),
+    )
+    worker = Worker.__new__(Worker)
+    worker._get_session = get_session
+    worker._check_tier(item)
+    assert len(item.data) == 1
+    return case, worker, item, old
+
+
+def test_expired_overlapping_events_still_allow_normal_retention(
+    tmp_path, get_db_session
+):
+    """File deduplication must not lose authorization for another expired event."""
+    case, worker, selected, _ = _selected_expired_case(
+        tmp_path, get_db_session, count=2
+    )
+    assert len(selected.retention_recording_ids) == 2
+    case.handler._check_tier(
+        get_db_session,
+        selected.data,
+        retention_recording_ids=selected.retention_recording_ids,
+    )
+    command = case.storage.tier_check_worker_send_command.call_args
+    item = command.args[0]
+    worker.work_input(item)
+    assert item.error is None
+    assert not item.deferred
+    assert not case.paths[0].exists()
+
+
+def test_event_created_before_dispatch_cannot_join_old_authorization(
+    tmp_path, get_db_session
+):
+    """The parent's queueing step must use the worker's original eligibility set."""
+    case, worker, selected, old = _selected_expired_case(tmp_path, get_db_session)
+    with get_db_session() as session:
+        session.add(
+            Recordings(
+                camera_identifier="test",
+                start_time=old,
+                adjusted_start_time=old,
+                end_time=old + datetime.timedelta(seconds=5),
+            )
+        )
+        session.commit()
+    case.handler._check_tier(
+        get_db_session,
+        selected.data,
+        retention_recording_ids=selected.retention_recording_ids,
+    )
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    worker.work_input(item)
+    assert item.deferred
+    assert case.paths[0].exists()
+
+
+def test_reopened_selected_event_keeps_its_segment(tmp_path, get_db_session):
+    """An originally authorized ID is no longer eligible after reopening."""
+    case = _case(tmp_path, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    with get_db_session() as session:
+        session.execute(update(Recordings).values(end_time=None))
+        session.commit()
+    worker = Worker.__new__(Worker)
+    worker._get_session = get_db_session
+    worker.work_input(item)
+    assert item.deferred
+    assert case.paths[0].exists()
+
+
+def test_event_creation_is_fenced_through_segment_unlink(
+    tmp_path, get_db_session, monkeypatch
+):
+    """A creator cannot commit between the final event check and physical deletion."""
+    case = _case(tmp_path, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    remove = os.remove
+    checked = []
+
+    def check_fence(path):
+        with get_db_session() as session:
+            obtained = session.execute(
+                select(
+                    func.pg_try_advisory_xact_lock(
+                        func.hashtext("recording-events:test")
+                    )
+                )
+            ).scalar_one()
+            assert obtained is False
+        checked.append(path)
+        remove(path)
+
+    monkeypatch.setattr("viseron.components.storage.check_tier.os.remove", check_fence)
+    worker = Worker.__new__(Worker)
+    worker._get_session = get_db_session
+    worker.work_input(item)
+    assert item.error is None
+    assert checked == [str(case.paths[0])]
+    with get_db_session() as session:
+        assert (
+            session.execute(
+                select(
+                    func.pg_try_advisory_xact_lock(
+                        func.hashtext("recording-events:test")
+                    )
+                )
+            ).scalar_one()
+            is True
+        )
+
+
+@pytest.mark.parametrize("new_event", [False, True])
+def test_continuous_only_retention_rechecks_new_events(
+    tmp_path, get_db_session, new_event
+):
+    """Continuous expiry allows old closed events but not a new event claim."""
+    case, worker, selected, old = _selected_expired_case(tmp_path, get_db_session)
+    selected.files_enabled = True
+    selected.events_enabled = False
+    selected.max_age = datetime.timedelta(minutes=1)
+    worker._check_tier(selected)
+    assert len(selected.data) == 1
+    assert selected.retention_recording_ids == (case.recording_id,)
+    if new_event:
+        with get_db_session() as session:
+            session.add(
+                Recordings(
+                    camera_identifier="test",
+                    start_time=old,
+                    adjusted_start_time=old,
+                    end_time=None,
+                )
+            )
+            session.commit()
+    case.handler._events_enabled = False
+    case.handler._continuous_configured = True
+    case.handler._check_tier(
+        get_db_session,
+        selected.data,
+        retention_recording_ids=selected.retention_recording_ids,
+    )
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    worker.work_input(item)
+    assert item.error is None
+    assert item.deferred == new_event
+    assert case.paths[0].exists() == new_event
+
+
+def test_event_on_another_run_does_not_block_old_run_retention(
+    tmp_path, get_db_session
+):
+    """A new run's event cannot claim an older run even at the same clock time."""
+    case = _case(tmp_path, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    with get_db_session() as session:
+        row = session.execute(select(Files)).scalar_one()
+        session.add(
+            Recordings(
+                camera_identifier="test",
+                recorder_run_id="20261102T000001.000000Z-abcdef123456",
+                start_time=row.orig_ctime,
+                adjusted_start_time=row.orig_ctime,
+                end_time=None,
+            )
+        )
+        session.commit()
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    worker = Worker.__new__(Worker)
+    worker._get_session = get_db_session
+    worker.work_input(item)
+    assert item.error is None
+    assert not item.deferred
+    assert not case.paths[0].exists()
+
+
+def test_unassociated_footage_claimed_after_selection_is_kept(tmp_path, get_db_session):
+    """An events-only tier cannot purge ordinary footage newly claimed by pre-roll."""
+    case, worker, selected, old = _selected_expired_case(tmp_path, get_db_session)
+    with get_db_session() as session:
+        session.execute(delete(Recordings))
+        session.commit()
+    worker._check_tier(selected)
+    assert selected.data[0]["recording_id"] == -1
+    assert selected.retention_recording_ids == ()
+    with get_db_session() as session:
+        session.add(
+            Recordings(
+                camera_identifier="test",
+                start_time=old,
+                adjusted_start_time=old,
+                end_time=None,
+            )
+        )
+        session.commit()
+    case.handler._check_tier(
+        get_db_session,
+        selected.data,
+        retention_recording_ids=selected.retention_recording_ids,
+    )
+    item = case.storage.tier_check_worker_send_command.call_args.args[0]
+    worker.work_input(item)
+    assert item.error is None
+    assert item.deferred
+    assert case.paths[0].exists()

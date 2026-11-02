@@ -587,6 +587,9 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 tier_handlers[0]._logger,
                 force_delete=force_delete,
                 on_complete=ANY,
+                retention_recording_ids=(recording_id,)
+                if recording_id is not None
+                else (),
             )
             thumbnail_tier_handler.move_thumbnail.assert_not_called()
             recordings_tier_handler.move_event_clip.assert_not_called()

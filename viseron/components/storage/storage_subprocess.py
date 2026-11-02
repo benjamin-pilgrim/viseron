@@ -69,6 +69,7 @@ class DataItem:
     continuous_lookback_seconds: int = 0
     callback_id: str | None = None
     data: np.ndarray | None = None
+    retention_recording_ids: tuple[int, ...] | None = None
     error: str | None = None
     deferred: bool = False
 
@@ -109,6 +110,7 @@ class DataItemDeleteFile:
     callback_id: str | None = None
     error: str | None = None
     tier_markers: dict[str, str] = field(default_factory=dict)
+    retention_recording_ids: tuple[int, ...] | None = None
 
 
 class DedupCheckQueue:

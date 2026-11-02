@@ -928,7 +928,10 @@ class TierHandler(FileSystemEventHandler):
         except Exception:  # pylint: disable=broad-except # noqa: BLE001
             self._logger.exception("Failed to retry forced tier check")
 
-    def _check_tier(self, get_session: Callable[[], Session], data: np.ndarray) -> None:
+    def _check_tier(
+        self, get_session: Callable[[], Session], data: np.ndarray,
+        retention_recording_ids: tuple[int, ...] | None = None,
+    ) -> None:
         files_processed = 0
         for file in data:
             if files_processed >= self._storage.file_batch_size:
@@ -991,6 +994,7 @@ class TierHandler(FileSystemEventHandler):
                 self._check_tier(
                     self._storage.get_session,
                     data,
+                    retention_recording_ids=item.retention_recording_ids,
                 )
             finally:
                 self._release_check_tier()
@@ -1769,6 +1773,7 @@ class SegmentsTierHandler(TierHandler):
         data: np.ndarray,
         events_next_tier: SegmentsTierHandler | None,
         on_complete: Callable[[str], None] | None = None,
+        retention_recording_ids: tuple[int, ...] | None = None,
     ) -> list[int]:
         # A file can be in multiple recordings, so we need to keep track of which
         # files we have already processed using processed_paths
@@ -1800,6 +1805,7 @@ class SegmentsTierHandler(TierHandler):
                 file["path"],
                 file["tier_path"],
                 self._logger,
+                retention_recording_ids=retention_recording_ids,
                 force_delete=force_delete,
                 on_complete=(
                     partial(on_complete, str(file["path"]))
@@ -1816,6 +1822,7 @@ class SegmentsTierHandler(TierHandler):
         get_session: Callable[[], Session],
         data: np.ndarray,
         continuous_next_tier: SegmentsTierHandler | None,
+        retention_recording_ids: tuple[int, ...] | None = None,
     ) -> None:
         files_processed = 0
         for file in data:
@@ -1836,6 +1843,7 @@ class SegmentsTierHandler(TierHandler):
                 file["path"],
                 file["tier_path"],
                 self._logger,
+                retention_recording_ids=retention_recording_ids,
             )
             files_processed += 1
 
@@ -1846,6 +1854,7 @@ class SegmentsTierHandler(TierHandler):
         events_next_tier: SegmentsTierHandler | None,
         continuous_next_tier: SegmentsTierHandler | None,
         on_complete: Callable[[str], None] | None = None,
+        retention_recording_ids: tuple[int, ...] | None = None,
     ) -> list[int]:
         # A file can be in multiple recordings, so we need to keep track of which
         # files we have already processed using processed_paths
@@ -1898,6 +1907,7 @@ class SegmentsTierHandler(TierHandler):
                 file["path"],
                 file["tier_path"],
                 self._logger,
+                retention_recording_ids=retention_recording_ids,
                 force_delete=force_delete,
                 on_complete=(
                     partial(on_complete, str(file["path"]))
@@ -1909,7 +1919,23 @@ class SegmentsTierHandler(TierHandler):
             files_processed += 1
         return recording_ids
 
-    def _check_tier(self, get_session: Callable[[], Session], data: np.ndarray) -> None:
+    def _check_tier(
+        self,
+        get_session: Callable[[], Session],
+        data: np.ndarray,
+        retention_recording_ids: tuple[int, ...] | None = None,
+    ) -> None:
+        if retention_recording_ids is None:
+            retention_recording_ids = tuple(
+                sorted(
+                    {
+                        int(row["recording_id"])
+                        for row in data
+                        if "recording_id" in data.dtype.names
+                        and row["recording_id"] >= 0
+                    }
+                )
+            )
         events_next_tier = None
         recording_ids = (
             sorted(
@@ -1947,12 +1973,20 @@ class SegmentsTierHandler(TierHandler):
             events_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "events"
             )
-            self._handle_events(get_session, data, events_next_tier, on_complete)
+            self._handle_events(
+                get_session,
+                data,
+                events_next_tier,
+                on_complete,
+                retention_recording_ids,
+            )
         elif self.continuous_enabled and not self._events_enabled:
             continuous_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "continuous"
             )
-            self._handle_continuous(get_session, data, continuous_next_tier)
+            self._handle_continuous(
+                get_session, data, continuous_next_tier, retention_recording_ids
+            )
         else:
             events_next_tier = find_next_tier_segments(
                 self._storage, self._tier_id, self._camera, "events"
@@ -1961,7 +1995,12 @@ class SegmentsTierHandler(TierHandler):
                 self._storage, self._tier_id, self._camera, "continuous"
             )
             self._handle_events_and_continuous(
-                get_session, data, events_next_tier, continuous_next_tier, on_complete
+                get_session,
+                data,
+                events_next_tier,
+                continuous_next_tier,
+                on_complete,
+                retention_recording_ids,
             )
 
     def _complete_event_retention(
@@ -2366,6 +2405,7 @@ def handle_file(
     *,
     force_delete: bool = False,
     on_complete: Callable[[], None] | None = None,
+    retention_recording_ids: tuple[int, ...] | None = None,
 ) -> None:
     """Move file if there is a succeeding tier, else delete the file."""
     if not storage.tier_available(path):
@@ -2405,7 +2445,16 @@ def handle_file(
                 on_complete()
 
         try:
-            delete_file(storage, path, callback=on_delete)
+            delete_file(
+                storage,
+                path,
+                callback=on_delete,
+                retention_recording_ids=(
+                    retention_recording_ids
+                    if curr_tier_category == "recorder" and path.endswith(".m4s")
+                    else None
+                ),
+            )
         except StorageCallbackCapacityError:
             _schedule_source_retry(
                 storage,
@@ -2500,12 +2549,14 @@ def delete_file(
     path: str,
     *,
     callback: Callable[[DataItemDeleteFile], None] | None = None,
+    retention_recording_ids: tuple[int, ...] | None = None,
 ) -> None:
     """Delete file from storage."""
     storage.tier_check_worker_send_command(
         DataItemDeleteFile(
             cmd="delete_file",
             src=path,
+            retention_recording_ids=retention_recording_ids,
         ),
         callback=callback,
     )

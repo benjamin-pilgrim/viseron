@@ -42,6 +42,7 @@ from viseron.components.storage.source_move_intent import (
 )
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.pressure import event_fence
 from viseron.components.storage.util import (
     TIER_MOVE_TEMP_PREFIX,
     is_tier_marker,
@@ -244,6 +245,22 @@ class Worker:
             return False
 
     def _check_tier(self, item: DataItem) -> None:
+        if (
+            item.category == "recorder"
+            and "segments" in item.subcategories
+            and not item.events_enabled
+        ):
+            # Continuous-only retention governs closed events too. Capture them
+            # before selecting files; a later event must not inherit this decision.
+            with self._get_session() as session:
+                item.retention_recording_ids = tuple(
+                    session.execute(
+                        select(Recordings.id).where(
+                            Recordings.camera_identifier == item.camera_identifier,
+                            Recordings.end_time.is_not(None),
+                        )
+                    ).scalars()
+                )
         files = np.empty(0, dtype=FILES_DTYPE)
         if item.cmd == "check_tier" and item.files_enabled:
             LOGGER.debug(
@@ -359,12 +376,13 @@ class Worker:
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
         """Delete file."""
-        delete_file(
+        item.deferred = delete_file(
             self._get_session,
             item.src,
             LOGGER,
             tier_markers=item.tier_markers,
-        )
+            retention_recording_ids=item.retention_recording_ids,
+        ) is False
 
     def work_input(self, item: DataItem | DataItemMoveFile | DataItemDeleteFile):
         """Perform work on input item from child process."""
@@ -553,6 +571,7 @@ class Worker:
             max_age_timestamp,
             file_min_age,
         )
+        authorized_recordings: set[int] = set()
         rows_to_move = get_recordings_to_move(
             recordings_data,
             files_data,
@@ -563,8 +582,9 @@ class Worker:
             max_age_timestamp,
             file_min_age,
             drain=item.drain,
+            retention_recording_ids=authorized_recordings,
         )
-
+        item.retention_recording_ids = tuple(sorted(authorized_recordings))
         return rows_to_move
 
 
@@ -788,6 +808,7 @@ def get_recordings_to_move(
     max_age_timestamp: float,
     file_min_age_timestamp: float,
     drain: bool,
+    retention_recording_ids: set[int] | None = None,
 ):
     """Get files to move based on recording grouping."""
     # Sort recordings by adjusted start time (descending)
@@ -932,6 +953,11 @@ def get_recordings_to_move(
         # Convert list of structured array rows to a new array
         files_to_move_np = np.array(files_to_move_list, dtype=RECORDINGS_FILES_DTYPE)
 
+    if retention_recording_ids is not None:
+        retention_recording_ids.update(
+            int(value) for value in recordings_data[recording_indices_to_move]["id"]
+        )
+
     # A fragment shared with any retained event cannot be moved on behalf of
     # an eligible event. Check the associations before deduplicating by file.
     if files_to_move_np.size:
@@ -967,8 +993,9 @@ def delete_file(
     logger: logging.Logger,
     *,
     tier_markers: dict[str, str] | None = None,
-) -> None:
-    """Delete file."""
+    retention_recording_ids: tuple[int, ...] | None = None,
+) -> bool:
+    """Delete a file, deferring stale retention authorization."""
     logger.debug("Deleting file %s", path)
     if is_tier_marker(path, tier_markers or {}):
         raise OSError(f"Refusing to delete storage marker {path}")
@@ -987,12 +1014,49 @@ def delete_file(
             or asset_move_pending(session, path)
         ):
             raise BlockingIOError("File has an active publication hold")
+        if retention_recording_ids is not None:
+            row = session.execute(
+                select(Files).where(Files.path == path)
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.category != "recorder"
+                or row.subcategory != "segments"
+                or row.duration is None
+            ):
+                return False
+            event_fence(session, row.camera_identifier)
+            claimed = session.execute(
+                select(Recordings.id)
+                .where(
+                    Recordings.camera_identifier == row.camera_identifier,
+                    Recordings.adjusted_start_time
+                    <= row.orig_ctime + datetime.timedelta(seconds=row.duration),
+                    or_(
+                        Recordings.end_time.is_(None),
+                        Recordings.end_time > row.orig_ctime,
+                    ),
+                    or_(
+                        Recordings.recorder_run_id.is_(None),
+                        Recordings.recorder_run_id == os.path.basename(row.directory),
+                    ),
+                    or_(
+                        Recordings.end_time.is_(None),
+                        Recordings.id.not_in(retention_recording_ids),
+                    ),
+                )
+                .limit(1)
+            ).first()
+            if claimed:
+                logger.debug("Deferring stale retention deletion for %s", path)
+                return False
         require_tier_markers(path, tier_markers or {})
         os.remove(path)
         require_tier_markers(path, tier_markers or {})
         stmt = delete(Files).where(Files.path == path)
         session.execute(stmt)
         session.commit()
+        return True
 
 
 RUN_DIRECTORY_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}$")
