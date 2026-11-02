@@ -184,7 +184,9 @@ def test_recovery_roots_cross_child_process_boundary(tmp_path, monkeypatch):
     legacy_prefix = str(tmp_path / "legacy")
     legacy = legacy_prefix + str(tier)
     os.makedirs(legacy)
-    monkeypatch.setattr("viseron.components.storage.jobs.TEMP_DIR", legacy_prefix)
+    monkeypatch.setattr(
+        "viseron.components.storage.run_lifecycle.TEMP_DIR", legacy_prefix
+    )
     camera = SimpleNamespace(segments_folder=str(tier), temp_segments_folder=str(spool))
     vis, storage = Mock(), Mock()
     vis.get_registered_identifiers.return_value = {"camera": camera}

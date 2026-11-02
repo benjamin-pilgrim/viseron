@@ -10,6 +10,8 @@ import stat
 import time
 from pathlib import Path
 
+from viseron.const import TEMP_DIR
+
 
 class CameraLockBusy(BlockingIOError):
     """A cooperating publisher or cleanup currently owns the camera lock."""
@@ -95,7 +97,9 @@ def remove_stale_temporary(path: str, check_tier) -> bool:
         ):
             return False
         if os.path.basename(path).startswith(".viseron-tier-move-init-"):
-            marker = os.path.join(os.path.dirname(path), ".viseron-tier-move-run-init.json")
+            marker = os.path.join(
+                os.path.dirname(path), ".viseron-tier-move-run-init.json"
+            )
             if os.path.lexists(marker):
                 try:
                     with open(marker, encoding="utf-8") as stream:
@@ -109,7 +113,10 @@ def remove_stale_temporary(path: str, check_tier) -> bool:
                             and all(isinstance(item, int) for item in record[key])
                             for key in ("source", "destination")
                         )
-                        or (record["version"] == 2 and not isinstance(record.get("digest"), str))
+                        or (
+                            record["version"] == 2
+                            and not isinstance(record.get("digest"), str)
+                        )
                         or not isinstance(owned, str)
                         or os.path.basename(owned) != owned
                         or not owned.startswith(".viseron-tier-move-init-")
@@ -202,3 +209,61 @@ def reclaim_spool_run(lock_root: str, camera_key: str, run_dir: str) -> bool:
                 os.close(fd)
     except (OSError, ValueError):
         return False
+
+
+def recording_camera_paths(storage, camera):
+    """Find all recording tiers, current spool and retained legacy staging."""
+    roots = list(storage.get_segments_path(camera, all_tiers=True))
+    roots.append(camera.temp_segments_folder)
+    legacy = TEMP_DIR + camera.segments_folder
+    try:
+        os.lstat(legacy)
+    except FileNotFoundError:
+        pass
+    else:
+        roots.append(legacy)
+    return tuple(sorted({os.path.abspath(root) for root in roots}))
+
+
+@contextlib.contextmanager
+def empty_recording_run(roots, run_id, tier_markers):
+    """Hold publication locks through retirement; uncertainty retains metadata.
+
+    Whole-run drainage is deliberately conservative. It does not infer absence
+    of recoverable media from the index or guess timing for unknown disk files.
+    """
+    from viseron.components.storage.util import require_tier_markers  # noqa: PLC0415
+
+    if not roots or not run_id or not is_run_directory(run_id):
+        yield False
+        return
+    with contextlib.ExitStack() as locks:
+        empty = False
+        try:
+            for root in sorted(set(roots)):
+                locks.enter_context(camera_lock("/tmp/viseron-run-locks", root))
+                require_tier_markers(root, tier_markers)
+                if not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode):
+                    break
+                run = os.path.join(root, run_id)
+                try:
+                    info = os.stat(run, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    break
+                with os.scandir(run) as entries:
+                    if any(
+                        entry.name
+                        not in {"init.mp4", ".viseron-tier-move-run-init.json"}
+                        or not entry.is_file(follow_symlinks=False)
+                        for entry in entries
+                    ):
+                        break
+            else:
+                for root in roots:
+                    require_tier_markers(root, tier_markers)
+                empty = True
+        except OSError:
+            pass
+        yield empty

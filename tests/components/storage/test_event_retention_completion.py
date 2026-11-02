@@ -16,6 +16,7 @@ from watchdog.events import FileDeletedEvent
 from viseron.components.storage.check_tier import Worker
 from viseron.components.storage.check_tier import delete_file as delete_segment
 from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.run_lifecycle import camera_lock, is_run_directory
 from viseron.components.storage.storage_subprocess import (
     DataItem,
     StorageCallbackCapacityError,
@@ -25,12 +26,21 @@ from viseron.components.storage.tier_handler import SegmentsTierHandler, move_fi
 
 def _case(tmp_path, get_session, count=1):
     now = datetime.datetime.now(datetime.timezone.utc)
-    paths = [tmp_path / f"segment-{index}.m4s" for index in range(count)]
+    run = (
+        tmp_path
+        if is_run_directory(tmp_path.name)
+        else tmp_path / "20261102T000000.000000Z-012345abcdef"
+    )
+    run.mkdir(exist_ok=True)
+    spool = run.parent / "staging"
+    spool.mkdir(exist_ok=True)
+    paths = [run / f"segment-{index}.m4s" for index in range(count)]
     for path in paths:
         path.write_bytes(b"only copy")
     with get_session() as session:
         recording = Recordings(
             camera_identifier="test",
+            recorder_run_id=run.name,
             start_time=now,
             adjusted_start_time=now,
             end_time=now + datetime.timedelta(seconds=count),
@@ -43,7 +53,7 @@ def _case(tmp_path, get_session, count=1):
                 category="recorder",
                 subcategory="segments",
                 path=str(path),
-                directory=str(tmp_path),
+                directory=str(run),
                 filename=path.name,
                 size=9,
                 orig_ctime=now + datetime.timedelta(seconds=index),
@@ -66,6 +76,8 @@ def _case(tmp_path, get_session, count=1):
     storage = MagicMock()
     storage.get_session = get_session
     storage.tier_available.return_value = True
+    storage.get_segments_path.return_value = [str(run.parent)]
+    storage.tier_markers = {}
     storage.camera_requested_files_count = {"test": SimpleNamespace(filenames=set())}
     thumbnail, clip, segments = Mock(), Mock(), Mock()
     segments._check_tier_lock = threading.Lock()
@@ -80,7 +92,11 @@ def _case(tmp_path, get_session, count=1):
     storage.pending_moves = {}
     storage.pending_moves_lock = threading.Lock()
     handler = SegmentsTierHandler.__new__(SegmentsTierHandler)
-    handler._camera = SimpleNamespace(identifier="test")
+    handler._camera = SimpleNamespace(
+        identifier="test",
+        temp_segments_folder=str(spool),
+        segments_folder=str(run.parent),
+    )
     handler._storage = storage
     handler._vis = Mock()
     handler._tier_id = 0
@@ -257,7 +273,7 @@ def test_late_indexed_event_segment_prevents_finalization(
     delete_segment(get_db_session, command.args[0].src, case.handler._logger)
     command.kwargs["callback"](command.args[0])
     event = _recording(get_db_session, case.recording_id)
-    late = tmp_path / "late.m4s"
+    late = case.paths[0].parent / "late.m4s"
     late.write_bytes(b"late footage")
     with get_db_session() as session:
         session.add(
@@ -268,7 +284,7 @@ def test_late_indexed_event_segment_prevents_finalization(
                 category="recorder",
                 subcategory="segments",
                 path=str(late),
-                directory=str(tmp_path),
+                directory=str(late.parent),
                 filename=late.name,
                 size=12,
                 orig_ctime=event.adjusted_start_time
@@ -306,7 +322,7 @@ def test_terminal_retirement_rechecks_at_delete_without_retiring_assets(
             if arrival == "reopened-event":
                 session.execute(update(Recordings).values(end_time=None))
             else:
-                late = tmp_path / "arriving.m4s"
+                late = case.paths[0].parent / "arriving.m4s"
                 late.write_bytes(b"late video")
                 session.add(
                     Files(
@@ -316,7 +332,7 @@ def test_terminal_retirement_rechecks_at_delete_without_retiring_assets(
                         category="recorder",
                         subcategory="segments",
                         path=str(late),
-                        directory=str(tmp_path),
+                        directory=str(late.parent),
                         filename=late.name,
                         size=10,
                         orig_ctime=recording.adjusted_start_time,
@@ -712,3 +728,123 @@ def test_unassociated_footage_claimed_after_selection_is_kept(tmp_path, get_db_s
     assert item.error is None
     assert item.deferred
     assert case.paths[0].exists()
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "tier",
+        "spool",
+        "pending",
+        "writer",
+        "legacy",
+        "missing-root",
+        "offline",
+        "unknown",
+        "symlink",
+        "publication",
+        "empty",
+    ],
+)
+def test_terminal_retirement_preserves_unindexed_run_state(
+    tmp_path, get_db_session, location
+):
+    """A completed selected batch cannot erase recovery's event association."""
+    run_id = "20261102T000000.000000Z-abcdef123456"
+    root = tmp_path / "segments" / "test"
+    spool = tmp_path / "spool" / "test"
+    run = root / run_id
+    run.mkdir(parents=True)
+    spool.mkdir(parents=True)
+    case = _case(run, get_db_session)
+    case.handler._camera = SimpleNamespace(
+        identifier="test",
+        temp_segments_folder=str(spool),
+        segments_folder=str(root),
+    )
+    case.storage.get_segments_path.return_value = [str(root)]
+    case.storage.tier_markers = {}
+    with get_db_session() as session:
+        session.get(Recordings, case.recording_id).recorder_run_id = (
+            None if location == "legacy" else run_id
+        )
+        session.commit()
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    delete_segment(get_db_session, command.args[0].src, case.handler._logger)
+    command.kwargs["callback"](command.args[0])
+    directory = spool / run_id if location in ("spool", "writer") else run
+    directory.mkdir(exist_ok=True)
+    filename = {
+        "tier": "unindexed.m4s",
+        "spool": "staged.m4s",
+        "pending": ".viseron-tier-move-pending-late.m4s.json",
+        "writer": ".viseron-writer-lease",
+    }.get(location, "unknown")
+    retained = directory / filename
+    if location == "missing-root":
+        spool.rmdir()
+    elif location == "offline":
+        case.storage.tier_markers = {str(tmp_path): ".missing-mount-marker"}
+    elif location == "symlink":
+        retained.symlink_to(tmp_path / "missing")
+    elif location not in ("empty", "publication", "legacy"):
+        retained.write_bytes(b"recovery state")
+    if location == "publication":
+        with camera_lock("/tmp/viseron-run-locks", str(root)):
+            _run_finalization(case)
+    else:
+        _run_finalization(case)
+    assert (_recording(get_db_session, case.recording_id) is None) == (
+        location == "empty"
+    )
+    if location in ("tier", "spool", "pending", "writer", "unknown"):
+        assert retained.read_bytes() == b"recovery state"
+    case.thumbnail.move_thumbnail.assert_not_called()
+    case.clip.move_event_clip.assert_not_called()
+
+
+def test_terminal_retirement_holds_publication_locks_through_commit(
+    tmp_path, get_db_session
+):
+    """A cooperating indexer cannot commit between disk proof and retirement."""
+    case = _case(tmp_path, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    delete_segment(get_db_session, command.args[0].src, case.handler._logger)
+    command.kwargs["callback"](command.args[0])
+    checked = []
+
+    def assert_fenced():
+        for root in case.storage.get_segments_path.return_value + [
+            case.handler._camera.temp_segments_folder
+        ]:
+            with (
+                pytest.raises(BlockingIOError),
+                camera_lock("/tmp/viseron-run-locks", root),
+            ):
+                pytest.fail("Retirement released the publication fence")
+
+    def deleting(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith("DELETE FROM recordings"):
+            assert_fenced()
+            checked.append("delete")
+
+    def committing(_connection):
+        assert_fenced()
+        checked.append("commit")
+
+    engine = get_db_session.kw["bind"]
+    sqlalchemy_event.listen(engine, "before_cursor_execute", deleting)
+    sqlalchemy_event.listen(engine, "commit", committing)
+    try:
+        _run_finalization(case)
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", deleting)
+        sqlalchemy_event.remove(engine, "commit", committing)
+    assert checked == ["delete", "commit"]
+    assert _recording(get_db_session, case.recording_id) is None
+    with camera_lock(
+        "/tmp/viseron-run-locks", case.handler._camera.temp_segments_folder
+    ):
+        pass

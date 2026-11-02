@@ -98,7 +98,9 @@ from viseron.components.storage.pending_journal import (
 from viseron.components.storage.run_lifecycle import (
     CameraLockBusy,
     camera_lock,
+    empty_recording_run,
     is_run_directory,
+    recording_camera_paths,
 )
 from viseron.components.storage.source_move_intent import (
     is_source_move_marker,
@@ -929,7 +931,9 @@ class TierHandler(FileSystemEventHandler):
             self._logger.exception("Failed to retry forced tier check")
 
     def _check_tier(
-        self, get_session: Callable[[], Session], data: np.ndarray,
+        self,
+        get_session: Callable[[], Session],
+        data: np.ndarray,
         retention_recording_ids: tuple[int, ...] | None = None,
     ) -> None:
         files_processed = 0
@@ -2048,16 +2052,49 @@ class SegmentsTierHandler(TierHandler):
                 ~remaining_source,
             )
             if events_next_tier is None:
-                # The delete itself decides eligibility. An earlier selection
-                # cannot authorize asset removal after footage/event state changes.
-                retired = session.execute(
-                    delete(Recordings)
-                    .where(*eligible)
-                    .returning(
-                        Recordings.id, Recordings.thumbnail_path, Recordings.clip_path
+                # Index absence is insufficient: staging or an in-flight
+                # publication can still own this event's historical footage.
+                retired = []
+                recordings = (
+                    session.execute(
+                        select(Recordings).where(
+                            *eligible, Recordings.recorder_run_id.is_not(None)
+                        )
                     )
-                ).all()
-                session.commit()
+                    .scalars()
+                    .all()
+                )
+                if not recordings:
+                    return
+                try:
+                    roots = recording_camera_paths(self._storage, self._camera)
+                except OSError:
+                    return
+                for recording in recordings:
+                    with empty_recording_run(
+                        roots, recording.recorder_run_id, self._storage.tier_markers
+                    ) as empty:
+                        if not empty:
+                            continue
+                        # Keep both the disk locks and the final SQL eligibility
+                        # recheck through commit, before any asset cleanup.
+                        retired.extend(
+                            session.execute(
+                                delete(Recordings)
+                                .where(
+                                    *eligible,
+                                    Recordings.id == recording.id,
+                                    Recordings.recorder_run_id
+                                    == recording.recorder_run_id,
+                                )
+                                .returning(
+                                    Recordings.id,
+                                    Recordings.thumbnail_path,
+                                    Recordings.clip_path,
+                                )
+                            ).all()
+                        )
+                        session.commit()
             else:
                 recording_ids = list(
                     session.execute(select(Recordings.id).where(*eligible)).scalars()

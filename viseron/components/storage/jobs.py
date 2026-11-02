@@ -6,7 +6,6 @@ import contextlib
 import datetime
 import logging
 import os
-import stat
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -33,7 +32,9 @@ from viseron.components.storage.source_move_intent import (
 )
 from viseron.components.storage.run_lifecycle import (
     camera_lock,
+    empty_recording_run,
     is_run_directory,
+    recording_camera_paths,
     reclaim_empty_run,
     remove_stale_temporary,
 )
@@ -51,7 +52,7 @@ from viseron.components.storage.util import (
     tier_markers_available,
     require_tier_markers,
 )
-from viseron.const import TEMP_DIR, VISERON_SIGNAL_SHUTDOWN
+from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
@@ -996,44 +997,14 @@ def _empty_recording_run(
 ) -> Iterator[bool]:
     """Prove a whole run is drained; uncertainty keeps the event for a later pass.
 
-    This is deliberately coarser than normal callback-driven retention. It only
-    recovers lost callbacks once the run has no media, staging or recovery state.
+    This shares terminal callback retirement's conservative proof and recovers
+    lost callbacks once the run has no media, staging or recovery state.
     Unscoped legacy events require manual reconciliation.
     """
     roots = getattr(runner, "recording_paths", {}).get(recording.camera_identifier)
-    run_id = recording.recorder_run_id
-    if not roots or not run_id or not is_run_directory(run_id):
-        yield False
-        return
-    with contextlib.ExitStack() as locks:
-        empty = False
-        try:
-            for root in sorted(set(roots)):
-                locks.enter_context(camera_lock("/tmp/viseron-run-locks", root))
-                require_tier_markers(root, runner.tier_markers)
-                if not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode):
-                    break
-                run = os.path.join(root, run_id)
-                try:
-                    info = os.stat(run, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if not stat.S_ISDIR(info.st_mode):
-                    break
-                with os.scandir(run) as entries:
-                    if any(
-                        entry.name
-                        not in {"init.mp4", ".viseron-tier-move-run-init.json"}
-                        or not entry.is_file(follow_symlinks=False)
-                        for entry in entries
-                    ):
-                        break
-            else:
-                for root in roots:
-                    require_tier_markers(root, runner.tier_markers)
-                empty = True
-        except OSError:
-            LOGGER.debug("Deferring event recovery for %s", recording.id, exc_info=True)
+    with empty_recording_run(
+        roots, recording.recorder_run_id, getattr(runner, "tier_markers", {})
+    ) as empty:
         yield empty
 
 
@@ -1044,16 +1015,7 @@ class OrphanedRecordingsCleanup(BaseCleanupJob):
         """Include all tiers, current spool and retained legacy staging."""
         paths = {}
         for identifier, camera in (self._get_cameras() or {}).items():
-            roots = list(self._storage.get_segments_path(camera, all_tiers=True))
-            roots.append(camera.temp_segments_folder)
-            legacy = TEMP_DIR + camera.segments_folder
-            try:
-                os.lstat(legacy)
-            except FileNotFoundError:
-                pass
-            else:
-                roots.append(legacy)
-            paths[identifier] = tuple(sorted({os.path.abspath(root) for root in roots}))
+            paths[identifier] = recording_camera_paths(self._storage, camera)
         return paths
 
     @property
