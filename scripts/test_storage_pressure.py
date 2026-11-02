@@ -44,7 +44,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--image", required=True)
-    parser.add_argument("--frontend", required=True, type=Path)
+    parser.add_argument("--frontend", type=Path)
+    parser.add_argument(
+        "--expected-commit", help="Required application revision in packaged mode"
+    )
+    parser.add_argument(
+        "--packaged",
+        action="store_true",
+        help="Test image contents without source, nginx or frontend bind mounts",
+    )
     parser.add_argument("--cifs-mount", required=True, type=Path)
     parser.add_argument(
         "--test-samba",
@@ -63,7 +71,11 @@ def main():
     assert (
         command("findmnt", "-n", "-o", "FSTYPE", "-T", str(args.cifs_mount)) == "cifs"
     ), "Real CIFS mount required"
-    assert (args.frontend / "index.html").is_file()
+    if args.packaged:
+        assert args.expected_commit, "Packaged mode requires --expected-commit"
+        assert args.frontend is None, "Packaged mode must use the image frontend"
+    else:
+        assert args.frontend and (args.frontend / "index.html").is_file()
     root = Path(tempfile.mkdtemp(prefix="viseron-pressure-e2e-"))
     name = root.name
     remote = args.cifs_mount / name
@@ -111,6 +123,11 @@ ffmpeg:
     publisher = None
     evidence = {
         "commit": command("git", "-C", str(args.repo), "rev-parse", "HEAD"),
+        "image": args.image,
+        "image_id": command(
+            "podman", "image", "inspect", args.image, "--format", "{{.Id}}"
+        ),
+        "packaged": args.packaged,
         "policy": args.policy,
         "root": str(root),
         "remote": str(remote),
@@ -150,6 +167,29 @@ ffmpeg:
 
     def digest(path):
         return command("podman", "exec", app, "sha256sum", path).split()[0]
+
+    def snapshot_hashes():
+        # Ordinary footage may be evicted between the SQL snapshot and open().
+        # Hash open files in one exec; skip only paths already removed by policy.
+        code = """import hashlib,json,sys
+result={}
+for path in json.load(sys.stdin):
+    try:
+        with open(path, 'rb') as stream:
+            result[path]=hashlib.file_digest(stream, 'sha256').hexdigest()
+    except FileNotFoundError:
+        continue
+print(json.dumps(result))
+"""
+        result = subprocess.run(
+            ["podman", "exec", "-i", app, "python3", "-c", code],
+            input=json.dumps(local_rows()),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        return json.loads(result.stdout)
 
     def api(action):
         request = urllib.request.Request(
@@ -276,6 +316,21 @@ ffmpeg:
             stdout=publisher_log,
             stderr=subprocess.STDOUT,
         )
+        application_mounts = (
+            []
+            if args.packaged
+            else [
+                "-v",
+                f"{args.repo}/viseron:/src/viseron:ro",
+                "-v",
+                (
+                    f"{args.repo}/rootfs/usr/local/nginx/conf/nginx.conf:"
+                    "/usr/local/nginx/conf/nginx.conf:ro"
+                ),
+                "-v",
+                f"{args.frontend}:/src/viseron/frontend:ro",
+            ]
+        )
         command(
             "podman",
             "run",
@@ -288,13 +343,7 @@ ffmpeg:
             "S6_KILL_GRACETIME=3000",
             "--tmpfs",
             "/buffer:size=16m,mode=1777",
-            "-v",
-            f"{args.repo}/viseron:/src/viseron:ro",
-            "-v",
-            f"{args.repo}/rootfs/usr/local/nginx/conf/nginx.conf:"
-            "/usr/local/nginx/conf/nginx.conf:ro",
-            "-v",
-            f"{args.frontend}:/src/viseron/frontend:ro",
+            *application_mounts,
             "-v",
             f"{remote}:/cifs",
             "-v",
@@ -305,6 +354,37 @@ ffmpeg:
             f"{root}/recordings:/recordings",
             args.image,
         )
+        mounts = json.loads(
+            command("podman", "inspect", app, "--format", "{{json .Mounts}}")
+        )
+        evidence["mount_destinations"] = [mount["Destination"] for mount in mounts]
+        if args.packaged:
+            assert not any(
+                mount["Destination"].startswith(
+                    ("/src", "/usr/local/nginx", "/etc/services.d")
+                )
+                for mount in mounts
+            ), "Image content was overridden"
+            evidence["image_commit"] = command(
+                "podman", "exec", app, "printenv", "VISERON_GIT_COMMIT"
+            )
+            evidence["image_revision_label"] = command(
+                "podman",
+                "image",
+                "inspect",
+                args.image,
+                "--format",
+                '{{ index .Labels "org.opencontainers.image.revision" }}',
+            )
+            assert (
+                evidence["image_commit"]
+                == args.expected_commit
+                == evidence["image_revision_label"]
+            ), "Packaged application revision does not match the expected commit"
+            print(
+                "PASS: expected image revision and no source/nginx/frontend overrides",
+                flush=True,
+            )
         wait_for(
             "synthetic camera produces indexed RAM fragments",
             lambda: len(local_rows()) >= 3,
@@ -319,8 +399,9 @@ ffmpeg:
             )
         command("podman", "stop", "-t", "3", args.test_samba)
         print("Dedicated Samba server stopped; real CIFS outage begins.", flush=True)
-        before = wait_for("RAM contains pressure candidates", local_rows)
-        tracked, tracked_hash = before[0], digest(before[0])
+        before = wait_for("RAM contains pressure candidates", snapshot_hashes)
+        tracked = next(iter(before))
+        tracked_hash = before[tracked]
         evidence.update(tracked=tracked, tracked_hash=tracked_hash)
         if args.policy == "ordinary_first":
             wait_for(
@@ -341,7 +422,7 @@ ffmpeg:
                 lambda: "Recording storage /buffer/: blocked" in logs(),
                 timeout=150,
             )
-            preserved = {path: digest(path) for path in local_rows()}
+            preserved = snapshot_hashes()
             assert preserved, "No retained event footage"
             command(
                 "podman",
@@ -367,7 +448,7 @@ ffmpeg:
             command("podman", "exec", app, "rm", "/buffer/pressure-filler")
             print("Manual event stop:", api("stop"), flush=True)
             print("PASS: active event buffer survived full RAM filesystem.", flush=True)
-        survivors = {path: digest(path) for path in local_rows()}
+        survivors = snapshot_hashes()
         assert survivors, "No local recovery candidates"
         latest_before_recovery = max(survivors)
         command("podman", "start", args.test_samba)
@@ -401,35 +482,72 @@ ffmpeg:
         browser("recovered")
         run = remote / Path(destination).relative_to("/cifs").parent
         playlist = root / "recovered.m3u8"
-        command(
-            "python3",
-            str(args.repo / "scripts/recover_hls.py"),
-            "--output",
-            str(playlist),
-            str(run),
-        )
-        command(
-            "ffmpeg",
-            "-v",
-            "error",
-            "-xerror",
-            "-protocol_whitelist",
-            "file,crypto,data",
-            "-i",
-            str(playlist),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0",
-            "-fps_mode:v",
-            "passthrough",
-            "-enc_time_base:v",
-            "demux",
-            "-f",
-            "null",
-            "-",
-            timeout=60,
-        )
+        if args.packaged:
+            command(
+                "podman",
+                "exec",
+                app,
+                "python3",
+                "/src/scripts/recover_hls.py",
+                "--output",
+                "/recordings/recovered.m3u8",
+                str(Path(destination).parent),
+            )
+            command(
+                "podman",
+                "exec",
+                app,
+                "ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-protocol_whitelist",
+                "file,crypto,data",
+                "-i",
+                "/recordings/recovered.m3u8",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-fps_mode:v",
+                "passthrough",
+                "-enc_time_base:v",
+                "demux",
+                "-f",
+                "null",
+                "-",
+                timeout=60,
+            )
+        else:
+            command(
+                "python3",
+                str(args.repo / "scripts/recover_hls.py"),
+                "--output",
+                str(playlist),
+                str(run),
+            )
+            command(
+                "ffmpeg",
+                "-v",
+                "error",
+                "-xerror",
+                "-protocol_whitelist",
+                "file,crypto,data",
+                "-i",
+                str(playlist),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-fps_mode:v",
+                "passthrough",
+                "-enc_time_base:v",
+                "demux",
+                "-f",
+                "null",
+                "-",
+                timeout=60,
+            )
         print(
             "PASS: CIFS run recovered and audio/video decoded without database access.",
             flush=True,

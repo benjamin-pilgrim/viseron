@@ -1,0 +1,21 @@
+# Local acceptance image: package a committed checkout over a compatible runtime.
+# Supply an immutable local runtime image ID and a prebuilt current frontend.
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+ARG RUNTIME_IMAGE
+ARG CANDIDATE_COMMIT
+
+RUN test -n "$CANDIDATE_COMMIT" && rm -rf /src/viseron
+COPY rootfs/ /
+COPY viseron/ /src/viseron/
+COPY frontend-dist/ /src/viseron/frontend/
+COPY manager.py /src/manager.py
+COPY scripts/recover_hls.py /src/scripts/recover_hls.py
+COPY docker/ffmpeg_wrapper /home/abc/bin/ffmpeg
+COPY docker/ffprobe_wrapper /home/abc/bin/ffprobe
+
+ENV VISERON_VERSION=recording-candidate
+ENV VISERON_GIT_COMMIT=${CANDIDATE_COMMIT}
+LABEL org.opencontainers.image.revision=${CANDIDATE_COMMIT}
+LABEL org.opencontainers.image.base.name=${RUNTIME_IMAGE}
+LABEL org.opencontainers.image.description="Local recording acceptance candidate; inherited runtime, not a release build"
