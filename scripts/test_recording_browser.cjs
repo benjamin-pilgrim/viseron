@@ -1,5 +1,6 @@
 /* Browser smoke for test_run_recording.sh's disposable Viseron instance. */
 const { createRequire } = require("node:module");
+const fs = require("node:fs");
 const path = require("node:path");
 
 const [, , repo, origin] = process.argv;
@@ -14,12 +15,21 @@ const { chromium } = requireFrontend("@playwright/test");
     headless: true,
     args: ["--no-sandbox", "--autoplay-policy=no-user-gesture-required"],
   });
+  const page = await browser.newPage();
+  const diagnostics = { errors: [], media: [] };
+  page.on("pageerror", (error) => diagnostics.errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" || /HLS|playlist|recover/i.test(message.text())) {
+      diagnostics.errors.push(message.text());
+      diagnostics.errors = diagnostics.errors.slice(-100);
+    }
+  });
   try {
-    const page = await browser.newPage();
     const mediaResponses = [];
     page.on("response", (response) => {
       if (/\/api\/v1\/hls\/vertical_camera\/index\.m3u8|\/run-init\/vertical_camera\//.test(response.url())) {
         mediaResponses.push({ url: response.url(), status: response.status() });
+        diagnostics.media = mediaResponses.slice(-20);
       }
     });
     await page.goto(`${origin}/#/events?camera=vertical_camera&tab=timeline`);
@@ -74,6 +84,26 @@ const { chromium } = requireFrontend("@playwright/test");
       }, resumed, { timeout: 20000 });
       console.log("PASS: browser recovered from playlist change with a new client and resumed decoding");
     }
+  } catch (error) {
+    if (process.env.VISERON_TEST_BROWSER_DIAGNOSTICS) {
+      diagnostics.video = await page.locator("video").evaluateAll((videos) =>
+        videos.map((v) => ({
+          paused: v.paused,
+          readyState: v.readyState,
+          currentTime: v.currentTime,
+          error: v.error && { code: v.error.code, message: v.error.message },
+          source: v.currentSrc,
+          width: v.videoWidth,
+          buffered: Array.from({ length: v.buffered.length }, (_, i) => [
+            v.buffered.start(i), v.buffered.end(i),
+          ]),
+        })),
+      );
+      diagnostics.text = await page.locator("body").innerText();
+      fs.writeFileSync(process.env.VISERON_TEST_BROWSER_DIAGNOSTICS + ".json", JSON.stringify(diagnostics, null, 2));
+      await page.screenshot({ path: process.env.VISERON_TEST_BROWSER_DIAGNOSTICS + ".png" });
+    }
+    throw error;
   } finally {
     await browser.close();
   }
