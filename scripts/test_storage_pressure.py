@@ -60,7 +60,7 @@ def main():
         help="Dedicated disposable server; WILL be stopped",
     )
     parser.add_argument(
-        "--max-size", default="2MiB", help="Shared RAM budget, e.g. 2MiB or 12.5%"
+        "--max-size", default="2MiB", help="Shared RAM budget, e.g. 2MiB or 12.5%%"
     )
     parser.add_argument("--http-port", type=int, default=29775)
     parser.add_argument("--rtsp-port", type=int, default=29774)

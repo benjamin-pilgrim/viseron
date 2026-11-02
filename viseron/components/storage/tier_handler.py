@@ -1693,6 +1693,7 @@ class SegmentsTierHandler(TierHandler):
             self._next_tier is None
             and not any(self._events_params)
             and not any(self._continuous_params)
+            and not self._tier.get("retention", {}).get("max_size")
         ):
             self._logger.warning(
                 "Last recorder tier '%s' has no retention (max_age/max_size) "
@@ -2640,6 +2641,14 @@ def move_file(
     moved, causing a 404 in the browser, we copy the file to the new location and then
     delete the old one.
     """
+    manager = getattr(storage, "pressure_manager", None)
+    if (
+        curr_tier_category == TIER_CATEGORY_RECORDER
+        and manager is not None
+        and manager.accepts_promotions(dst_tier_path) is False
+    ):
+        logger.debug("Deferring promotion to pressured tier %s", dst_tier_path)
+        return
     logger.debug("Moving file from %s to %s", src, dst)
     file_meta = None
     source_db = None

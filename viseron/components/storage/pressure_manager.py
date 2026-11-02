@@ -227,6 +227,10 @@ class PressureManager:
                     "Pressure promotion deferred for %s", candidate["path"]
                 )
 
+    def accepts_promotions(self, path):
+        """Keep footage on its source when the destination cannot accept more."""
+        return self.status.get(path, {}).get("state") not in ("blocked", "unavailable")
+
     def recording_blocked(self, identifier):
         """Stop admission only when the first tier has no eligible space left."""
         tiers = self.storage.camera_tier_handlers.get(identifier, {}).get(

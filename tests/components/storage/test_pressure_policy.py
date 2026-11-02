@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import errno
+import logging
 import multiprocessing
 import os
 import queue
@@ -24,6 +25,7 @@ from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.pressure_config import resolve_size_limit
 from viseron.components.storage.pressure_manager import PressureManager
 from viseron.components.storage.storage_subprocess import DataItem
+from viseron.components.storage.tier_handler import move_file as queue_move_file
 from viseron.components.storage.util import calculate_age, calculate_bytes
 from viseron.domains.camera.fragmenter_process import FragmenterWork
 from viseron.domains.camera.playlist_timing import capture_playlist_times
@@ -513,3 +515,69 @@ def test_percentage_budget_rejects_unknown_capacity():
     """Unknown capacity cannot silently turn a percentage budget into unlimited."""
     with pytest.raises(ValueError, match="filesystem capacity"):
         resolve_size_limit("80%", 0)
+
+
+@pytest.mark.parametrize("state", ["blocked", "unavailable"])
+def test_full_destination_preserves_source_until_pressure_recovers(
+    get_db_session, tmp_path, state
+):
+    """A full protected NAS must stop accepting new promotion from its RAM tier."""
+    root = tmp_path / "ram"
+    root.mkdir()
+    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    source = _record(get_db_session, root, "camera", now, 1024)
+    nas = tmp_path / "nas"
+    nas.mkdir()
+    destination_root = str(nas)
+    destination = destination_root + str(source).removeprefix(str(root))
+    storage = SimpleNamespace(
+        pending_moves={},
+        pending_moves_lock=threading.Lock(),
+        temporary_files_meta={},
+        tier_check_worker_send_command=Mock(),
+    )
+    manager = PressureManager(storage)
+    storage.pressure_manager = manager
+    if state == "blocked":
+        protected = _record(get_db_session, nas, "camera", now, 1024, event=True)
+        manager.status[destination_root] = reclaim(
+            _configuration(nas, "preserve_events", maximum=1000), get_db_session
+        )
+        assert manager.status[destination_root]["state"] == "blocked"
+        assert protected.exists()
+    else:
+        manager.status[destination_root] = {"state": state}
+    completed = Mock()
+
+    def promote():
+        queue_move_file(
+            Mock(),
+            storage,
+            get_db_session,
+            "camera",
+            0,
+            "recorder",
+            "segments",
+            str(source),
+            destination,
+            destination_root,
+            logging.getLogger(__name__),
+            on_complete=completed,
+        )
+
+    promote()
+    storage.tier_check_worker_send_command.assert_not_called()
+    completed.assert_not_called()
+    assert not storage.pending_moves
+    assert source.read_bytes() == b"x" * 1024
+    with get_db_session() as session:
+        assert session.query(Files).filter(Files.path == str(source)).one().path == str(
+            source
+        )
+    manager.status[destination_root] = reclaim(
+        _configuration(nas, "preserve_events", maximum=4096), get_db_session
+    )
+    assert manager.status[destination_root]["state"] == "normal"
+    promote()
+    storage.tier_check_worker_send_command.assert_called_once()
+    assert source.exists()

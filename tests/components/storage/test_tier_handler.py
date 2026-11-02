@@ -1945,3 +1945,27 @@ def test_deferred_cleanup_cannot_remove_new_move_metadata(
         replacement.result(timeout=5)
     assert src in storage.pending_moves
     assert dst in storage.temporary_files_meta
+
+
+@pytest.mark.parametrize("maximum", ["80%", 4096, None])
+def test_last_tier_warning_honors_shared_size_budget(vis, tmp_path, caplog, maximum):
+    """Size-only NAS retention must not be advertised as unlimited storage."""
+    camera = Mock()
+    camera.identifier = "test"
+    camera.config = {
+        CONFIG_RECORDER: {
+            CONFIG_LOOKBACK: 5,
+            CONFIG_CONTINUOUS_RECORDING: True,
+            CONFIG_SCHEDULE: None,
+        }
+    }
+    tier = _get_tier_config(events=False, continuous=False)
+    tier[CONFIG_PATH] = str(tmp_path)
+    if maximum is not None:
+        tier["retention"] = {"max_size": maximum}
+    with caplog.at_level(logging.WARNING):
+        SegmentsTierHandler(vis, camera, 0, "recorder", "segments", tier, None)
+    warnings = [record.message for record in caplog.records]
+    assert any("accumulate indefinitely" in message for message in warnings) == (
+        maximum is None
+    )
