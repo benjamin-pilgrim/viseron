@@ -141,7 +141,7 @@ from viseron.helpers.validators import UNDEFINED
 from viseron.watchdog.thread_watchdog import RestartableThread
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     import numpy as np
     from sqlalchemy.orm import Session
@@ -2002,16 +2002,31 @@ class SegmentsTierHandler(TierHandler):
                 )
                 .exists()
             )
-            recording_ids = list(
-                session.execute(
-                    select(Recordings.id).where(
-                        Recordings.id.in_(recording_ids),
-                        Recordings.camera_identifier == self._camera.identifier,
-                        Recordings.end_time.is_not(None),
-                        ~remaining_source,
-                    )
-                ).scalars()
+            eligible = (
+                Recordings.id.in_(recording_ids),
+                Recordings.camera_identifier == self._camera.identifier,
+                Recordings.end_time.is_not(None),
+                ~remaining_source,
             )
+            if events_next_tier is None:
+                # The delete itself decides eligibility. An earlier selection
+                # cannot authorize asset removal after footage/event state changes.
+                retired = session.execute(
+                    delete(Recordings)
+                    .where(*eligible)
+                    .returning(
+                        Recordings.id, Recordings.thumbnail_path, Recordings.clip_path
+                    )
+                ).all()
+                session.commit()
+            else:
+                recording_ids = list(
+                    session.execute(select(Recordings.id).where(*eligible)).scalars()
+                )
+
+        if events_next_tier is None:
+            self._delete_retired_event_assets(get_session, retired)
+            return
 
         # Signal to the thumbnail tier that the recording has been moved
         if recording_ids:
@@ -2041,17 +2056,41 @@ class SegmentsTierHandler(TierHandler):
                     events_next_tier.tier if events_next_tier else None,
                 )
 
-        # Delete recordings from Recordings table if this is the last tier
-        if recording_ids and events_next_tier is None:
-            self._logger.debug("Deleting recordings: %s", recording_ids)
-            with get_session() as _session:
-                stmt = delete(Recordings).where(
-                    Recordings.id.in_(recording_ids),
-                    Recordings.camera_identifier == self._camera.identifier,
-                    Recordings.end_time.is_not(None),
-                )
-                _session.execute(stmt)
-                _session.commit()
+    def _delete_retired_event_assets(
+        self, get_session: Callable[[], Session], retired: Sequence[Any]
+    ) -> None:
+        """Queue cleanup only after retirement commits, using exact owned paths."""
+        for recording_id, thumbnail_path, clip_path in retired:
+            for subcategory, path in (
+                (TIER_SUBCATEGORY_THUMBNAILS, thumbnail_path),
+                (TIER_SUBCATEGORY_EVENT_CLIPS, clip_path),
+            ):
+                if not path or getattr(self, "_tier_check_stopping", False):
+                    continue
+                with get_session() as session:
+                    owned = session.execute(
+                        select(Files.id).where(
+                            Files.path == path,
+                            Files.camera_identifier == self._camera.identifier,
+                            Files.category == TIER_CATEGORY_RECORDER,
+                            Files.subcategory == subcategory,
+                            Files.tier_id == self._tier_id,
+                            Files.tier_path == self._tier[CONFIG_PATH],
+                            Files.move_target.is_(None),
+                        )
+                    ).first()
+                if owned is None:
+                    continue
+                try:
+                    delete_file(self._storage, path)
+                except StorageCallbackCapacityError:
+                    # Metadata was retired, so existing orphan-asset cleanup
+                    # can retry this file without an in-memory callback.
+                    self._logger.warning(
+                        "Deferred retired asset cleanup for event %s: %s",
+                        recording_id,
+                        path,
+                    )
 
 
 SNAPSHOT_REFERENCE_MODELS: dict[str, type[Motion | Objects | PostProcessorResults]] = {

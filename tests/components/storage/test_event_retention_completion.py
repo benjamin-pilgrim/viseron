@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select, update
 from watchdog.events import FileDeletedEvent
 
@@ -144,7 +145,9 @@ def test_unacknowledged_segment_cannot_retire_event(tmp_path, get_db_session, st
     case.handler._vis.background_scheduler.add_job.assert_not_called()
 
 
-def test_successful_retention_waits_for_every_committed_delete(tmp_path, get_db_session):
+def test_successful_retention_waits_for_every_committed_delete(
+    tmp_path, get_db_session
+):
     """A completed batch retires normally, with duplicate replies coalesced."""
     case = _case(tmp_path, get_db_session, count=2)
     case.handler._check_tier(get_db_session, case.data)
@@ -163,8 +166,8 @@ def test_successful_retention_waits_for_every_committed_delete(tmp_path, get_db_
     case.handler._vis.background_scheduler.add_job.assert_called_once()
     _run_finalization(case)
     assert _recording(get_db_session, case.recording_id) is None
-    case.thumbnail.move_thumbnail.assert_called_once_with(case.recording_id, None)
-    case.clip.move_event_clip.assert_called_once_with(case.recording_id, None)
+    case.thumbnail.move_thumbnail.assert_not_called()
+    case.clip.move_event_clip.assert_not_called()
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -275,3 +278,140 @@ def test_late_indexed_event_segment_prevents_finalization(
     case.thumbnail.move_thumbnail.assert_not_called()
     case.clip.move_event_clip.assert_not_called()
     assert late.read_bytes() == b"late footage"
+
+
+@pytest.mark.parametrize("arrival", ["fragment", "reopened-event"])
+def test_terminal_retirement_rechecks_at_delete_without_retiring_assets(
+    tmp_path, get_db_session, arrival
+):
+    """A change after eligibility selection cannot retire metadata or assets."""
+    case = _case(tmp_path, get_db_session)
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    delete_segment(get_db_session, command.args[0].src, case.handler._logger)
+    command.kwargs["callback"](command.args[0])
+    recording = _recording(get_db_session, case.recording_id)
+    injected = False
+
+    def arrive(_connection, _cursor, statement, _parameters, _context, _many):
+        nonlocal injected
+        if injected or not statement.startswith("DELETE FROM recordings"):
+            return
+        injected = True
+        with get_db_session() as session:
+            if arrival == "reopened-event":
+                session.execute(update(Recordings).values(end_time=None))
+            else:
+                late = tmp_path / "arriving.m4s"
+                late.write_bytes(b"late video")
+                session.add(
+                    Files(
+                        tier_id=0,
+                        tier_path=str(tmp_path),
+                        camera_identifier="test",
+                        category="recorder",
+                        subcategory="segments",
+                        path=str(late),
+                        directory=str(tmp_path),
+                        filename=late.name,
+                        size=10,
+                        orig_ctime=recording.adjusted_start_time,
+                        duration=1,
+                    )
+                )
+            session.commit()
+
+    engine = get_db_session.kw["bind"]
+    sqlalchemy_event.listen(engine, "before_cursor_execute", arrive)
+    try:
+        _run_finalization(case)
+    finally:
+        sqlalchemy_event.remove(engine, "before_cursor_execute", arrive)
+    assert injected
+    assert _recording(get_db_session, case.recording_id) is not None
+    case.thumbnail.move_thumbnail.assert_not_called()
+    case.clip.move_event_clip.assert_not_called()
+
+
+def test_terminal_assets_are_deleted_only_after_retirement_commits(
+    tmp_path, get_db_session
+):
+    """Real asset deletion observes the committed retirement, not a selected ID."""
+    case = _case(tmp_path, get_db_session)
+    assets = [tmp_path / "event.jpg", tmp_path / "event.mp4"]
+    for path in assets:
+        path.write_bytes(b"asset")
+    with get_db_session() as session:
+        recording = session.get(Recordings, case.recording_id)
+        recording.thumbnail_path, recording.clip_path = map(str, assets)
+        for kind, path in zip(("thumbnails", "event_clips"), assets, strict=True):
+            session.add(
+                Files(
+                    tier_id=0,
+                    tier_path=str(tmp_path),
+                    camera_identifier="test",
+                    category="recorder",
+                    subcategory=kind,
+                    path=str(path),
+                    directory=str(tmp_path),
+                    filename=path.name,
+                    size=5,
+                    orig_ctime=recording.start_time,
+                )
+            )
+        session.commit()
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    delete_segment(get_db_session, command.args[0].src, case.handler._logger)
+    command.kwargs["callback"](command.args[0])
+    removed = []
+
+    def remove_asset(item, **_kwargs):
+        assert _recording(get_db_session, case.recording_id) is None
+        assert os.path.exists(item.src)
+        delete_segment(get_db_session, item.src, case.handler._logger)
+        removed.append(item.src)
+
+    case.storage.tier_check_worker_send_command.side_effect = remove_asset
+    _run_finalization(case)
+    assert sorted(removed) == sorted(map(str, assets))
+    assert not any(path.exists() for path in assets)
+
+
+def test_rejected_terminal_asset_cleanup_leaves_files_for_orphan_recovery(
+    tmp_path, get_db_session
+):
+    """Queue pressure after retirement cannot lose the retained asset file."""
+    case = _case(tmp_path, get_db_session)
+    path = tmp_path / "event.jpg"
+    path.write_bytes(b"asset")
+    with get_db_session() as session:
+        recording = session.get(Recordings, case.recording_id)
+        recording.thumbnail_path = str(path)
+        session.add(
+            Files(
+                tier_id=0,
+                tier_path=str(tmp_path),
+                camera_identifier="test",
+                category="recorder",
+                subcategory="thumbnails",
+                path=str(path),
+                directory=str(tmp_path),
+                filename=path.name,
+                size=5,
+                orig_ctime=recording.start_time,
+            )
+        )
+        session.commit()
+    case.handler._check_tier(get_db_session, case.data)
+    command = case.storage.tier_check_worker_send_command.call_args
+    delete_segment(get_db_session, command.args[0].src, case.handler._logger)
+    command.kwargs["callback"](command.args[0])
+    case.storage.tier_check_worker_send_command.side_effect = (
+        StorageCallbackCapacityError("full")
+    )
+    _run_finalization(case)
+    assert _recording(get_db_session, case.recording_id) is None
+    assert path.read_bytes() == b"asset"
+    with get_db_session() as session:
+        assert session.execute(select(Files.path)).scalar_one() == str(path)

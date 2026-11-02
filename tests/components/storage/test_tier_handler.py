@@ -451,8 +451,8 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 1,
                 True,
                 None,
-                True,
-                True,
+                False,
+                False,
             ),
             # Test that check_tier deletes the file if its not part of a recording and
             # next tier does not store continuous
