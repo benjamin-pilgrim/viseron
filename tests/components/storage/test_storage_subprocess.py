@@ -13,6 +13,7 @@ from viseron.components.storage.storage_subprocess import (
     DataItem,
     DedupCheckQueue,
     TierCheckWorker,
+    get_parser,
 )
 
 
@@ -201,3 +202,23 @@ def test_worker_marks_busy_check_as_deferred() -> None:
     worker.check_tier(item)
     assert item.deferred
     assert item.data is None
+
+
+@pytest.mark.parametrize("cpu_limit", [None, 10])
+def test_storage_worker_command_parses_optional_cpu_limit(cpu_limit):
+    """Disabling CPU throttling must produce a valid child command."""
+    worker = object.__new__(TierCheckWorker)
+    worker._cpulimit = cpu_limit
+    worker._workers = 4
+    worker._server_port = 12345
+    worker._authkey_store = Mock(authkey="test-key")
+    worker._log_pipe = Mock()
+    worker._name = "test"
+    with patch(
+        "viseron.components.storage.storage_subprocess.RestartablePopen"
+    ) as popen:
+        worker.spawn_subprocess()
+    command = popen.call_args.args[0]
+    parsed = get_parser().parse_args(command[3:])
+    assert parsed.cpulimit == cpu_limit
+    assert parsed.workers == 4

@@ -211,15 +211,16 @@ class TierCheckWorker(SubProcessWorker):
 
     def spawn_subprocess(self) -> RestartablePopen:
         """Spawn subprocess."""
+        command = [
+            "python3", "-u", "viseron/components/storage/storage_subprocess.py",
+            "--manager-port", str(self._server_port),
+            "--manager-authkey", str(self._authkey_store.authkey),
+            "--workers", str(self._workers), "--loglevel", "DEBUG",
+        ]
+        if self._cpulimit is not None:
+            command.extend(["--cpulimit", str(self._cpulimit)])
         return RestartablePopen(
-            (
-                "python3 -u viseron/components/storage/storage_subprocess.py "
-                f"--manager-port {self._server_port} "
-                f"--manager-authkey {self._authkey_store.authkey} "
-                f"--cpulimit {self._cpulimit} "
-                f"--workers {self._workers} "
-                f"--loglevel DEBUG"
-            ).split(" "),
+            command,
             name=self.subprocess_name,
             stdout=self._log_pipe,
             stderr=self._log_pipe,

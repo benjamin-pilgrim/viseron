@@ -305,6 +305,30 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         row.tier_id = 0
         session.commit()
 
+    # Content corruption with unchanged inode and length must never acknowledge
+    # a RAM-to-NAS promotion or remove its source database row.
+    for damaged in (dest, dest.parent / "init.mp4"):
+        original = damaged.read_bytes()
+        damaged.write_bytes(b"x" * len(original))
+        with patch("viseron.components.storage.tier_handler.threading.Timer"):
+            handler._on_created(event)
+        assert src.exists() and marker_path.exists() and marker_for_source(src).exists()
+        completed.assert_not_called()
+        with get_db_session() as session:
+            assert session.execute(
+                select(Files.id).where(Files.path == str(src))
+            ).scalar_one() == source_id
+        damaged.write_bytes(original)
+
+    with (
+        patch("viseron.components.storage.pending_journal.verify_file_contents",
+              side_effect=OSError("CIFS readback failed")),
+        patch("viseron.components.storage.tier_handler.threading.Timer"),
+    ):
+        handler._on_created(event)
+    assert src.exists() and marker_path.exists() and marker_for_source(src).exists()
+    completed.assert_not_called()
+
     # Simulate a database outage after unlink; replay must finish safely.
     # Save original before replacing: wrapper above cannot refer to itself.
     real_release = release_indexed_source
@@ -774,8 +798,9 @@ def test_first_tier_journal_allocates_stable_key_and_keeps_staging(
     assert dest.read_bytes() == b"video"
 
 
+@pytest.mark.parametrize("corruption", [None, "segment", "init"])
 def test_first_tier_release_is_driven_by_real_handler(
-    tmp_path, get_db_session, monkeypatch
+    tmp_path, get_db_session, monkeypatch, corruption
 ):
     """The real watcher callback releases the spool only after committed indexing."""
 
@@ -821,6 +846,16 @@ def test_first_tier_release_is_driven_by_real_handler(
     ):
         handler._on_created(FileCreatedEvent(str(dest)))
     assert source.exists() and intent.exists() and os.path.exists(marker)
+
+    if corruption is not None:
+        damaged = dest if corruption == "segment" else dest.parent / "init.mp4"
+        original = damaged.read_bytes()
+        damaged.write_bytes(b"x" * len(original))
+        with patch("viseron.components.storage.tier_handler.threading.Timer"):
+            handler._on_created(FileCreatedEvent(str(dest)))
+        assert source.exists(), "Unverified destination must not release its source"
+        assert intent.exists() and os.path.exists(marker)
+        damaged.write_bytes(original)
 
     original_unlink = Path.unlink
 

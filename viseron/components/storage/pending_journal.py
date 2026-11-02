@@ -1,4 +1,4 @@
-"""Prototype only: durable per-file pending record, no Viseron integration."""
+"""Durable publication records and verified source handover."""
 
 import hashlib
 import contextlib
@@ -51,6 +51,9 @@ def prepare(
             if not re.fullmatch(r"[0-9a-f]{64}", copied_digest or ""):
                 raise ValueError("missing copied-byte digest")
             record["copied_digest"] = copied_digest
+            record["init_digest"] = hashlib.sha256(
+                (intent.parent / "init.mp4").read_bytes()
+            ).hexdigest()
             record["source_intent"] = str(intent)
             record["source_snapshot"] = {
                 k: source[k]
@@ -183,6 +186,42 @@ def publish_or_verify(marker):
     return record
 
 
+def verify_file_contents(path, expected_digest, expected_identity=None):
+    """Sync and read back a stable regular file before releasing its source.
+
+    Cache eviction is advisory, not a substitute for the filesystem's fsync
+    contract. Storage writers must not use signal-based CPU throttling.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest or ""):
+        return False
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or (
+            expected_identity is not None
+            and [before.st_dev, before.st_ino, before.st_size] != expected_identity
+        ):
+            return False
+        os.fsync(stream.fileno())
+        with contextlib.suppress(OSError):
+            os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        digest = hashlib.sha256()
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(stream.fileno())
+        named = os.stat(path, follow_symlinks=False)
+
+        def attrs(info):
+            return (
+                info.st_dev, info.st_ino, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns,
+            )
+
+        return (
+            attrs(before) == attrs(after) == attrs(named)
+            and digest.hexdigest() == expected_digest
+        )
+
+
 def release_indexed_source(
     marker,
     allowed_source_roots,
@@ -224,6 +263,17 @@ def release_indexed_source(
             return "invalid"
         if not tier_available(str(destination)) or not index_is_committed(record):
             return "uncommitted"
+        init_digest = record.get("init_digest")
+        if init_digest is None:
+            # Older records did not persist init content identity. Adopt only
+            # from the retained immutable source run; never from the target.
+            init_digest = hashlib.sha256(
+                (source.parent / "init.mp4").read_bytes()
+            ).hexdigest()
+        if not verify_file_contents(
+            destination, record.get("copied_digest"), record["identity"]
+        ) or not verify_file_contents(destination.parent / "init.mp4", init_digest):
+            return "destination-unverified"
         # No destination I/O after acquiring source camera lock.
         camera = os.path.abspath(source.parent.parent)
         with camera_lock(lock_root, camera):

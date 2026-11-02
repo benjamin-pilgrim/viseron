@@ -126,7 +126,7 @@ CONFIG_TIERS: Final = "tiers"
 CONFIG_INTERVAL: Final = "interval"
 
 
-DEFAULT_TIER_CHECK_CPU_LIMIT: Final = 10
+DEFAULT_TIER_CHECK_CPU_LIMIT: Final = None
 DEFAULT_TIER_CHECK_WORKERS: Final = 4
 DEFAULT_TIER_CHECK_BATCH_SIZE: Final = 5
 DEFAULT_TIER_CHECK_SLEEP_BETWEEN_BATCHES: Final = 0.5
@@ -182,7 +182,8 @@ DEFAULT_EVENTS: Final = None
 DEFAULT_INTERVAL: dict[str, Any] = {}
 
 DESC_TIER_CHECK_CPU_LIMIT = (
-    "CPU limit for the tier check process. "
+    "Optional signal-based CPU limit for the storage process. Disabled by default. "
+    "Leave disabled for network storage: stop/resume signals can interrupt writes. "
     "This is used to limit the CPU usage of the process that checks for files to move "
     "or delete. "
     "This is useful to not overload the system with the tier check process. "
