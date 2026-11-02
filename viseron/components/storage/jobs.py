@@ -6,6 +6,7 @@ import contextlib
 import datetime
 import logging
 import os
+import stat
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import setproctitle
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import and_, delete, exists, func, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.orm import sessionmaker
 
 from viseron.components.storage.const import (
@@ -49,7 +50,7 @@ from viseron.components.storage.util import (
     tier_markers_available,
     require_tier_markers,
 )
-from viseron.const import CAMERA_SEGMENT_DURATION, VISERON_SIGNAL_SHUTDOWN
+from viseron.const import TEMP_DIR, VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 from viseron.exceptions import DomainNotRegisteredError
 from viseron.helpers import utcnow
@@ -63,6 +64,7 @@ from viseron.watchdog.process_watchdog import RestartableProcess
 from viseron.watchdog.thread_watchdog import RestartableThread
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from multiprocessing.synchronize import Event
 
     from apscheduler.triggers.interval import IntervalTrigger
@@ -105,6 +107,7 @@ class CleanupJobConfig:
     sensitive_strings: tuple[str, ...]
     log_level: int
     tier_markers: dict[str, str] | None = None
+    recording_paths: dict[str, tuple[str, ...]] | None = None
 
 
 class CleanupJobRunner:
@@ -116,6 +119,7 @@ class CleanupJobRunner:
         self.ignored_files = config.ignored_files
         self.kill_event = kill_event
         self.tier_markers = config.tier_markers or {}
+        self.recording_paths = config.recording_paths or {}
         self._session_maker = sessionmaker(bind=ENGINE)
         self._last_log_time = 0.0
 
@@ -192,6 +196,10 @@ class BaseCleanupJob(ABC):
         """Return the storage paths the job processes."""
         return []
 
+    def _get_recording_paths(self) -> dict[str, tuple[str, ...]]:
+        """Return recording roots needed by event recovery, resolved in the parent."""
+        return {}
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -217,6 +225,7 @@ class BaseCleanupJob(ABC):
         process_config = CleanupJobConfig(
             name=self.name,
             paths=self._get_paths(),
+            recording_paths=self._get_recording_paths(),
             ignored_files=frozenset(self._storage.ignored_files),
             sensitive_strings=tuple(SensitiveInformationFilter.sensitive_strings),
             log_level=logging.getLogger().level,
@@ -922,8 +931,71 @@ class OrphanedEventClipsCleanup(BaseCleanupJob):
         )
 
 
+@contextlib.contextmanager
+def _empty_recording_run(
+    runner: CleanupJobRunner, recording: Recordings
+) -> Iterator[bool]:
+    """Prove a whole run is drained; uncertainty keeps the event for a later pass.
+
+    This is deliberately coarser than normal callback-driven retention. It only
+    recovers lost callbacks once the run has no media, staging or recovery state.
+    Unscoped legacy events require manual reconciliation.
+    """
+    roots = getattr(runner, "recording_paths", {}).get(recording.camera_identifier)
+    run_id = recording.recorder_run_id
+    if not roots or not run_id or not is_run_directory(run_id):
+        yield False
+        return
+    with contextlib.ExitStack() as locks:
+        empty = False
+        try:
+            for root in sorted(set(roots)):
+                locks.enter_context(camera_lock("/tmp/viseron-run-locks", root))
+                require_tier_markers(root, runner.tier_markers)
+                if not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode):
+                    break
+                run = os.path.join(root, run_id)
+                try:
+                    info = os.stat(run, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    break
+                with os.scandir(run) as entries:
+                    if any(
+                        entry.name
+                        not in {"init.mp4", ".viseron-tier-move-run-init.json"}
+                        or not entry.is_file(follow_symlinks=False)
+                        for entry in entries
+                    ):
+                        break
+            else:
+                for root in roots:
+                    require_tier_markers(root, runner.tier_markers)
+                empty = True
+        except OSError:
+            LOGGER.debug("Deferring event recovery for %s", recording.id, exc_info=True)
+        yield empty
+
+
 class OrphanedRecordingsCleanup(BaseCleanupJob):
     """Cleanup job that removes orphaned recording entries from the database."""
+
+    def _get_recording_paths(self) -> dict[str, tuple[str, ...]]:
+        """Include all tiers, current spool and retained legacy staging."""
+        paths = {}
+        for identifier, camera in (self._get_cameras() or {}).items():
+            roots = list(self._storage.get_segments_path(camera, all_tiers=True))
+            roots.append(camera.temp_segments_folder)
+            legacy = TEMP_DIR + camera.segments_folder
+            try:
+                os.lstat(legacy)
+            except FileNotFoundError:
+                pass
+            else:
+                roots.append(legacy)
+            paths[identifier] = tuple(sorted({os.path.abspath(root) for root in roots}))
+        return paths
 
     @property
     def name(self) -> str:
@@ -969,47 +1041,53 @@ class OrphanedRecordingsCleanup(BaseCleanupJob):
                 # Update cursor
                 last_id = batch[-1][0].id
 
-                # Find orphaned recordings
-                to_delete = []
-                for recording in batch:
+                for (recording,) in batch:
                     if runner.kill_event.is_set():
                         break
-                    has_segments = session.execute(
-                        select(1)
-                        .select_from(Files)
-                        .where(
-                            and_(
+                    # Missing rows alone do not prove that footage was retired.
+                    # Hold every publication lock until the deletion commits.
+                    with _empty_recording_run(runner, recording) as empty:
+                        if (
+                            not empty
+                            or runner.kill_event.is_set()
+                            or recording.recorder_run_id is None
+                        ):
+                            continue
+                        has_segments = session.execute(
+                            select(Files.id)
+                            .where(
                                 Files.category == TIER_CATEGORY_RECORDER,
                                 Files.subcategory == TIER_SUBCATEGORY_SEGMENTS,
-                                Files.camera_identifier
-                                == recording[0].camera_identifier,
-                                Files.orig_ctime.between(
-                                    recording[0].adjusted_start_time.replace(
-                                        microsecond=0
-                                    ),
-                                    recording[0].end_time.replace(microsecond=0)
-                                    + datetime.timedelta(
-                                        seconds=CAMERA_SEGMENT_DURATION
-                                    ),
+                                Files.camera_identifier == recording.camera_identifier,
+                                Files.directory.endswith(
+                                    "/" + recording.recorder_run_id
+                                ),
+                                Files.orig_ctime < recording.end_time,
+                                or_(
+                                    Files.duration.is_(None),
+                                    Files.orig_ctime
+                                    + func.make_interval(
+                                        0, 0, 0, 0, 0, 0, Files.duration
+                                    )
+                                    >= recording.adjusted_start_time,
                                 ),
                             )
+                            .limit(1)
+                        ).first()
+                        if has_segments:
+                            continue
+                        result = cast(
+                            "CursorResult[Any]",
+                            session.execute(
+                                delete(Recordings).where(
+                                    Recordings.id == recording.id,
+                                    Recordings.end_time.is_not(None),
+                                )
+                            ),
                         )
-                        .limit(1)
-                    ).first()
+                        session.commit()
+                        total_deleted += result.rowcount
                     time.sleep(0.1)
-
-                    if not has_segments:
-                        to_delete.append(recording[0].id)
-
-                if to_delete:
-                    result = cast(
-                        "CursorResult[Any]",
-                        session.execute(
-                            delete(Recordings).where(Recordings.id.in_(to_delete))
-                        ),
-                    )
-                    session.commit()
-                    total_deleted += result.rowcount
 
                 total_processed += len(batch)
                 runner.log_progress(
