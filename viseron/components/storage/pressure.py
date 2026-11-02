@@ -264,6 +264,7 @@ def reclaim(config, get_session, *, free_space=None):
             "promote": [item for item in candidates if item["id"] is not None][:16],
         }
     deleted = 0
+    removed = set()
     for candidate in candidates:
         if (
             free_space() >= target_free
@@ -335,6 +336,7 @@ def reclaim(config, get_session, *, free_space=None):
                     )
                 session.commit()
                 deleted += 1
+                removed.add(path)
                 used -= candidate["identity"][2]
         except OSError:
             continue
@@ -348,7 +350,11 @@ def reclaim(config, get_session, *, free_space=None):
         "deleted": deleted,
         "used": used,
         "free": free_space(),
-        "promote": [item for item in candidates if item["id"] is not None][:16],
+        "promote": [
+            item
+            for item in candidates
+            if item["id"] is not None and item["path"] not in removed
+        ][:16],
         "offset": 0 if deleted or scanned < BATCH else config.get("offset", 0) + BATCH,
     }
 

@@ -201,6 +201,8 @@ def test_size_budget_is_shared_across_cameras(get_db_session, tmp_path):
     assert result["deleted"] == 1
     assert not oldest.exists()
     assert newest.exists()
+    assert str(oldest) not in {item["path"] for item in result["promote"]}
+    assert str(newest) in {item["path"] for item in result["promote"]}
 
 
 def test_normalized_camera_override_is_idempotent():
