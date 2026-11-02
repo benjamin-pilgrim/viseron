@@ -66,6 +66,12 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_THUMBNAILS,
     CleanupJobNames,
 )
+from viseron.components.storage.asset_moves import (
+    asset_move_pending,
+    destination_pending,
+    is_recording_asset,
+    reserve as reserve_asset_move,
+)
 from viseron.components.storage.dispatch_fence import create_token
 from viseron.components.storage.pending_journal import (
     PREFIX,
@@ -271,7 +277,20 @@ class TierHandler(FileSystemEventHandler):
         self._hold_retry_stopping = False
         self._hold_retry_since = 0.0
         self._hold_retry_warned = False
-        if self._subcategory == TIER_SUBCATEGORY_SEGMENTS:
+        self._asset_move_cursor = 0
+        if self._category == TIER_CATEGORY_RECORDER and self._subcategory in (
+            TIER_SUBCATEGORY_THUMBNAILS,
+            TIER_SUBCATEGORY_EVENT_CLIPS,
+        ):
+            self._source_intent_job = self._vis.background_scheduler.add_job(
+                self._reconcile_asset_moves,
+                "interval",
+                seconds=30,
+                next_run_time=utcnow(),
+                max_instances=1,
+                coalesce=True,
+            )
+        elif self._subcategory == TIER_SUBCATEGORY_SEGMENTS:
             self._source_intent_job = self._vis.background_scheduler.add_job(
                 self._reconcile_source_intents,
                 "interval",
@@ -280,6 +299,82 @@ class TierHandler(FileSystemEventHandler):
                 max_instances=1,
                 coalesce=True,
             )
+
+    def _reconcile_asset_moves(self) -> None:
+        """Bound retries and keep unavailable asset storage off scheduler threads."""
+        if self._tier_check_stopping or not self._source_scan_lock.acquire(False):
+            return
+
+        def replay() -> None:
+            try:
+                self._replay_asset_moves()
+            except Exception:  # pylint: disable=broad-except
+                self._logger.exception("Could not replay recording asset moves")
+            finally:
+                self._source_scan_lock.release()
+
+        try:
+            threading.Thread(
+                target=replay, daemon=True, name="asset-move-replay"
+            ).start()
+        except Exception:
+            self._source_scan_lock.release()
+            raise
+
+    def _replay_asset_moves(self) -> None:
+        """Resume a rotating batch from destinations stored on existing file rows."""
+        with self._storage.get_session() as session:
+            rows = (
+                session.execute(
+                    select(Files)
+                    .where(
+                        Files.camera_identifier == self._camera.identifier,
+                        Files.category == self._category,
+                        Files.subcategory == self._subcategory,
+                        Files.tier_id == self._tier_id,
+                        Files.tier_path == self._tier[CONFIG_PATH],
+                        Files.move_target.is_not(None),
+                        Files.id > self._asset_move_cursor,
+                    )
+                    .order_by(Files.id)
+                    .limit(20)
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                self._asset_move_cursor = 0
+                return
+            for row in rows:
+                self._asset_move_cursor = row.id
+                target = row.move_target
+                if self._tier_check_stopping:
+                    return
+                if not (
+                    self._storage.tier_available(row.path)
+                    and self._storage.tier_available(target["path"])
+                ):
+                    continue
+                try:
+                    move_file(
+                        self._vis,
+                        self._storage,
+                        self._storage.get_session,
+                        self._camera.identifier,
+                        self._tier_id,
+                        self._category,
+                        self._subcategory,
+                        row.path,
+                        target["path"],
+                        target["tier_path"],
+                        self._logger,
+                    )
+                except (OSError, SQLAlchemyError, StorageCallbackCapacityError):
+                    self._logger.warning("Deferred asset move for %s", row.path)
+
+    def _asset_destination_pending(self, path: str) -> bool:
+        with self._storage.get_session() as session:
+            return destination_pending(session, path)
 
     def _reconcile_source_intents(self):
         """Run at most one isolated scan without occupying the scheduler."""
@@ -1398,6 +1493,13 @@ class TierHandler(FileSystemEventHandler):
         src_path = _src_path(event)
         directory = os.path.dirname(src_path)
         if not is_run_directory(os.path.basename(directory)):
+            if self._category == TIER_CATEGORY_RECORDER and self._subcategory in (
+                TIER_SUBCATEGORY_THUMBNAILS,
+                TIER_SUBCATEGORY_EVENT_CLIPS,
+            ):
+                with self._storage.get_session() as session:
+                    if asset_move_pending(session, src_path):
+                        return
             return self._on_deleted_impl(event)
         try:
             with camera_lock(
@@ -2046,12 +2148,21 @@ class ThumbnailTierHandler(TierHandler):
 
     def _on_created(self, event: FileCreatedEvent) -> None:
         src_path = _src_path(event)
+        if self._asset_destination_pending(src_path):
+            return
 
         try:
             with self._storage.get_session() as session:
                 stmt = (
                     update(Recordings)
                     .where(Recordings.id == os.path.basename(src_path).split(".")[0])
+                    .where(Recordings.camera_identifier == self._camera.identifier)
+                    .where(
+                        or_(
+                            Recordings.thumbnail_path.is_(None),
+                            Recordings.thumbnail_path == src_path,
+                        )
+                    )
                     .values(thumbnail_path=src_path)
                 )
                 session.execute(stmt)
@@ -2085,6 +2196,19 @@ class ThumbnailTierHandler(TierHandler):
                 )
                 return
 
+            indexed = session.execute(
+                select(Files.id).where(
+                    Files.path == recording.thumbnail_path,
+                    Files.camera_identifier == self._camera.identifier,
+                    Files.tier_id == self._tier_id,
+                    Files.tier_path == self._tier[CONFIG_PATH],
+                    Files.category == self._category,
+                    Files.subcategory == self._subcategory,
+                )
+            ).first()
+            if indexed is None:
+                return  # A duplicate or stale event batch no longer owns this asset.
+
             handle_file(
                 self._vis,
                 self._storage.get_session,
@@ -2109,39 +2233,17 @@ class EventClipTierHandler(TierHandler):
         """Initialize event clips tier."""
         self._path = get_event_clips_path(self._tier, self._camera)
         self.add_file_handler(
-            self._path, rf"{re.escape(self._path)}/(.*\.{re.escape(self._camera.extension)}$)"
+            self._path,
+            rf"{re.escape(self._path)}/(.*\.{re.escape(self._camera.extension)}$)",
         )
 
     def check_tier(self, *, force: bool = False) -> bool:  # noqa: ARG002
         """Do nothing, as we move event clips manually."""
         return True
 
-    def _update_clip_path(self, event: FileCreatedEvent) -> None:
-        src_path = _src_path(event)
-
-        try:
-            with self._storage.get_session() as session:
-                stmt = (
-                    update(Recordings)
-                    .where(Recordings.camera_identifier == self._camera.identifier)
-                    .where(
-                        Recordings.clip_path.like(
-                            f"%{src_path.split('/')[-2]}/{os.path.basename(src_path)}"
-                        )
-                    )
-                    .values(clip_path=src_path)
-                )
-                session.execute(stmt)
-                session.commit()
-        except Exception as error:  # pylint: disable=broad-except # noqa: BLE001
-            self._logger.error(
-                "Failed to update clip path for recording with path: "
-                f"{src_path}: {error}"
-            )
-
     def _on_created(self, event: FileCreatedEvent) -> None:
-        if not self.first_tier:
-            self._update_clip_path(event)
+        if self._asset_destination_pending(_src_path(event)):
+            return
         super()._on_created(event)
 
     def move_event_clip(
@@ -2156,6 +2258,19 @@ class EventClipTierHandler(TierHandler):
             )
             recording = session.execute(sel).scalar()
             if recording is None:
+                return
+
+            indexed = session.execute(
+                select(Files.id).where(
+                    Files.path == recording.clip_path,
+                    Files.camera_identifier == self._camera.identifier,
+                    Files.tier_id == self._tier_id,
+                    Files.tier_path == self._tier[CONFIG_PATH],
+                    Files.category == self._category,
+                    Files.subcategory == self._subcategory,
+                )
+            ).first()
+            if indexed is None:
                 return
 
             handle_file(
@@ -2317,7 +2432,12 @@ def handle_file(
                     if protected_by_pending(path) or source_move_pending(path):
                         return
                     with get_session() as session:
-                        stmt = delete(Files).where(Files.path == path)
+                        stmt = delete(Files).where(
+                            Files.path == path,
+                            Files.tier_id == curr_tier_id,
+                            Files.tier_path == tier_path,
+                            Files.move_target.is_(None),
+                        )
                         session.execute(stmt)
                         session.commit()
             except OSError:
@@ -2326,7 +2446,12 @@ def handle_file(
                 )
             return
         with get_session() as session:
-            stmt = delete(Files).where(Files.path == path)
+            stmt = delete(Files).where(
+                Files.path == path,
+                Files.tier_id == curr_tier_id,
+                Files.tier_path == tier_path,
+                Files.move_target.is_(None),
+            )
             session.execute(stmt)
             session.commit()
 
@@ -2392,6 +2517,7 @@ def move_file(
     file_meta = None
     source_db = None
     pending_move = None
+    asset_target = None
     try:
         with get_session() as session:
             _lock_path(session, src)
@@ -2407,9 +2533,27 @@ def move_file(
                 duration=res.duration,
                 file_key=res.file_key,
             )
+            if is_recording_asset(res):
+                destination_tier_id = None
+                handlers = storage.camera_tier_handlers[camera_identifier][
+                    curr_tier_category
+                ]
+                for index, handler in enumerate(handlers):
+                    if (
+                        handler[curr_tier_subcategory].tier[CONFIG_PATH]
+                        == dst_tier_path
+                    ):
+                        destination_tier_id = index
+                        break
+                if destination_tier_id is None:
+                    raise OSError("Asset destination tier is no longer configured")
+                asset_target = reserve_asset_move(
+                    res, dst, destination_tier_id, dst_tier_path
+                )
+                session.commit()
             pending_move = PendingMove(
                 dst=dst,
-                tier_id=curr_tier_id + 1,
+                tier_id=(asset_target["tier_id"] if asset_target else curr_tier_id + 1),
                 tier_path=dst_tier_path,
                 on_complete=on_complete,
             )
@@ -2470,6 +2614,15 @@ def move_file(
                     logger,
                 )
             return
+        if asset_target is not None and not item.error:
+            with storage.pending_moves_lock:
+                if storage.pending_moves.get(src) is pending_move:
+                    storage.pending_moves.pop(src, None)
+                if storage.temporary_files_meta.get(dst) is file_meta:
+                    storage.temporary_files_meta.pop(dst, None)
+            if on_complete is not None:
+                on_complete()
+            return
         if item.error:
             logger.error(f"Error moving file {src} to {dst}: {item.error}")
             with storage.pending_moves_lock:
@@ -2500,6 +2653,7 @@ def move_file(
                     "duration": file_meta.duration,
                     "file_key": file_meta.file_key,
                     "source_db": source_db,
+                    **({"asset_target": asset_target} if asset_target else {}),
                 },
             ),
             callback=_move_file_callback,

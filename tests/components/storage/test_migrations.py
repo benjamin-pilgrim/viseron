@@ -93,3 +93,29 @@ def test_timelapse_orig_ctime_backfill(
         2: INSERT_TIME,
         1723111161: INSERT_TIME,
     }
+
+
+def test_asset_move_target_upgrade_preserves_files(
+    alembic_runner: MigrationContext, alembic_engine: Engine
+) -> None:
+    """Existing files remain unchanged and new pending destinations default empty."""
+    alembic_runner.migrate_up_before("a41e6752c801")
+    alembic_runner.insert_into("files", [_file_row(1)])
+    alembic_runner.migrate_up_one()
+    with alembic_engine.begin() as connection:
+        row = connection.execute(
+            text("SELECT file_key, move_target FROM files WHERE id = 1")
+        ).one()
+        assert row.file_key is not None
+        assert row.move_target is None
+        indexes = (
+            connection.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes WHERE tablename = 'files' "
+                    "AND indexname = 'idx_files_move_target_path'"
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert indexes == ["idx_files_move_target_path"]

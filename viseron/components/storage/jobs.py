@@ -18,6 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.orm import sessionmaker
 
+from viseron.components.storage.asset_moves import asset_locks, asset_move_pending
 from viseron.components.storage.const import (
     ENGINE,
     CONFIG_TIER_MARKERS,
@@ -396,6 +397,22 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                                         file_path,
                                         exc_info=True,
                                     )
+                            else:
+                                try:
+                                    with asset_locks(file_path):
+                                        if remove_stale_temporary(
+                                            file_path,
+                                            lambda file_path=file_path: (
+                                                require_tier_markers(
+                                                    file_path, runner.tier_markers
+                                                )
+                                            ),
+                                        ):
+                                            deleted_count += 1
+                                except OSError:
+                                    LOGGER.debug(
+                                        "Deferring temporary cleanup: %s", file_path
+                                    )
                             continue
                         if is_tier_marker(file_path, runner.tier_markers):
                             continue
@@ -418,12 +435,17 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                                             os.remove(file_path)
                                             deleted_count += 1
                             else:
-                                file_exists = session.execute(
-                                    select(Files).where(Files.path == file_path)
-                                ).first()
-                                if not file_exists and os.path.exists(file_path):
-                                    os.remove(file_path)
-                                    deleted_count += 1
+                                with asset_locks(file_path):
+                                    file_exists = session.execute(
+                                        select(Files).where(Files.path == file_path)
+                                    ).first()
+                                    if (
+                                        not file_exists
+                                        and not asset_move_pending(session, file_path)
+                                        and os.path.exists(file_path)
+                                    ):
+                                        os.remove(file_path)
+                                        deleted_count += 1
                         except OSError:
                             LOGGER.warning(
                                 "Unable to check cleanup candidate %s",
@@ -482,7 +504,7 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                 time.sleep(1)
                 files = session.execute(
                     select(Files.id, Files.path)
-                    .where(Files.id > last_id)
+                    .where(Files.id > last_id, Files.move_target.is_(None))
                     .order_by(Files.id)
                     .limit(BATCH_SIZE)
                 ).all()
@@ -501,7 +523,7 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                         if tier_markers_available(
                             file_path, runner.tier_markers
                         ) and file_is_missing(file_path):
-                            to_delete.append(file_id)
+                            to_delete.append((file_id, file_path))
                         continue
                     try:
                         with camera_lock(
@@ -531,7 +553,19 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                 if to_delete:
                     result = cast(
                         "CursorResult[Any]",
-                        session.execute(delete(Files).where(Files.id.in_(to_delete))),
+                        session.execute(
+                            delete(Files).where(
+                                Files.move_target.is_(None),
+                                or_(
+                                    *[
+                                        and_(
+                                            Files.id == file_id, Files.path == file_path
+                                        )
+                                        for file_id, file_path in to_delete
+                                    ]
+                                ),
+                            )
+                        ),
                     )
                     session.commit()
                     total_deleted += result.rowcount
@@ -588,6 +622,7 @@ class ZeroSizeFilesCleanup(BaseCleanupJob):
                             and_(
                                 Files.id > last_id,
                                 Files.size == 0,
+                                Files.move_target.is_(None),
                                 Files.created_at < cutoff_time,
                             )
                         )
@@ -806,11 +841,23 @@ class OrphanedThumbnailsCleanup(BaseCleanupJob):
                             continue
                         if not tier_markers_available(file_path, runner.tier_markers):
                             continue
-                        if file_path not in existing_thumbnails and os.path.exists(
-                            file_path
-                        ):
-                            os.remove(file_path)
-                            deleted_count += 1
+                        try:
+                            with asset_locks(file_path):
+                                if (
+                                    file_path not in existing_thumbnails
+                                    and session.execute(
+                                        select(Recordings.id)
+                                        .where(Recordings.thumbnail_path == file_path)
+                                        .limit(1)
+                                    ).first()
+                                    is None
+                                    and not asset_move_pending(session, file_path)
+                                    and os.path.exists(file_path)
+                                ):
+                                    os.remove(file_path)
+                                    deleted_count += 1
+                        except OSError:
+                            LOGGER.debug("Deferring busy asset cleanup: %s", file_path)
                         total_files_processed += 1
                         files_processed += 1
 
@@ -902,11 +949,23 @@ class OrphanedEventClipsCleanup(BaseCleanupJob):
                             continue
                         if not tier_markers_available(file_path, runner.tier_markers):
                             continue
-                        if file_path not in existing_clips and os.path.exists(
-                            file_path
-                        ):
-                            os.remove(file_path)
-                            deleted_count += 1
+                        try:
+                            with asset_locks(file_path):
+                                if (
+                                    file_path not in existing_clips
+                                    and session.execute(
+                                        select(Recordings.id)
+                                        .where(Recordings.clip_path == file_path)
+                                        .limit(1)
+                                    ).first()
+                                    is None
+                                    and not asset_move_pending(session, file_path)
+                                    and os.path.exists(file_path)
+                                ):
+                                    os.remove(file_path)
+                                    deleted_count += 1
+                        except OSError:
+                            LOGGER.debug("Deferring busy asset cleanup: %s", file_path)
                         total_files_processed += 1
                         files_processed += 1
 

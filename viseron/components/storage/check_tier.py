@@ -18,6 +18,11 @@ import numpy as np
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from viseron.components.storage.asset_moves import (
+    asset_locks,
+    asset_move_pending,
+    move_asset,
+)
 from viseron.components.storage.dispatch_fence import token_permits_start
 from viseron.components.storage.pending_journal import (
     prepare,
@@ -972,18 +977,22 @@ def delete_file(
     lock = (
         camera_lock("/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(run_dir)))
         if is_run_directory(os.path.basename(run_dir))
-        else contextlib.nullcontext()
+        else asset_locks(path)
     )
-    with lock:
-        if source_move_pending(path) or protected_by_pending(path):
+    with lock, get_session() as session:
+        session.execute(select(func.pg_advisory_xact_lock(func.hashtext(path))))
+        if (
+            source_move_pending(path)
+            or protected_by_pending(path)
+            or asset_move_pending(session, path)
+        ):
             raise BlockingIOError("File has an active publication hold")
         require_tier_markers(path, tier_markers or {})
         os.remove(path)
         require_tier_markers(path, tier_markers or {})
-        with get_session() as session:
-            stmt = delete(Files).where(Files.path == path)
-            session.execute(stmt)
-            session.commit()
+        stmt = delete(Files).where(Files.path == path)
+        session.execute(stmt)
+        session.commit()
 
 
 RUN_DIRECTORY_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12}$")
@@ -1026,6 +1035,9 @@ def move_file(
     verify_readback: bool = False,
 ) -> None:
     """Move a file while serializing generation publications with cleanup."""
+    if publication_meta is not None and "asset_target" in publication_meta:
+        move_asset(_get_session, src, dst, publication_meta, tier_markers or {})
+        return
     is_run = is_run_directory(os.path.basename(os.path.dirname(src)))
     if is_run and (camera_identifier is None or publication_meta is None):
         raise ValueError("Run segment moves require camera and publication metadata")

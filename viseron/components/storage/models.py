@@ -6,7 +6,7 @@ import datetime
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import (
     BigInteger,
@@ -113,6 +113,11 @@ class Files(Base):
 
     __table_args__ = (
         Index("idx_files_path", "path"),
+        Index(
+            "idx_files_move_target_path",
+            text("(move_target ->> 'path')"),
+            postgresql_where=text("move_target IS NOT NULL"),
+        ),
         Index("idx_files_camera_id", "camera_identifier"),
         Index(
             "idx_files_tier_lookup",
@@ -155,6 +160,9 @@ class Files(Base):
     directory: Mapped[str] = mapped_column(String)
     filename: Mapped[str] = mapped_column(String)
     size: Mapped[int] = mapped_column(Integer)
+    move_target: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     duration: Mapped[float] = mapped_column(Float, nullable=True)
     orig_ctime: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), nullable=False

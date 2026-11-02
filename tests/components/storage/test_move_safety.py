@@ -14,6 +14,8 @@ from watchdog.events import FileCreatedEvent, FileMovedEvent
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
+from sqlalchemy import Delete
+
 from viseron.components.storage.check_tier import delete_file, move_file
 from viseron.components.storage.jobs import (
     OrphanedEventClipsCleanup,
@@ -79,6 +81,8 @@ def test_failed_delete_preserves_database_record(
     source = tmp_path / "source.m4s"
     source.write_bytes(b"recording")
     get_session = MagicMock()
+    session = get_session.return_value.__enter__.return_value
+    session.execute.return_value.first.return_value = None
 
     def fail_remove(_path: str) -> None:
         raise OSError("tier unavailable")
@@ -88,7 +92,10 @@ def test_failed_delete_preserves_database_record(
         delete_file(get_session, str(source), logging.getLogger())
 
     assert source.read_bytes() == b"recording"
-    get_session.assert_not_called()
+    session.commit.assert_not_called()
+    assert all(
+        not isinstance(call.args[0], Delete) for call in session.execute.call_args_list
+    )
 
 
 def test_inaccessible_file_is_not_considered_missing(
