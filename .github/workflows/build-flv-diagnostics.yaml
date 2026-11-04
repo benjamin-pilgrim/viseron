@@ -37,7 +37,13 @@ jobs:
         run: |
           command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
           python3 docker/go2rtc-diagnostics/shadow_flv_test.py "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics/go2rtc"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build diagnostic overlay
+        timeout-minutes: 8
         run: |
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \
             -t "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
@@ -59,10 +65,5 @@ jobs:
           name: flv-diagnostic-smoke-artifacts
           path: ${{ runner.temp }}/smoke-artifacts
           if-no-files-found: ignore
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish tested image
         run: docker push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}"

@@ -56,7 +56,11 @@ log_info "[seed] building a PostgreSQL ${OLD} cluster at ${PGDATA}"
 KEYRING=/usr/share/keyrings/postgresql-archive-keyring.gpg
 KEY_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
 APT_URL=https://apt.postgresql.org/pub/repos/apt
-curl -fsSL "$KEY_URL" | gpg --dearmor -o "$KEYRING"
+KEY_SOURCE=$(mktemp)
+curl --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 10 \
+  --max-time 20 -fsSL "$KEY_URL" -o "$KEY_SOURCE"
+gpg --batch --yes --dearmor -o "$KEYRING" "$KEY_SOURCE"
+rm -f "$KEY_SOURCE"
 echo "deb [signed-by=$KEYRING] $APT_URL ${UBUNTU_CODENAME}-pgdg main" \
   > /etc/apt/sources.list.d/pgdg.list
 apt-get update
