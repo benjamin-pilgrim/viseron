@@ -140,13 +140,13 @@ class Headers:
 MEDIA_PROBE = r'''
 import json,pathlib,psutil,subprocess,tempfile,os,urllib.request
 try:
- try:
  with urllib.request.urlopen('http://127.0.0.1:1984/api/diagnostics/flv-timing',timeout=2) as response: snapshot=json.load(response)
  for record in snapshot['records']:
   print(json.dumps({'event':'flv_timing','instance':snapshot['instance'],'record':record}),flush=True)
 except Exception as exc:
  print(json.dumps({'event':'flv_diagnostics_unavailable','error_type':type(exc).__name__}),flush=True)
-with urllib.request.urlopen('http://127.0.0.1:1984/api/streams',timeout=2) as response: streams=json.load(response)
+try:
+ with urllib.request.urlopen('http://127.0.0.1:1984/api/streams',timeout=2) as response: streams=json.load(response)
  for name,stream in streams.items():
   if name not in ('front_door_camera','driveway_camera'): continue
   producers=[]

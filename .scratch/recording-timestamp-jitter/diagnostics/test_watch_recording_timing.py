@@ -1,10 +1,15 @@
 """Run with python3 -m unittest discover -s THIS_DIRECTORY -p 'test_watch*'."""
 
 import json
+import io
+import sys
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest.mock import patch
 import struct
 import unittest
 
-from watch_recording_timing import Flow, Headers
+from watch_recording_timing import Flow, Headers, MEDIA_PROBE
 
 
 def frame(ts=16000, sequence=1, ssrc=7):
@@ -23,6 +28,22 @@ def packet(payload, seq=100):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_embedded_probe_collects_source_records_and_redacts_producer_url(self):
+        snapshot = {'instance': 42, 'records': [{'seq': 1, 'producer': 7}]}
+        streams = {'front_door_camera': {'producers': [
+            {'id': 7, 'bytes_recv': 123, 'url': 'https://SECRET_CAMERA'}]}}
+        def response(url, **kwargs):
+            return io.StringIO(json.dumps(snapshot if '/diagnostics/' in url else streams))
+        output = io.StringIO()
+        with patch.dict(sys.modules, {'psutil': SimpleNamespace(process_iter=lambda *_: [])}):
+            with patch('urllib.request.urlopen', side_effect=response), redirect_stdout(output):
+                exec(MEDIA_PROBE, {})
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([x['event'] for x in rows], ['flv_timing', 'relay_state'])
+        self.assertEqual(rows[0]['record']['seq'], 1)
+        self.assertEqual(rows[1]['producers'], [{'id': 7, 'bytes_recv': 123}])
+        self.assertNotIn('SECRET', output.getvalue())
+
     def test_fragmentation_and_retransmission(self):
         flow = Flow()
         data = frame()
