@@ -1,4 +1,4 @@
-# Diagnostic overlay: the deployed Viseron application stays at b011adbf.
+# FLV timing fix plus diagnostic overlay: the deployed Viseron application stays at b011adbf.
 ARG BASE_IMAGE=ghcr.io/benjamin-pilgrim/viseron@sha256:c2cd219ff406adb306f5a9b5b2730117b340957df711071aa23c5fe0efb32c61
 FROM ${BASE_IMAGE}
 ARG DIAGNOSTIC_COMMIT

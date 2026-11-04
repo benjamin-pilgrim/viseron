@@ -18,6 +18,7 @@
 !docker/azure-agent-start.sh
 !docker/opencv-python-headless-setup.py
 !docker/jetson-nano/opencv-tuple.patch
+!docker/go2rtc/flv-audio-timestamps.patch
 !rootfs/
 !frontend/
 frontend/node_modules

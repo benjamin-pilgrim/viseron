@@ -4,6 +4,7 @@ on:
   push:
     branches: [codex/recording-integration]
     paths:
+      - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
@@ -22,6 +23,7 @@ jobs:
           git clone --depth 1 --branch v1.9.14 https://github.com/AlexxIT/go2rtc.git "$RUNNER_TEMP/go2rtc"
           test "$(git -C "$RUNNER_TEMP/go2rtc" rev-parse HEAD)" = b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
           git -C "$RUNNER_TEMP/go2rtc" apply "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics/timing.patch"
+          git -C "$RUNNER_TEMP/go2rtc" apply "$GITHUB_WORKSPACE/docker/go2rtc/flv-audio-timestamps.patch"
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
@@ -29,9 +31,9 @@ jobs:
       - name: Test diagnostics, packet equivalence, and synthetic timestamp gaps
         run: |
           cd "$RUNNER_TEMP/go2rtc"
-          go test -race ./pkg/flv ./internal/api ./pkg/rtsp
-          go test ./pkg/aac -run TestBuggy_RTSP_AAC
-          go test ./pkg/flv -run TestFLVGapReproducesAACSampleClockDivergence -v
+          go test -race ./pkg/core ./pkg/flv ./internal/api ./pkg/rtsp
+          go test -race ./pkg/aac -run 'TestBuggy_RTSP_AAC|TestRTPPay'
+          go test ./pkg/flv -run TestLegacyAACSampleClockCompressesTimestampGaps -v
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics/go2rtc" .
       - uses: docker/login-action@v3
         with:
@@ -48,11 +50,13 @@ jobs:
         timeout-minutes: 2
         run: |
           mkdir -p "$RUNNER_TEMP/flv-shadow"
-          docker run --rm --network host --entrypoint python3 \
+          for scenario in steady gap camera-catchup; do
+            docker run --rm --network host --entrypoint python3 \
             -v "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics:/diagnostics:ro" \
             -v "$RUNNER_TEMP/flv-shadow:/tmp" \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
-            /diagnostics/shadow_flv_test.py /usr/local/bin/go2rtc
+            /diagnostics/shadow_flv_test.py /usr/local/bin/go2rtc --case "$scenario"
+          done
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

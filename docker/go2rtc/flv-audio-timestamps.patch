@@ -1,0 +1,231 @@
+diff --git a/pkg/aac/rtp.go b/pkg/aac/rtp.go
+--- a/pkg/aac/rtp.go
++++ b/pkg/aac/rtp.go
+@@ -64,6 +64,16 @@
+ }
+ 
+ func RTPPay(handler core.HandlerFunc) core.HandlerFunc {
++	return rtpPay(handler, false)
++}
++
++// RTPPayWithTimestamp packetizes raw AAC without discarding its source clock.
++// Other raw AAC sources retain RTPPay's existing sample-count clock.
++func RTPPayWithTimestamp(handler core.HandlerFunc) core.HandlerFunc {
++	return rtpPay(handler, true)
++}
++
++func rtpPay(handler core.HandlerFunc, preserveTimestamp bool) core.HandlerFunc {
+ 	var seq uint16
+ 	var ts uint32
+ 
+@@ -71,6 +81,10 @@
+ 		if packet.Version != RTPPacketVersionAAC {
+ 			handler(packet)
+ 			return
++		}
++
++		if preserveTimestamp {
++			ts = packet.Timestamp
+ 		}
+ 
+ 		// support ONLY one unit in payload
+diff --git a/pkg/core/codec.go b/pkg/core/codec.go
+--- a/pkg/core/codec.go
++++ b/pkg/core/codec.go
+@@ -16,6 +16,10 @@
+ 	Channels    uint8  // 0, 1, 2
+ 	FmtpLine    string
+ 	PayloadType uint8
++
++	// RawTimestamp means raw frames carry source timestamps in ClockRate units.
++	// Payloaders must preserve those timestamps rather than synthesize a clock.
++	RawTimestamp bool
+ }
+ 
+ // MarshalJSON - return FFprobe compatible output
+diff --git a/pkg/flv/producer.go b/pkg/flv/producer.go
+--- a/pkg/flv/producer.go
++++ b/pkg/flv/producer.go
+@@ -187,6 +187,7 @@
+ 			}
+ 
+ 			codec := aac.ConfigToCodec(pkt.Payload[2:])
++			codec.RawTimestamp = true // FLV audio and video share the source clock.
+ 			media := &core.Media{
+ 				Kind:      core.KindAudio,
+ 				Direction: core.DirectionRecvonly,
+diff --git a/pkg/rtsp/consumer.go b/pkg/rtsp/consumer.go
+--- a/pkg/rtsp/consumer.go
++++ b/pkg/rtsp/consumer.go
+@@ -155,7 +155,11 @@
+ 		case core.CodecH265:
+ 			handlerFunc = h265.RTPPay(c.PacketSize, handlerFunc)
+ 		case core.CodecAAC:
+-			handlerFunc = aac.RTPPay(handlerFunc)
++			if codec.RawTimestamp {
++				handlerFunc = aac.RTPPayWithTimestamp(handlerFunc)
++			} else {
++				handlerFunc = aac.RTPPay(handlerFunc)
++			}
+ 		case core.CodecJPEG:
+ 			handlerFunc = mjpeg.RTPPay(handlerFunc)
+ 		}
+diff --git a/pkg/aac/rtp_timestamp_test.go b/pkg/aac/rtp_timestamp_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/aac/rtp_timestamp_test.go
+@@ -0,0 +1,55 @@
++package aac
++
++import (
++	"bytes"
++	"reflect"
++	"testing"
++
++	"github.com/pion/rtp"
++)
++
++func TestRTPPaySourceTimestamp(t *testing.T) {
++	for name, timestamps := range map[string][]uint32{
++		"steady_nonzero": {160000, 161024, 162048},
++		"forward_gap":    {0, 1024, 162048},
++		"backward_step":  {160000, 161024, 1024},
++		"rtp_wrap":       {0xfffffc00, 0, 1024},
++		"camera_catchup": {76536832, 76537856, 76538880, 76591328, 76592352},
++	} {
++		t.Run(name, func(t *testing.T) {
++			var got []uint32
++			pay := RTPPayWithTimestamp(func(p *rtp.Packet) {
++				got = append(got, p.Timestamp)
++				if p.Version != 2 || !p.Marker || p.SequenceNumber != uint16(len(got)-1) || !bytes.Equal(p.Payload, []byte{0, 16, 0, 16, 0x11, 0x22}) {
++					t.Fatalf("invalid AAC RTP: %+v", p)
++				}
++			})
++			for _, ts := range timestamps {
++				pay(&rtp.Packet{Header: rtp.Header{Timestamp: ts}, Payload: []byte{0x11, 0x22}})
++			}
++			if !reflect.DeepEqual(got, timestamps) {
++				t.Fatalf("timestamps %v, want %v", got, timestamps)
++			}
++		})
++	}
++}
++
++func TestRTPPayLegacyClockUnchanged(t *testing.T) {
++	var got []uint32
++	pay := RTPPay(func(p *rtp.Packet) { got = append(got, p.Timestamp) })
++	for _, ts := range []uint32{160000, 161024, 321024} {
++		pay(&rtp.Packet{Header: rtp.Header{Timestamp: ts}, Payload: []byte{0x11}})
++	}
++	if !reflect.DeepEqual(got, []uint32{0, 1024, 2048}) {
++		t.Fatal(got)
++	}
++}
++
++func TestRTPPayTimestampPassesExistingRTP(t *testing.T) {
++	packet := &rtp.Packet{Header: rtp.Header{Version: 2, Timestamp: 12345, SequenceNumber: 44, SSRC: 99}, Payload: []byte{1, 2, 3}}
++	var got *rtp.Packet
++	RTPPayWithTimestamp(func(p *rtp.Packet) { got = p })(packet)
++	if got != packet {
++		t.Fatal("existing RTP changed")
++	}
++}
+diff --git a/pkg/flv/source_timestamp_test.go b/pkg/flv/source_timestamp_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/flv/source_timestamp_test.go
+@@ -0,0 +1,42 @@
++package flv
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++func TestFLVAudioCarriesSourceTimestamps(t *testing.T) {
++	// Header + a video sequence header and AAC AudioSpecificConfig (AAC-LC/16kHz/mono).
++	data := []byte{'F', 'L', 'V', 1, 5, 0, 0, 0, 9}
++	data = append(data, sourceTimestampTag(TagVideo, 0, []byte{0x17, 0, 0, 0, 0, 1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce})...)
++	data = append(data, sourceTimestampTag(TagAudio, 0, []byte{0xaf, 0, 0x14, 0x08})...)
++	p, err := Open(bytes.NewReader(data))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var found bool
++	for _, m := range p.Medias {
++		for _, c := range m.Codecs {
++			if c.Name == core.CodecAAC {
++				found = true
++				if !c.RawTimestamp || c.ClockRate != 16000 {
++					t.Fatalf("wrong FLV audio codec: %+v", c)
++				}
++			}
++		}
++	}
++	if !found {
++		t.Fatal("no AAC codec")
++	}
++}
++
++func sourceTimestampTag(kind byte, ms uint32, payload []byte) []byte {
++	b := make([]byte, 15+len(payload))
++	b[4] = kind
++	b[5], b[6], b[7] = byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload))
++	b[8], b[9], b[10], b[11] = byte(ms>>16), byte(ms>>8), byte(ms), byte(ms>>24)
++	copy(b[15:], payload)
++	return b
++}
+diff --git a/pkg/rtsp/flv_timestamp_test.go b/pkg/rtsp/flv_timestamp_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/rtsp/flv_timestamp_test.go
+@@ -0,0 +1,47 @@
++package rtsp
++
++import (
++	"bytes"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++)
++
++type timingCaptureConn struct {
++	net.Conn
++	data bytes.Buffer
++}
++
++func (c *timingCaptureConn) Write(b []byte) (int, error)      { return c.data.Write(b) }
++func (c *timingCaptureConn) SetWriteDeadline(time.Time) error { return nil }
++
++func TestRawAACTimestampSelection(t *testing.T) {
++	for _, preserve := range []bool{false, true} {
++		capture := &timingCaptureConn{}
++		c := &Conn{conn: capture, Transport: "tcp", state: StatePlay, playOK: true}
++		codec := &core.Codec{Name: core.CodecAAC, ClockRate: 16000, PayloadType: core.PayloadTypeRAW, RawTimestamp: preserve}
++		write := c.packetWriter(codec, 2, 97)
++		for i, ts := range []uint32{160000, 161024, 321024} {
++			write(&rtp.Packet{Header: rtp.Header{Timestamp: ts}, Payload: []byte{0x11, 0x22}})
++			frame := capture.data.Bytes()
++			var packet rtp.Packet
++			if len(frame) < 4 || frame[0] != '$' || frame[1] != 2 {
++				t.Fatal("missing interleaved frame")
++			}
++			if err := packet.Unmarshal(frame[4:]); err != nil {
++				t.Fatal(err)
++			}
++			want := uint32(i) * 1024
++			if preserve {
++				want = ts
++			}
++			if packet.Timestamp != want || packet.SequenceNumber != uint16(i) || packet.PayloadType != 97 {
++				t.Fatalf("preserve=%v got=%+v want ts=%d", preserve, packet.Header, want)
++			}
++			capture.data.Reset()
++		}
++	}
++}

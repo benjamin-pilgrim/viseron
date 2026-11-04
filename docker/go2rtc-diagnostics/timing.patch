@@ -332,7 +332,7 @@ index 0000000..e653c3a
 +	}
 +}
 +
-+func TestFLVGapReproducesAACSampleClockDivergence(t *testing.T) {
++func TestLegacyAACSampleClockCompressesTimestampGaps(t *testing.T) {
 +	out := runFLV(t, true, []uint32{0, 64, 10128})
 +	var video, audio uint32
 +	for _, p := range out {
