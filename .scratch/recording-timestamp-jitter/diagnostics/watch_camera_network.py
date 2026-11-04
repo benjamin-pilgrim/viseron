@@ -214,6 +214,13 @@ class Headers:
             bucket['advertised_window_raw'] = p['window_raw']
 
 
+def capture_counters(line):
+    # SIGUSR1 uses one prefixed comma-separated line; exit uses three lines.
+    return [{'event': 'capture_counter',
+             'counter': match[2].decode().replace(' ', '_'), 'value': int(match[1])}
+            for match in re.finditer(rb'(\d+) packets (captured|received by filter|dropped by kernel)', line)]
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -299,9 +306,8 @@ def main():
 
     def capture_status():
         for raw in capture.stderr:
-            match = re.fullmatch(rb'(\d+) packets (captured|received by filter|dropped by kernel)\s*', raw)
-            if match:
-                emit({'event': 'capture_counter', 'counter': match[2].decode().replace(' ', '_'), 'value': int(match[1])})
+            for row in capture_counters(raw):
+                emit(row)
 
     def sockets():
         previous = {}

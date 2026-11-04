@@ -91,6 +91,14 @@ class Tests(unittest.TestCase):
         self.assertNotIn('bytes_retrans',rows[0])
         self.assertEqual(network.socket_rows(text,'other','192.0.2.41'),[])
 
+    def test_periodic_and_exit_capture_statistics(self):
+        periodic=b'tcpdump: 100 packets captured, 101 packets received by filter, 0 packets dropped by kernel\n'
+        rows=network.capture_counters(periodic)
+        self.assertEqual([r['value'] for r in rows],[100,101,0])
+        self.assertEqual(rows[-1]['counter'],'dropped_by_kernel')
+        self.assertEqual(network.capture_counters(b'7 packets dropped by kernel\n')[0]['value'],7)
+        self.assertEqual(network.capture_counters(b'filter description SECRET'),[])
+
     def test_syn_clears_old_connection_state(self):
         out=[];h=network.Headers({'camera':'192.0.2.40'},out.append)
         h.packet(packet(seq=100),1,10)
