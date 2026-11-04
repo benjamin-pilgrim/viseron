@@ -1,0 +1,395 @@
+diff --git a/internal/api/api.go b/internal/api/api.go
+index dfb6511..4b3ea77 100644
+--- a/internal/api/api.go
++++ b/internal/api/api.go
+@@ -15,6 +15,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/app"
++	"github.com/AlexxIT/go2rtc/pkg/flv"
+ 	"github.com/rs/zerolog"
+ )
+ 
+@@ -58,6 +59,9 @@ func Init() {
+ 	HandleFunc("api/exit", exitHandler)
+ 	HandleFunc("api/restart", restartHandler)
+ 	HandleFunc("api/log", logHandler)
++	if flv.TimingDiagnosticsEnabled {
++		HandleFunc("api/diagnostics/flv-timing", flvTimingHandler)
++	}
+ 
+ 	Handler = http.DefaultServeMux // 4th
+ 
+diff --git a/internal/api/flv_timing.go b/internal/api/flv_timing.go
+new file mode 100644
+index 0000000..65241a7
+--- /dev/null
++++ b/internal/api/flv_timing.go
+@@ -0,0 +1,26 @@
++package api
++
++import (
++	"encoding/json"
++	"github.com/AlexxIT/go2rtc/pkg/flv"
++	"net"
++	"net/http"
++	"time"
++)
++
++var flvTimingInstance = time.Now().UnixNano()
++
++func flvTimingHandler(w http.ResponseWriter, r *http.Request) {
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil || !net.ParseIP(host).IsLoopback() {
++		http.Error(w, "loopback only", http.StatusForbidden)
++		return
++	}
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	_ = json.NewEncoder(w).Encode(map[string]any{"instance": flvTimingInstance, "records": flv.TimingSnapshot()})
++}
+diff --git a/internal/api/flv_timing_test.go b/internal/api/flv_timing_test.go
+new file mode 100644
+index 0000000..e5bb714
+--- /dev/null
++++ b/internal/api/flv_timing_test.go
+@@ -0,0 +1,21 @@
++package api
++
++import (
++	"net/http/httptest"
++	"testing"
++)
++
++func TestFLVTimingHandlerLoopbackOnly(t *testing.T) {
++	for _, test := range []struct {
++		address, method string
++		code            int
++	}{{"127.0.0.1:123", "GET", 200}, {"[::1]:123", "GET", 200}, {"192.168.1.2:123", "GET", 403}, {"127.0.0.1:123", "POST", 405}} {
++		r := httptest.NewRequest(test.method, "/api/diagnostics/flv-timing", nil)
++		r.RemoteAddr = test.address
++		w := httptest.NewRecorder()
++		flvTimingHandler(w, r)
++		if w.Code != test.code {
++			t.Fatalf("%+v: %d", test, w.Code)
++		}
++	}
++}
+diff --git a/pkg/flv/producer.go b/pkg/flv/producer.go
+index 38c601d..869228c 100644
+--- a/pkg/flv/producer.go
++++ b/pkg/flv/producer.go
+@@ -75,6 +75,8 @@ func (c *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
+ }
+ 
+ func (c *Producer) Start() error {
++	timing := newTimingObserver(c.ID)
++	defer timing.close()
+ 	for {
+ 		pkt, err := c.readPacket()
+ 		if err != nil {
+@@ -89,7 +91,9 @@ func (c *Producer) Start() error {
+ 				continue
+ 			}
+ 
++			rawTimestamp := pkt.Timestamp
+ 			pkt.Timestamp = TimeToRTP(pkt.Timestamp, c.audio.Codec.ClockRate)
++			timing.observe("audio", rawTimestamp, pkt.Timestamp, c.audio.Codec.ClockRate, time.Now())
+ 			pkt.Payload = pkt.Payload[2:]
+ 			c.audio.WriteRTP(pkt)
+ 
+@@ -119,7 +123,9 @@ func (c *Producer) Start() error {
+ 				}
+ 			}
+ 
++			rawTimestamp := pkt.Timestamp
+ 			pkt.Timestamp = TimeToRTP(pkt.Timestamp, c.video.Codec.ClockRate)
++			timing.observe("video", rawTimestamp, pkt.Timestamp, c.video.Codec.ClockRate, time.Now())
+ 			c.video.WriteRTP(pkt)
+ 		}
+ 	}
+diff --git a/pkg/flv/timing_diagnostics.go b/pkg/flv/timing_diagnostics.go
+new file mode 100644
+index 0000000..0fffd1b
+--- /dev/null
++++ b/pkg/flv/timing_diagnostics.go
+@@ -0,0 +1,117 @@
++package flv
++
++// Temporary Viseron diagnostics: never retain payloads, URLs or error strings.
++import (
++	"os"
++	"sync"
++	"time"
++)
++
++const timingCapacity = 2048
++
++var TimingDiagnosticsEnabled = os.Getenv("VISERON_FLV_TIMING_DIAGNOSTICS") == "1"
++
++type TimingRecord struct {
++	Seq             uint64 `json:"seq"`
++	Event           string `json:"event"`
++	Producer        uint32 `json:"producer"`
++	Track           string `json:"track,omitempty"`
++	ObservedMS      int64  `json:"observed_ms"`
++	FirstArrivalMS  int64  `json:"first_arrival_ms,omitempty"`
++	LastArrivalMS   int64  `json:"last_arrival_ms,omitempty"`
++	ClockRate       uint32 `json:"clock_rate,omitempty"`
++	Packets         int    `json:"packets,omitempty"`
++	FirstFLV        uint32 `json:"first_flv_ms"`
++	LastFLV         uint32 `json:"last_flv_ms"`
++	FirstRTP        uint32 `json:"first_rtp"`
++	LastRTP         uint32 `json:"last_rtp"`
++	MinFLVStep      int32  `json:"min_flv_step_ms"`
++	MaxFLVStep      int32  `json:"max_flv_step_ms"`
++	MaxArrivalGapMS int64  `json:"max_arrival_gap_ms"`
++}
++
++var timingRing struct {
++	sync.Mutex
++	Records [timingCapacity]TimingRecord
++	Next    uint64
++}
++
++func pushTiming(record TimingRecord) {
++	timingRing.Lock()
++	defer timingRing.Unlock()
++	timingRing.Next++
++	record.Seq = timingRing.Next
++	timingRing.Records[(record.Seq-1)%timingCapacity] = record
++}
++
++func TimingSnapshot() []TimingRecord {
++	timingRing.Lock()
++	defer timingRing.Unlock()
++	n := min(timingRing.Next, uint64(timingCapacity))
++	out := make([]TimingRecord, 0, n)
++	for seq := timingRing.Next - n + 1; seq <= timingRing.Next; seq++ {
++		out = append(out, timingRing.Records[(seq-1)%timingCapacity])
++	}
++	return out
++}
++
++type timingWindow struct {
++	Record      TimingRecord
++	LastFLV     uint32
++	LastArrival time.Time
++}
++
++type timingObserver struct {
++	Producer     uint32
++	Video, Audio timingWindow
++}
++
++func newTimingObserver(id uint32) *timingObserver {
++	if !TimingDiagnosticsEnabled {
++		return nil
++	}
++	pushTiming(TimingRecord{Event: "flv_session_start", Producer: id, ObservedMS: time.Now().UnixMilli()})
++	return &timingObserver{Producer: id}
++}
++
++func (o *timingObserver) observe(track string, raw, rtp, clock uint32, now time.Time) {
++	if o == nil {
++		return
++	}
++	window := &o.Video
++	if track == "audio" {
++		window = &o.Audio
++	}
++	if window.Record.Packets > 0 && window.Record.LastArrivalMS/1000 != now.Unix() {
++		pushTiming(window.Record)
++		window.Record = TimingRecord{}
++	}
++	record := &window.Record
++	if record.Packets == 0 {
++		*record = TimingRecord{Event: "flv_second", Producer: o.Producer, Track: track,
++			ObservedMS: now.UnixMilli(), FirstArrivalMS: now.UnixMilli(),
++			ClockRate: clock, FirstFLV: raw, FirstRTP: rtp}
++	}
++	if !window.LastArrival.IsZero() {
++		step := int32(raw - window.LastFLV) // normal uint32 wrap is intentional
++		record.MinFLVStep = min(record.MinFLVStep, step)
++		record.MaxFLVStep = max(record.MaxFLVStep, step)
++		record.MaxArrivalGapMS = max(record.MaxArrivalGapMS, now.Sub(window.LastArrival).Milliseconds())
++	}
++	record.LastArrivalMS = now.UnixMilli()
++	record.LastFLV, record.LastRTP = raw, rtp
++	record.Packets++
++	window.LastFLV, window.LastArrival = raw, now
++}
++
++func (o *timingObserver) close() {
++	if o == nil {
++		return
++	}
++	for _, window := range []*timingWindow{&o.Video, &o.Audio} {
++		if window.Record.Packets > 0 {
++			pushTiming(window.Record)
++		}
++	}
++	pushTiming(TimingRecord{Event: "flv_session_end", Producer: o.Producer, ObservedMS: time.Now().UnixMilli()})
++}
+diff --git a/pkg/flv/timing_diagnostics_test.go b/pkg/flv/timing_diagnostics_test.go
+new file mode 100644
+index 0000000..e653c3a
+--- /dev/null
++++ b/pkg/flv/timing_diagnostics_test.go
+@@ -0,0 +1,152 @@
++package flv
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"reflect"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/aac"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264"
++	"github.com/pion/rtp"
++)
++
++func resetTiming() {
++	timingRing.Lock()
++	timingRing.Next = 0
++	timingRing.Records = [timingCapacity]TimingRecord{}
++	timingRing.Unlock()
++}
++
++func flvTag(kind byte, ms uint32, payload []byte) []byte {
++	b := make([]byte, 15+len(payload)) // previous size plus tag header
++	b[4] = kind
++	n := len(payload)
++	b[5], b[6], b[7] = byte(n>>16), byte(n>>8), byte(n)
++	b[8], b[9], b[10], b[11] = byte(ms>>16), byte(ms>>8), byte(ms), byte(ms>>24)
++	copy(b[15:], payload)
++	return b
++}
++
++type recordedPacket struct {
++	Track     string
++	Timestamp uint32
++	Payload   string
++}
++
++func runFLV(t *testing.T, enabled bool, timestamps []uint32) []recordedPacket {
++	t.Helper()
++	old := TimingDiagnosticsEnabled
++	TimingDiagnosticsEnabled = enabled
++	defer func() { TimingDiagnosticsEnabled = old }()
++	resetTiming()
++	var input []byte
++	for _, ms := range timestamps {
++		input = append(input, flvTag(TagVideo, ms, []byte{0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88})...)
++		input = append(input, flvTag(TagAudio, ms, []byte{0xaf, 1, 0x11, 0x22})...)
++	}
++	producer := &Producer{Connection: core.Connection{ID: 71}, rd: core.NewReadBuffer(bytes.NewReader(input))}
++	producer.video = core.NewReceiver(&core.Media{Kind: core.KindVideo}, &core.Codec{Name: core.CodecH264, ClockRate: 90000})
++	producer.audio = core.NewReceiver(&core.Media{Kind: core.KindAudio}, &core.Codec{Name: core.CodecAAC, ClockRate: 16000})
++	var out []recordedPacket
++	sink := func(track string) core.HandlerFunc {
++		return func(p *rtp.Packet) { out = append(out, recordedPacket{track, p.Timestamp, string(p.Payload)}) }
++	}
++	producer.video.Input = h264.RTPPay(1400, sink("video"))
++	producer.audio.Input = aac.RTPPay(sink("audio"))
++	if err := producer.Start(); err != io.EOF {
++		t.Fatalf("Start: %v", err)
++	}
++	return out
++}
++
++func TestTimingDiagnosticsFLVStallLeavesOutputIdentical(t *testing.T) {
++	cases := map[string][]uint32{"steady": {0, 64, 128}, "forward_gap": {0, 64, 10128}, "backward_step": {10000, 10064, 64}, "wrap": {0xffff_ff00, 0xffff_ff40, 0x20}}
++	for name, timestamps := range cases {
++		t.Run(name, func(t *testing.T) {
++			plain := runFLV(t, false, timestamps)
++			if len(TimingSnapshot()) != 0 {
++				t.Fatal("disabled diagnostics retained events")
++			}
++			observed := runFLV(t, true, timestamps)
++			if !reflect.DeepEqual(plain, observed) {
++				t.Fatal("diagnostics changed media packets")
++			}
++			records := TimingSnapshot()
++			if len(records) != 4 {
++				t.Fatalf("expected lifecycle + two track summaries, got %d", len(records))
++			}
++			for _, r := range records {
++				if r.Event == "flv_second" && (r.Packets != 3 || r.FirstFLV != timestamps[0] || r.LastFLV != timestamps[2] || r.LastRTP != TimeToRTP(timestamps[2], r.ClockRate)) {
++					t.Fatalf("wrong source/conversion evidence: %+v", r)
++				}
++			}
++		})
++	}
++}
++
++func TestFLVGapReproducesAACSampleClockDivergence(t *testing.T) {
++	out := runFLV(t, true, []uint32{0, 64, 10128})
++	var video, audio uint32
++	for _, p := range out {
++		if p.Track == "video" {
++			video = p.Timestamp
++		} else {
++			audio = p.Timestamp
++		}
++	}
++	if video != TimeToRTP(10128, 90000) || audio != 2*aac.AUTime {
++		t.Fatalf("unexpected packetizer behavior: video=%d audio=%d", video, audio)
++	}
++	// Input FLV clocks agree, but RTSP's existing AAC payloader compresses the gap.
++	t.Logf("aligned input FLV clocks; packetized video=%dms audio=%dms: divergence=%dms", video/90, audio/16, int64(video)/90-int64(audio)/16)
++	if int64(video)/90-int64(audio)/16 != 10000 {
++		t.Fatal("failed to reproduce 10s divergence")
++	}
++}
++
++func TestTimingDiagnosticsBoundedConcurrentSnapshot(t *testing.T) {
++	resetTiming()
++	var wg sync.WaitGroup
++	for j := 0; j < 4; j++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < 3000; i++ {
++				pushTiming(TimingRecord{Event: "bounded"})
++				_ = TimingSnapshot()
++			}
++		}()
++	}
++	wg.Wait()
++	records := TimingSnapshot()
++	if len(records) != timingCapacity {
++		t.Fatal("ring is not bounded")
++	}
++	for i := 1; i < len(records); i++ {
++		if records[i].Seq != records[i-1].Seq+1 {
++			t.Fatal("unordered snapshot")
++		}
++	}
++	data, _ := json.Marshal(records)
++	if bytes.Contains(data, []byte("payload")) || bytes.Contains(data, []byte("url")) {
++		t.Fatal("unexpected sensitive fields")
++	}
++}
++
++func TestTimingGapAtSecondBoundaryAndWrap(t *testing.T) {
++	resetTiming()
++	o := &timingObserver{Producer: 1}
++	start := time.Unix(10, 0)
++	o.observe("audio", 0xffff_fff0, 1, 16000, start)
++	o.observe("audio", 0x30, 2, 16000, start.Add(3*time.Second))
++	o.close()
++	records := TimingSnapshot()
++	if records[1].MaxFLVStep != 64 || records[1].MaxArrivalGapMS != 3000 {
++		t.Fatalf("wrong wrap/gap: %+v", records[1])
++	}
++}
