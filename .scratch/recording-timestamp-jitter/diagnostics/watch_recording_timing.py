@@ -140,7 +140,13 @@ class Headers:
 MEDIA_PROBE = r'''
 import json,pathlib,psutil,subprocess,tempfile,os,urllib.request
 try:
- with urllib.request.urlopen('http://127.0.0.1:1984/api/streams',timeout=2) as response: streams=json.load(response)
+ try:
+ with urllib.request.urlopen('http://127.0.0.1:1984/api/diagnostics/flv-timing',timeout=2) as response: snapshot=json.load(response)
+ for record in snapshot['records']:
+  print(json.dumps({'event':'flv_timing','instance':snapshot['instance'],'record':record}),flush=True)
+except Exception as exc:
+ print(json.dumps({'event':'flv_diagnostics_unavailable','error_type':type(exc).__name__}),flush=True)
+with urllib.request.urlopen('http://127.0.0.1:1984/api/streams',timeout=2) as response: streams=json.load(response)
  for name,stream in streams.items():
   if name not in ('front_door_camera','driveway_camera'): continue
   producers=[]
@@ -236,12 +242,22 @@ def main():
             handler.release()
 
     def media():
+        flv_instance, flv_seq = None, 0
         while not stopped.is_set():
             try:
                 r = subprocess.run(['podman','exec',args.container,'python3','-c',MEDIA_PROBE],
                                    capture_output=True, text=True, timeout=45)
                 for line in r.stdout.splitlines():
                     row = json.loads(line)
+                    if row.get('event') == 'flv_timing':
+                        if row['instance'] != flv_instance:
+                            flv_instance, flv_seq = row['instance'], 0
+                        seq = row['record']['seq']
+                        if seq <= flv_seq:
+                            continue
+                        if flv_seq and seq != flv_seq + 1:
+                            emit({'event':'flv_history_gap','previous_seq':flv_seq,'next_seq':seq})
+                        flv_seq = seq
                     emit(row)
                     preserve_incident(row)
                 if r.returncode:
