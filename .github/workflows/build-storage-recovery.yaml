@@ -1,0 +1,67 @@
+name: Build storage recovery candidate
+
+on:
+  push:
+    branches: [codex/recording-integration]
+    paths:
+      - viseron/components/storage/pending_journal.py
+      - tests/components/storage/test_publication_inode_recovery.py
+      - tests/components/storage/test_journal_db_prototype.py
+      - docker/storage-recovery/**
+      - .github/workflows/build-storage-recovery.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/viseron:storage-recovery-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build minimal storage overlay
+        run: |
+          docker build -f docker/storage-recovery/Dockerfile \
+            --build-arg RECOVERY_COMMIT="$GITHUB_SHA" -t "$IMAGE" .
+      - name: Run source handover, crash recovery, and database regressions
+        timeout-minutes: 5
+        run: |
+          docker run --rm --user postgres --entrypoint /bin/sh \
+            -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
+            -e PYTHONPATH=/tmp/testdeps:/src -w /src "$IMAGE" -c '
+            python3 -m pip install --quiet --target /tmp/testdeps \
+              pytest==9.1.1 pytest-postgresql==9.1.1 "psycopg[binary]" &&
+            python3 -m pytest -q -o addopts= -p no:cacheprovider \
+              tests/components/storage/test_publication_inode_recovery.py \
+              tests/components/storage/test_pending_journal_prototype.py \
+              tests/components/storage/test_journal_tier_prototype.py \
+              tests/components/storage/test_journal_crash_prototype.py \
+              tests/components/storage/test_journal_db_prototype.py \
+              tests/components/storage/test_journal_watcher_prototype.py \
+              tests/components/storage/test_journal_fairness_prototype.py'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Run container smoke tests
+        env:
+          VISERON_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/smoke-artifacts
+        run: |
+          pip install -r requirements_container_test.txt
+          pytest -rs tests/container/ --confcutdir=tests/container \
+            --image="$IMAGE" --arch=amd64 --boot-timeout=240 --timeout=300 -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-recovery-smoke-artifacts
+          path: ${{ runner.temp }}/smoke-artifacts
+          if-no-files-found: ignore
+      - name: Publish tested candidate
+        run: docker push "$IMAGE"

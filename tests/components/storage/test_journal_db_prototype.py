@@ -98,8 +98,9 @@ def test_watcher_indexes_journal_metadata_and_acknowledges(tmp_path, get_db_sess
 
 
 @pytest.mark.parametrize("replace_pending", [False, True])
+@pytest.mark.parametrize("stale_destination_inode", [False, True])
 def test_move_process_exit_then_startup_replay_indexes_preserved_key(
-    tmp_path, get_db_session, replace_pending
+    tmp_path, get_db_session, replace_pending, stale_destination_inode
 ):
     """Move process exit then startup replay indexes preserved key."""
     run_name = "20261031T143215.482000Z-a7c93e12ab34"
@@ -227,6 +228,10 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
     # Older journals without source row identity must warn and retain the source.
     marker_path = Path(marker_for_path(str(dest)))
     journal = json.loads(marker_path.read_text())
+    if stale_destination_inode:
+        # CIFS noserverino can regenerate the client's inode after eviction.
+        # Preserve the copied-byte checksum and every source/DB guard.
+        journal["identity"][1] += 1
     source_db = journal["meta"].pop("source_db")
     replacement_marker = marker_path.with_name(
         ".viseron-tier-move-pending-test-replacement"

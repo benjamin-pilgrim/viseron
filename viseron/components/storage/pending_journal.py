@@ -164,9 +164,11 @@ def publish_or_verify(marker):
     ):
         raise ValueError("invalid publication marker")
     temp, target = marker.parent / temp_name, marker.parent / name
-    expected = record["identity"]
     if os.path.lexists(temp):
-        if identity(temp) != expected or os.path.lexists(target):
+        if (
+            os.path.lexists(target)
+            or _verified_publication_identity(temp, record) is None
+        ):
             raise FileExistsError("publication collision")
         rename = ctypes.CDLL(None, use_errno=True).renameat2
         rename.argtypes = [
@@ -181,9 +183,34 @@ def publish_or_verify(marker):
             err = ctypes.get_errno()
             raise OSError(err, os.strerror(err))
         sync_dir(marker.parent)
-    if identity(target) != expected:
+    verified = _verified_publication_identity(target, record)
+    if verified is None:
         raise ValueError("publication identity changed")
+    # Keep the original durable receipt as evidence. This identity is valid for
+    # this acknowledgement, including the final source-release readback.
+    record["identity"] = verified
     return record
+
+
+def _verified_publication_identity(path, record):
+    """Use byte proof when a tier copy's persisted CIFS inode has expired.
+
+    A noserverino mount allocates client-local inode numbers that can change
+    after cache eviction. They remain useful within a read, but cannot identify
+    a file across retries. Only source-backed copies have a trusted byte digest;
+    other publications retain their strict original identity check.
+    """
+    current = identity(path)
+    if current == record["identity"]:
+        return current
+    if (
+        record.get("source_intent")
+        and record.get("source_snapshot")
+        and current[2] == record["identity"][2]
+        and verify_file_contents(path, record.get("copied_digest"), current)
+    ):
+        return current
+    return None
 
 
 def verify_file_contents(path, expected_digest, expected_identity=None):
