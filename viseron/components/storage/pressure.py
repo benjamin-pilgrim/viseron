@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 import stat
 from pathlib import Path
@@ -20,6 +21,7 @@ from viseron.components.storage.source_move_intent import source_move_pending
 from viseron.components.storage.util import require_tier_markers
 from viseron.helpers import utcnow
 
+LOGGER = logging.getLogger(__name__)
 BATCH = 128
 
 
@@ -323,6 +325,13 @@ def reclaim(config, get_session, *, free_space=None):
                     ).first():
                         continue
                 os.unlink(path)
+                LOGGER.info(
+                    "Pressure reclaimed %s (policy=%s, event=%s, bytes=%s)",
+                    path,
+                    config["policy"],
+                    bool(events),
+                    candidate["identity"][2],
+                )
                 sync_dir(os.path.dirname(path))
                 if row is not None:
                     session.delete(row)

@@ -208,6 +208,35 @@ def test_size_budget_is_shared_across_cameras(get_db_session, tmp_path):
     assert str(newest) in {item["path"] for item in result["promote"]}
 
 
+
+def test_pressure_deletion_is_logged_when_budget_returns_to_normal(
+    get_db_session, tmp_path, caplog
+):
+    """A healthy final state must not conceal deletion of ordinary footage."""
+    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    oldest = _record(get_db_session, tmp_path, "camera", now, 1024)
+    newest = _record(
+        get_db_session, tmp_path, "camera", now + datetime.timedelta(seconds=5), 1024
+    )
+    config = _configuration(tmp_path, "preserve_events", maximum=1600)
+    with caplog.at_level(logging.INFO, logger=pressure.__name__):
+        result = reclaim(config, get_db_session)
+    assert result["state"] == "normal"
+    assert result["deleted"] == 1
+    assert not oldest.exists()
+    assert newest.exists()
+    decisions = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == pressure.__name__
+    ]
+    assert len(decisions) == 1
+    assert str(oldest) in decisions[0]
+    assert "preserve_events" in decisions[0]
+    assert "event=False" in decisions[0]
+    assert "bytes=1024" in decisions[0]
+
+
 def test_normalized_camera_override_is_idempotent():
     """Camera overrides can pass through storage schema validation again."""
     first = TIER_SCHEMA_RECORDER(
