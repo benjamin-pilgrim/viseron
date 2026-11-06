@@ -74,6 +74,7 @@ def create_tier(
         "move_on_shutdown": move_on_shutdown,
         "drain": drain,
         "poll": poll,
+        "poll_interval": 1,
         "check_interval": create_check_interval(**(check_interval or {})),
     }
 
@@ -95,6 +96,7 @@ def create_tier_snapshots(
         "move_on_shutdown": move_on_shutdown,
         "drain": drain,
         "poll": poll,
+        "poll_interval": 1,
         "check_interval": create_check_interval(**(check_interval or {})),
         **create_retain_config(
             max_age=max_age, min_age=min_age, max_size=max_size, min_size=min_size
@@ -118,6 +120,7 @@ DEFAULT_CONFIG = {
                     "move_on_shutdown": False,
                     "drain": False,
                     "poll": False,
+                    "poll_interval": 1,
                     "check_interval": create_check_interval(),
                 }
             ],

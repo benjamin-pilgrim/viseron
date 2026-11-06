@@ -7,6 +7,10 @@ on:
       - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
       - viseron/components/ffmpeg/stream.py
+      - viseron/components/storage/config.py
+      - viseron/components/storage/const.py
+      - viseron/components/storage/tier_handler.py
+      - tests/components/storage/test_polling.py
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
 
@@ -47,9 +51,28 @@ jobs:
         run: |
           cp viseron/components/ffmpeg/stream.py docker/go2rtc-diagnostics/stream.py
           cp viseron/components/storage/pressure.py docker/go2rtc-diagnostics/pressure.py
+          for module in config const tier_handler; do
+            cp "viseron/components/storage/${module}.py" "docker/go2rtc-diagnostics/${module}.py"
+          done
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \
             -t "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             docker/go2rtc-diagnostics
+      - name: Verify storage polling and safe publication
+        timeout-minutes: 5
+        run: |
+          docker run --rm --user postgres --entrypoint /bin/sh \
+            -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
+            -e PYTHONPATH=/tmp/testdeps:/src -e VISERON_TESTS=true \
+            -w /src \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" -c '
+            python3 -m pip install --quiet --target /tmp/testdeps \
+              pytest==9.1.1 pytest-postgresql==9.1.1 pytest-mock==3.17.0 "psycopg[binary]" &&
+            python3 -m pytest -q -o addopts= -p no:cacheprovider \
+              tests/components/storage/test_polling.py \
+              tests/components/storage/test_config.py \
+              tests/components/storage/test_move_safety.py \
+              tests/components/storage/test_tier_markers.py \
+              tests/components/storage/test_hold_retry.py'
       - name: Exercise synthetic FLV stall inside the candidate image
         timeout-minutes: 3
         run: |

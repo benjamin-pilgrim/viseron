@@ -31,6 +31,7 @@ from viseron.components.storage.const import (
     CONFIG_OBJECT_DETECTOR,
     CONFIG_PATH,
     CONFIG_POLL,
+    CONFIG_POLL_INTERVAL,
     CONFIG_RECORDER,
     CONFIG_SECONDS,
     CONFIG_SNAPSHOTS,
@@ -66,6 +67,7 @@ from viseron.components.storage.const import (
     DEFAULT_MOVE_ON_SHUTDOWN,
     DEFAULT_OBJECT_DETECTOR,
     DEFAULT_POLL,
+    DEFAULT_POLL_INTERVAL,
     DEFAULT_RECORDER,
     DEFAULT_RECORDER_TIERS,
     DEFAULT_SECONDS,
@@ -112,6 +114,7 @@ from viseron.components.storage.const import (
     DESC_OBJECT_DETECTOR,
     DESC_PATH,
     DESC_POLL,
+    DESC_POLL_INTERVAL,
     DESC_RECORDER,
     DESC_RECORDER_TIERS,
     DESC_SNAPSHOTS,
@@ -243,6 +246,11 @@ TIER_SCHEMA_SNAPSHOTS = TIER_SCHEMA_BASE.extend(
             description=DESC_POLL,
         ): bool,
         vol.Optional(
+            CONFIG_POLL_INTERVAL,
+            default=DEFAULT_POLL_INTERVAL,
+            description=DESC_POLL_INTERVAL,
+        ): vol.All(int, vol.Range(min=1)),
+        vol.Optional(
             CONFIG_MOVE_ON_SHUTDOWN,
             default=DEFAULT_MOVE_ON_SHUTDOWN,
             description=DESC_MOVE_ON_SHUTDOWN,
@@ -311,6 +319,11 @@ _TIER_SCHEMA_RECORDER = vol.Schema(
             default=DEFAULT_POLL,
             description=DESC_POLL,
         ): bool,
+        vol.Optional(
+            CONFIG_POLL_INTERVAL,
+            default=DEFAULT_POLL_INTERVAL,
+            description=DESC_POLL_INTERVAL,
+        ): vol.All(int, vol.Range(min=1)),
         vol.Optional(
             CONFIG_MOVE_ON_SHUTDOWN,
             default=DEFAULT_MOVE_ON_SHUTDOWN,

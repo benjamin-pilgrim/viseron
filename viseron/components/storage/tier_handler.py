@@ -56,8 +56,10 @@ from viseron.components.storage.const import (
     CONFIG_MOVE_ON_SHUTDOWN,
     CONFIG_PATH,
     CONFIG_POLL,
+    CONFIG_POLL_INTERVAL,
     CONFIG_SECONDS,
     CONFIG_TIER_MARKERS,
+    DEFAULT_POLL_INTERVAL,
     EVENT_CHECK_TIER,
     EVENT_FILE_CREATED,
     EVENT_FILE_DELETED,
@@ -739,7 +741,11 @@ class TierHandler(FileSystemEventHandler):
         """Create a fresh observer for the current directory mount."""
         os.makedirs(self._path, exist_ok=True)
         observer = (
-            PollingObserverVFS(stat=os.stat, listdir=os.scandir, polling_interval=1)
+            PollingObserverVFS(
+                stat=os.stat,
+                listdir=os.scandir,
+                polling_interval=self._tier.get(CONFIG_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
+            )
             if self._tier[CONFIG_POLL]
             else Observer()
         )
