@@ -77,6 +77,12 @@ jobs:
           pytest -rs tests/container/ --confcutdir=tests/container \
             --image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             --arch=amd64 --boot-timeout=240 --timeout=300 -v
+      - name: Make synthetic test artifacts readable
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/flv-shadow" ]; then
+            sudo chmod -R a+rX "$RUNNER_TEMP/flv-shadow"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
