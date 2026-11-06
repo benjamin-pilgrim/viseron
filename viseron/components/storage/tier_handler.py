@@ -744,7 +744,9 @@ class TierHandler(FileSystemEventHandler):
             PollingObserverVFS(
                 stat=os.stat,
                 listdir=os.scandir,
-                polling_interval=self._tier.get(CONFIG_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
+                polling_interval=self._tier.get(
+                    CONFIG_POLL_INTERVAL, DEFAULT_POLL_INTERVAL
+                ),
             )
             if self._tier[CONFIG_POLL]
             else Observer()
