@@ -11,7 +11,8 @@ const { hlsInstances } = vi.hoisted(() => ({
   hlsInstances: [] as any[],
 }));
 
-vi.mock("hls.js", () => {
+vi.mock("hls.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("hls.js")>();
   const Events = {
     MEDIA_ATTACHED: "hlsMediaAttached",
     MANIFEST_PARSED: "hlsManifestParsed",
@@ -33,6 +34,8 @@ vi.mock("hls.js", () => {
   };
 
   class MockHls {
+    static DefaultConfig = actual.default.DefaultConfig;
+
     media: HTMLMediaElement | null = null;
 
     levels: any[] = [];

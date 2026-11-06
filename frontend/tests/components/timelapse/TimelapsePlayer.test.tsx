@@ -12,8 +12,11 @@ const { hlsInstances } = vi.hoisted(() => ({
   hlsInstances: [] as any[],
 }));
 
-vi.mock("hls.js", () => {
+vi.mock("hls.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("hls.js")>();
   class MockHls {
+    static DefaultConfig = actual.default.DefaultConfig;
+
     handlers: Record<string, (...callbackArgs: any[]) => void> = {};
 
     on = vi.fn((event: string, callback: (...callbackArgs: any[]) => void) => {

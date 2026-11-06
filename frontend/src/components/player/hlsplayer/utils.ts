@@ -4,6 +4,8 @@ import React from "react";
 import { getToken } from "lib/tokens";
 import * as types from "lib/types";
 
+import { createMp4FragmentLoader } from "./mp4FragmentLoader";
+
 // Default HLS configuration options shared between live and VOD players.
 export const DEFAULT_HLS_CONFIG = {
   autoStartLoad: false,
@@ -23,6 +25,8 @@ export function createHlsInstance(
   return new Hls({
     ...DEFAULT_HLS_CONFIG,
     ...config,
+    progressive: false,
+    fLoader: createMp4FragmentLoader(config.loader),
     async xhrSetup(xhr, _url) {
       xhr.withCredentials = true;
       if (auth.enabled) {
