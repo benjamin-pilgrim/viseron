@@ -117,6 +117,11 @@ export function setupHlsErrorHandling(
   // Main error handler
   hls.on(Hls.Events.ERROR, (_event, data) => {
     if (hlsRef.current !== hls || resyncPending) return;
+    // Seeking cancels the previous fragment request. This is normal control
+    // flow, not a playback failure; an overlay can otherwise cover the new
+    // position even when it is already buffered and no FRAG_LOADED clears it.
+    if (!data.fatal && data.details === Hls.ErrorDetails.INTERNAL_ABORTED)
+      return;
     // Recording playlists return 409 when their fragments span camera runs.
     // Stop loading (including live-playlist refreshes) and prevent buffered
     // playback; retrying cannot make this recording compatible.
