@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import importlib
 import logging
+import os
 import threading
 from pathlib import Path
 from queue import Queue
@@ -531,3 +532,43 @@ def test_legacy_import_after_source_row_is_already_gone(promotion, get_db_sessio
         )
     assert marker_for_source(promotion.src).exists()
     assert promotion.dst.read_bytes() == b"video"
+
+
+def test_legacy_import_refuses_unreadable_archive(
+    promotion, get_db_session, monkeypatch
+):
+    """An unavailable NAS must not silently look like an empty legacy archive."""
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    metadata = {
+        key: item.publication_meta[key]
+        for key in ("orig_ctime", "duration", "file_key", "source_db")
+    }
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=metadata,
+    )
+    original = os.scandir
+
+    def unavailable(path):
+        if path == str(promotion.dst.parent.parent):
+            raise PermissionError("NAS enumeration failed")
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", unavailable)
+    with get_db_session() as session:
+        with pytest.raises(PermissionError, match="NAS enumeration"):
+            import_legacy(
+                session,
+                "camera",
+                str(promotion.src.parent.parent),
+                str(promotion.dst.parent.parent),
+                1,
+                str(promotion.dst.parents[2]),
+            )
+        assert session.execute(select(PendingSegmentMove)).first() is None
+    assert promotion.src.exists() and promotion.dst.exists()

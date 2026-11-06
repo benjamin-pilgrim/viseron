@@ -238,6 +238,10 @@ def import_legacy(
         os.path.abspath(source_root),
         os.path.abspath(destination_root),
     )
+
+    def unreadable_directory(error):
+        raise error
+
     imported = 0
     # A source row can be gone while its hold still exists. Destination journals
     # retain the complete metadata needed to discover that interrupted cleanup.
@@ -245,7 +249,7 @@ def import_legacy(
         (destination_root, DESTINATION_PREFIX),
         (source_root, SOURCE_PREFIX),
     ):
-        for directory, _, names in os.walk(root):
+        for directory, _, names in os.walk(root, onerror=unreadable_directory):
             if not is_run_directory(os.path.basename(directory)):
                 continue
             for name in names:
