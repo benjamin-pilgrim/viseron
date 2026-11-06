@@ -1819,7 +1819,7 @@ def test_duplicate_move_is_not_dispatched(vis: MockViseron, tmp_path: Path) -> N
     assert storage.temporary_files_meta[dst] is meta
 
 
-def test_contended_deletion_retries_and_stop_cancels(tmp_path: Path) -> None:
+def test_contended_deletion_retries_and_stop_cancels(tmp_path: Path, get_db_session) -> None:
     """A busy lock keeps the deletion event queued, with shutdown fencing it."""
     from queue import Queue
     from viseron.components.storage.run_lifecycle import camera_lock
@@ -1831,6 +1831,8 @@ def test_contended_deletion_retries_and_stop_cancels(tmp_path: Path) -> None:
     handler._tier_check_stopping = False
     handler._deletion_retry_stop = threading.Event()
     handler._on_deleted_impl = Mock()
+    handler._storage = Mock()
+    handler._storage.get_session = get_db_session
     camera_dir = tmp_path / "camera"
     run_dir = camera_dir / "20261031T175537.057658Z-481707b6048c"
     run_dir.mkdir(parents=True)
@@ -1854,18 +1856,36 @@ def test_concurrent_duplicate_moves_send_one_command(
     from concurrent.futures import ThreadPoolExecutor
 
     src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
-    row = Mock(orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/")
+    row = Mock(
+        orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/"
+    )
     barrier = threading.Barrier(2)
+
     def scalar_one():
         barrier.wait(timeout=5)
         return row
+
     session = MagicMock()
-    session.__enter__.return_value.execute.return_value.scalar_one.side_effect = scalar_one
+    session.__enter__.return_value.execute.return_value.scalar_one.side_effect = (
+        scalar_one
+    )
     storage = Mock(spec=Storage)
     storage.temporary_files_meta = {}
     storage.pending_moves = {}
     storage.pending_moves_lock = threading.Lock()
-    args = (vis, storage, lambda: session, "test", 0, "recorder", "segments", src, dst, str(tmp_path), logging.getLogger(__name__))
+    args = (
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(move_file, *args) for _ in range(2)]
         for future in futures:
@@ -1881,16 +1901,33 @@ def test_contended_retention_deletion_schedules_source_check(vis: MockViseron) -
     handler = Mock()
     handler._check_tier_lock = threading.Lock()
     storage.camera_tier_handlers = {"test": {"recorder": [{"segments": handler}]}}
-    handle_file(vis, MagicMock(), storage, "test", 0, "recorder", "segments", {"path": "/tier1"}, None, "/tier1/old.m4s", "/tier1", MagicMock())
+    handle_file(
+        vis,
+        MagicMock(),
+        storage,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        {"path": "/tier1"},
+        None,
+        "/tier1/old.m4s",
+        "/tier1",
+        MagicMock(),
+    )
     callback = storage.tier_check_worker_send_command.call_args.kwargs["callback"]
     callback(DataItemDeleteFile(cmd="delete_file", src="/tier1/old.m4s", deferred=True))
     handler._schedule_forced_tier_retry_locked.assert_called_once()
 
 
-def test_durable_hold_deferral_does_not_schedule_scan(vis: MockViseron, tmp_path: Path) -> None:
+def test_durable_hold_deferral_does_not_schedule_scan(
+    vis: MockViseron, tmp_path: Path
+) -> None:
     """The intent reconciler owns held moves; don't spin tier scans."""
     src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
-    row = Mock(orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/")
+    row = Mock(
+        orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/"
+    )
     session = MagicMock()
     session.__enter__.return_value.execute.return_value.scalar_one.return_value = row
     storage = Mock(spec=Storage)
@@ -1900,9 +1937,25 @@ def test_durable_hold_deferral_does_not_schedule_scan(vis: MockViseron, tmp_path
     handler = Mock()
     handler._check_tier_lock = threading.Lock()
     storage.camera_tier_handlers = {"test": {"recorder": [{"segments": handler}]}}
-    move_file(vis, storage, lambda: session, "test", 0, "recorder", "segments", src, dst, str(tmp_path), logging.getLogger(__name__))
+    move_file(
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
     callback = storage.tier_check_worker_send_command.call_args.kwargs["callback"]
-    callback(DataItemMoveFile(cmd="move_file", src=src, dst=dst, deferred=True, deferred_by_hold=True))
+    callback(
+        DataItemMoveFile(
+            cmd="move_file", src=src, dst=dst, deferred=True, deferred_by_hold=True
+        )
+    )
     handler._schedule_forced_tier_retry_locked.assert_not_called()
     assert not storage.pending_moves
     assert not storage.temporary_files_meta
@@ -1915,13 +1968,17 @@ def test_deferred_cleanup_cannot_remove_new_move_metadata(
     from concurrent.futures import ThreadPoolExecutor
 
     entered, release = threading.Event(), threading.Event()
+
     class BlockingDict(dict):
         def get(self, key, default=None):
             entered.set()
             assert release.wait(5)
             return super().get(key, default)
+
     src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
-    row = Mock(orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/")
+    row = Mock(
+        orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/"
+    )
     session = MagicMock()
     session.__enter__.return_value.execute.return_value.scalar_one.return_value = row
     storage = Mock(spec=Storage)
@@ -1931,12 +1988,26 @@ def test_deferred_cleanup_cannot_remove_new_move_metadata(
     handler = Mock()
     handler._check_tier_lock = threading.Lock()
     storage.camera_tier_handlers = {"test": {"recorder": [{"segments": handler}]}}
-    args = (vis, storage, lambda: session, "test", 0, "recorder", "segments", src, dst, str(tmp_path), logging.getLogger(__name__))
+    args = (
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
     move_file(*args)
     callback = storage.tier_check_worker_send_command.call_args.kwargs["callback"]
     storage.temporary_files_meta = BlockingDict(storage.temporary_files_meta)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        cleanup = executor.submit(callback, DataItemMoveFile(cmd="move_file", src=src, dst=dst, deferred=True))
+        cleanup = executor.submit(
+            callback, DataItemMoveFile(cmd="move_file", src=src, dst=dst, deferred=True)
+        )
         assert entered.wait(5)
         replacement = executor.submit(move_file, *args)
         assert not replacement.done()

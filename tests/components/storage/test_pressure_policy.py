@@ -565,6 +565,23 @@ def test_full_destination_preserves_source_until_pressure_recovers(
         temporary_files_meta={},
         tier_check_worker_send_command=Mock(),
     )
+    storage.camera_tier_handlers = {
+        "camera": {
+            "recorder": [
+                {
+                    "segments": SimpleNamespace(
+                        tier={"path": str(root)}, _path=str(source.parent.parent)
+                    )
+                },
+                {
+                    "segments": SimpleNamespace(
+                        tier={"path": destination_root},
+                        _path=str(Path(destination).parent.parent),
+                    )
+                },
+            ]
+        }
+    }
     manager = PressureManager(storage)
     storage.pressure_manager = manager
     if state == "blocked":

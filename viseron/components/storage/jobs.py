@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.orm import sessionmaker
 
+from viseron.components.storage.segment_moves import protects as segment_move_pending
 from viseron.components.storage.asset_moves import asset_locks, asset_move_pending
 from viseron.components.storage.const import (
     ENGINE,
@@ -431,6 +432,7 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                                         not file_exists
                                         and not protected_by_pending(file_path)
                                         and not source_move_pending(file_path)
+                                        and not segment_move_pending(session, file_path)
                                     ):
                                         if os.path.exists(file_path):
                                             os.remove(file_path)
@@ -534,6 +536,7 @@ class OrphanedDatabaseFilesCleanup(BaseCleanupJob):
                             if (
                                 tier_markers_available(file_path, runner.tier_markers)
                                 and not source_move_pending(file_path)
+                                and not segment_move_pending(session, file_path)
                                 and not protected_by_pending(file_path)
                                 and file_is_missing(file_path)
                             ):
@@ -658,7 +661,14 @@ class ZeroSizeFilesCleanup(BaseCleanupJob):
                     )
                     try:
                         with lock:
-                            if source_move_pending(path) or protected_by_pending(path):
+                            if (
+                                source_move_pending(path)
+                                or protected_by_pending(path)
+                                or (
+                                    is_run_directory(os.path.basename(run_dir))
+                                    and segment_move_pending(session, path)
+                                )
+                            ):
                                 continue
                             stat_size = os.path.getsize(path)
                             if stat_size > 0:

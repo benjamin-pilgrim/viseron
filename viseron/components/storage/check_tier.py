@@ -18,6 +18,8 @@ import numpy as np
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from viseron.components.storage.segment_moves import begin_copy
+from viseron.components.storage.segment_moves import protects as segment_move_pending
 from viseron.components.storage.asset_moves import (
     asset_locks,
     asset_move_pending,
@@ -394,7 +396,7 @@ class Worker:
             if item.cmd == "check_tier":
                 self.check_tier(item)
             if item.cmd == "move_file":
-                # Durable holds are resumed by the source-intent scanner. A
+                # Durable holds are resumed by indexed move replay. A
                 # normal tier scan must not independently copy the same file.
                 if item.dispatch_token is None and source_move_pending(item.src):
                     item.deferred = True
@@ -1012,6 +1014,7 @@ def delete_file(
             source_move_pending(path)
             or protected_by_pending(path)
             or asset_move_pending(session, path)
+            or segment_move_pending(session, path)
         ):
             raise BlockingIOError("File has an active publication hold")
         if retention_recording_ids is not None:
@@ -1154,6 +1157,11 @@ def _move_file_locked(
         source_camera = os.path.abspath(os.path.dirname(os.path.dirname(src)))
         with camera_lock("/tmp/viseron-run-locks", source_camera):
             require_tier_markers(src, tier_markers or {})
+            if "destination_tier_id" in publication_meta:
+                with _get_session() as session:
+                    publication_meta["pending_move_id"] = begin_copy(
+                        session, src, dst, publication_meta
+                    )
             source_intent = prepare_source_intent(
                 src,
                 dst,

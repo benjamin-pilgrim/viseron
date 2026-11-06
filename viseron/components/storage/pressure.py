@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlalchemy import and_, case as sql_case, func, or_, select, update
 from sqlalchemy.orm import sessionmaker
 
+from viseron.components.storage.segment_moves import protects as segment_move_pending
 from viseron.components.storage.asset_moves import asset_locks, asset_move_pending
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
@@ -295,6 +296,7 @@ def reclaim(config, get_session, *, free_space=None):
                     source_move_pending(path)
                     or protected_by_pending(path)
                     or asset_move_pending(session, path)
+                    or segment_move_pending(session, path)
                 ):
                     continue
                 if _identity(path) != candidate["identity"]:

@@ -7,10 +7,9 @@ on:
       - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
       - viseron/components/ffmpeg/stream.py
-      - viseron/components/storage/config.py
-      - viseron/components/storage/const.py
-      - viseron/components/storage/tier_handler.py
+      - viseron/components/storage/**
       - tests/components/storage/test_polling.py
+      - tests/components/storage/test_segment_moves.py
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
 
@@ -50,29 +49,35 @@ jobs:
         timeout-minutes: 8
         run: |
           cp viseron/components/ffmpeg/stream.py docker/go2rtc-diagnostics/stream.py
-          cp viseron/components/storage/pressure.py docker/go2rtc-diagnostics/pressure.py
-          for module in config const tier_handler; do
-            cp "viseron/components/storage/${module}.py" "docker/go2rtc-diagnostics/${module}.py"
-          done
+          cp -R viseron/components/storage docker/go2rtc-diagnostics/storage
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \
             -t "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             docker/go2rtc-diagnostics
       - name: Verify storage polling and safe publication
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           docker run --rm --user postgres --entrypoint /bin/sh \
+            --tmpfs /segments:rw,mode=1777 --tmpfs /thumbnails:rw,mode=1777 \
+            --tmpfs /event_clips:rw,mode=1777 --tmpfs /snapshots:rw,mode=1777 \
             -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
             -e PYTHONPATH=/tmp/testdeps:/src -e VISERON_TESTS=true \
             -w /src \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" -c '
             python3 -m pip install --quiet --target /tmp/testdeps \
-              pytest==9.1.1 pytest-postgresql==9.1.1 pytest-mock==3.17.0 "psycopg[binary]" &&
+              pytest==9.1.1 pytest-postgresql==9.1.1 pytest-mock==3.17.0 pytest-alembic==0.13.1 "psycopg[binary]" &&
             python3 -m pytest -q -o addopts= -p no:cacheprovider \
               tests/components/storage/test_polling.py \
               tests/components/storage/test_config.py \
               tests/components/storage/test_move_safety.py \
               tests/components/storage/test_tier_markers.py \
-              tests/components/storage/test_hold_retry.py'
+              tests/components/storage/test_hold_retry.py \
+              tests/components/storage/test_segment_moves.py \
+              tests/components/storage/test_journal_db_prototype.py \
+              tests/components/storage/test_pressure_policy.py \
+              tests/components/storage/test_migrations.py \
+              tests/components/storage/test_tier_handler.py \
+              tests/components/storage/test_jobs.py \
+              tests/components/storage/test_asset_move_recovery.py'
       - name: Exercise synthetic FLV stall inside the candidate image
         timeout-minutes: 3
         run: |

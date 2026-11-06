@@ -75,6 +75,11 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_THUMBNAILS,
     CleanupJobNames,
 )
+from viseron.components.storage.segment_moves import (
+    acknowledge as acknowledge_segment_move,
+    finish_completed as finish_completed_segment_move,
+    protects as segment_move_pending,
+)
 from viseron.components.storage.dispatch_fence import create_token
 from viseron.components.storage.models import (
     FILE_KEY_SEQUENCE,
@@ -84,6 +89,7 @@ from viseron.components.storage.models import (
     MotionContours,
     Objects,
     PendingMove,
+    PendingSegmentMove,
     PostProcessorResults,
     Recordings,
 )
@@ -107,7 +113,6 @@ from viseron.components.storage.run_lifecycle import (
 from viseron.components.storage.source_move_intent import (
     is_source_move_marker,
     marker_for_source,
-    scan_source_intents,
     source_move_pending,
 )
 from viseron.components.storage.storage_subprocess import (
@@ -401,56 +406,122 @@ class TierHandler(FileSystemEventHandler):
 
         def scan():
             try:
-                self._scan_source_intents()
+                self._replay_segment_moves()
             finally:
                 self._source_scan_lock.release()
 
         try:
-            threading.Thread(target=scan, daemon=True, name="source-hold-scan").start()
+            threading.Thread(
+                target=scan, daemon=True, name="segment-move-replay"
+            ).start()
         except Exception:
             self._source_scan_lock.release()
             raise
 
-    def _scan_source_intents(self):
-        """Scan holds; unavailable roots and unknown destinations fail closed."""
+    def _replay_segment_moves(self):
+        """Retry a rotating bounded batch of indexed moves, never walk archives."""
         try:
-            tiers = self._storage.camera_tier_handlers[self._camera.identifier][
-                self._category
-            ]
-            roots = [
-                tier[TIER_SUBCATEGORY_SEGMENTS]._path
-                for tier in tiers
-                if TIER_SUBCATEGORY_SEGMENTS in tier
-            ]
-
-            def report_incomplete(marker):
-                key = (marker, "incomplete source hold")
-                with self._journal_retry_lock:
-                    if (
-                        key not in self._journal_reported_issues
-                        and len(self._journal_reported_issues) < JOURNAL_BATCH_LIMIT
-                    ):
-                        self._journal_reported_issues.add(key)
-                        self._logger.warning(
-                            "Source hold %s is long-running or interrupted. "
-                            "It may still be active on another instance; inspect "
-                            "publication state before intervening. "
-                            "Do not remove the hold.",
-                            marker,
+            with self._hold_retry_lock:
+                active = set(self._hold_retry_active)
+            if active:
+                with self._storage.get_session() as session:
+                    unfinished = set(
+                        session.execute(
+                            select(PendingSegmentMove.source).where(
+                                PendingSegmentMove.source.in_(active)
+                            )
+                        ).scalars()
+                    )
+                with self._hold_retry_lock:
+                    self._hold_retry_active.difference_update(active - unfinished)
+            after = self._source_intent_cursor.get("after_id", 0)
+            with self._storage.get_session() as session:
+                moves = (
+                    session.execute(
+                        select(PendingSegmentMove)
+                        .where(
+                            PendingSegmentMove.camera_identifier
+                            == self._camera.identifier,
+                            PendingSegmentMove.source_root
+                            == os.path.abspath(self._path),
+                            PendingSegmentMove.id > after,
                         )
-
-            scan_source_intents(
-                self._path,
-                self._storage.get_session,
-                self._storage.tier_available,
-                roots,
-                "/tmp/viseron-run-locks",
-                cursor=self._source_intent_cursor,
-                report_incomplete=report_incomplete,
-                retry_incomplete=self._retry_held_move,
-            )
+                        .order_by(PendingSegmentMove.id)
+                        .limit(20)
+                    )
+                    .scalars()
+                    .all()
+                )
+            if not moves:
+                self._source_intent_cursor["after_id"] = 0
+                return
+            for move in moves:
+                self._source_intent_cursor["after_id"] = move.id
+                if self._hold_retry_stopping:
+                    return
+                destination = self._pending_segment_destination(move)
+                if destination is None:
+                    self._logger.warning(
+                        "Pending segment destination is not configured: %s",
+                        move.destination,
+                    )
+                    continue
+                try:
+                    with camera_lock("/tmp/viseron-run-locks", move.destination_root):
+                        if self._storage.tier_available(
+                            move.destination
+                        ) and os.path.lexists(marker_for_path(move.destination)):
+                            # Replay publication even when its worker callback was lost.
+                            destination._schedule_journal_retry(move.destination)
+                            continue
+                except BlockingIOError:
+                    continue
+                with self._storage.get_session() as session:
+                    try:
+                        if finish_completed_segment_move(
+                            session, move, self._storage.tier_available
+                        ):
+                            with self._storage.pending_moves_lock:
+                                pending = self._storage.pending_moves.get(move.source)
+                            destination._complete_pending_move(
+                                pending,
+                                self._storage.pending_moves,
+                                {"source_snapshot": {"source": move.source}},
+                                move.destination,
+                            )
+                            continue
+                    except BlockingIOError:
+                        continue
+                self._retry_held_move(
+                    str(marker_for_source(move.source)),
+                    {
+                        **move.metadata_record,
+                        "source": move.source,
+                        "destination": move.destination,
+                        "size": move.size,
+                        "pending_move_id": move.id,
+                        "destination_tier_id": move.destination_tier_id,
+                        "destination_tier_path": move.destination_tier_path,
+                    },
+                )
         except Exception:
-            self._logger.exception("Source-intent reconciliation failed; retrying")
+            self._logger.exception("Pending segment move replay failed; retrying")
+
+    def _pending_segment_destination(self, move):
+        """Resolve a queued path only against configured later camera tiers."""
+        tiers = self._storage.camera_tier_handlers[self._camera.identifier][
+            self._category
+        ]
+        return next(
+            (
+                tier[self._subcategory]
+                for tier in tiers[self._tier_id + 1 :]
+                if self._subcategory in tier
+                and os.path.abspath(tier[self._subcategory]._path)
+                == move.destination_root
+            ),
+            None,
+        )
 
     def _retry_held_move(self, marker, record):
         """Isolate potentially stalled tier probes to one daemon per camera."""
@@ -588,6 +659,16 @@ class TierHandler(FileSystemEventHandler):
                     "duration": row.duration,
                     "file_key": row.file_key,
                     "source_db": source_db,
+                    **(
+                        {"pending_move_id": record["pending_move_id"]}
+                        if "pending_move_id" in record
+                        else {}
+                    ),
+                    **{
+                        key: record[key]
+                        for key in ("destination_tier_id", "destination_tier_path")
+                        if key in record
+                    },
                 }
 
             def done(item):
@@ -657,6 +738,42 @@ class TierHandler(FileSystemEventHandler):
         """Queue a bounded, rotating batch after startup or tier recovery."""
         if not self._storage.tier_available(self._path):
             self._schedule_journal_retry()
+            return
+        if getattr(self, "_tier_id", 0) > 0:
+            # Later tiers contain the archive. Only query known outstanding moves.
+            with self._storage.get_session() as session:
+                moves = (
+                    session.execute(
+                        select(PendingSegmentMove)
+                        .where(
+                            PendingSegmentMove.camera_identifier
+                            == self._camera.identifier,
+                            PendingSegmentMove.destination_root
+                            == os.path.abspath(self._path),
+                            PendingSegmentMove.id
+                            > (getattr(self, "_journal_replay_after", None) or 0),
+                        )
+                        .order_by(PendingSegmentMove.id)
+                        .limit(JOURNAL_BATCH_LIMIT)
+                    )
+                    .scalars()
+                    .all()
+                )
+            for move in moves:
+                journal_exists = os.path.lexists(marker_for_path(move.destination))
+                with self._journal_retry_lock:
+                    if self._journal_retry_stopping:
+                        return
+                    if self._event_queue.qsize() >= JOURNAL_BATCH_LIMIT:
+                        self._schedule_journal_retry_unlocked()
+                        return
+                    if journal_exists:
+                        self._event_queue.put(FileCreatedEvent(move.destination))
+                    self._journal_replay_after = move.id
+            if len(moves) < JOURNAL_BATCH_LIMIT:
+                self._journal_replay_after = None
+            else:
+                self._schedule_journal_retry()
             return
         queued = 0
         after = getattr(self, "_journal_replay_after", None)
@@ -1300,30 +1417,43 @@ class TierHandler(FileSystemEventHandler):
                                 src_path, record, file_meta
                             )
                         self._schedule_journal_retry(src_path)
-                    elif pending is not None:
-                        completed_pending = None
-                        with self._storage.pending_moves_lock:
-                            source_path = record["source_snapshot"]["source"]
-                            if (
-                                pending.dst == src_path
-                                and pending.tier_id == self._tier_id
-                                and pending.tier_path == self._tier[CONFIG_PATH]
-                                and pending_moves.get(source_path) is pending
-                            ):
-                                pending_moves.pop(source_path, None)
-                                completed_pending = pending
-                        if (
-                            completed_pending is not None
-                            and completed_pending.on_complete is not None
-                        ):
-                            completed_pending.on_complete()
+                    else:
+                        with self._storage.get_session() as session:
+                            acknowledge_segment_move(
+                                session,
+                                record["source_snapshot"]["source"],
+                                src_path,
+                                record["meta"],
+                            )
+                        self._complete_pending_move(
+                            pending, pending_moves, record, src_path
+                        )
         except BlockingIOError:
             self._logger.debug("Publication busy; retrying %s", src_path)
             self._schedule_journal_retry(src_path)
         except Exception:
             self._logger.exception("Pending publication failed: %s", src_path)
-            # Retain marker and retry lock, database, or transient storage failure.
             self._schedule_journal_retry(src_path)
+
+    def _complete_pending_move(self, pending, pending_moves, record, src_path):
+        """Deliver an in-memory completion only after the durable handoff."""
+        if pending is not None:
+            completed_pending = None
+            with self._storage.pending_moves_lock:
+                source_path = record["source_snapshot"]["source"]
+                if (
+                    pending.dst == src_path
+                    and pending.tier_id == self._tier_id
+                    and pending.tier_path == self._tier[CONFIG_PATH]
+                    and pending_moves.get(source_path) is pending
+                ):
+                    pending_moves.pop(source_path, None)
+                    completed_pending = pending
+            if (
+                completed_pending is not None
+                and completed_pending.on_complete is not None
+            ):
+                completed_pending.on_complete()
 
     def _withdraw_journal_destination(self, path, record, file_meta):
         """Withdraw only this journal's matching row; retain all media and holds."""
@@ -1528,6 +1658,9 @@ class TierHandler(FileSystemEventHandler):
                     or os.path.lexists(src_path)
                 ):
                     return
+                with self._storage.get_session() as session:
+                    if segment_move_pending(session, src_path):
+                        return
                 self._on_deleted_impl(event)
         except CameraLockBusy:
             # Return one event to the existing queue, without creating timers or
@@ -2684,6 +2817,9 @@ def move_file(
                 duration=res.duration,
                 file_key=res.file_key,
             )
+            segment_tier_id = _segment_destination_tier(
+                storage, res, curr_tier_id, dst_tier_path
+            )
             if is_recording_asset(res):
                 destination_tier_id = None
                 handlers = storage.camera_tier_handlers[camera_identifier][
@@ -2704,7 +2840,7 @@ def move_file(
                 session.commit()
             pending_move = PendingMove(
                 dst=dst,
-                tier_id=(asset_target["tier_id"] if asset_target else curr_tier_id + 1),
+                tier_id=(asset_target["tier_id"] if asset_target else segment_tier_id),
                 tier_path=dst_tier_path,
                 on_complete=on_complete,
             )
@@ -2765,6 +2901,15 @@ def move_file(
                     logger,
                 )
             return
+        if (
+            not item.error
+            and (item.publication_meta or {}).get("pending_move_id") is not None
+        ):
+            # Notify our own publication directly; retry discovery is database-backed.
+            destination = storage.camera_tier_handlers[camera_identifier][
+                curr_tier_category
+            ][segment_tier_id][curr_tier_subcategory]
+            destination._schedule_journal_retry(dst)
         if asset_target is not None and not item.error:
             with storage.pending_moves_lock:
                 if storage.pending_moves.get(src) is pending_move:
@@ -2807,6 +2952,8 @@ def move_file(
                     "duration": file_meta.duration,
                     "file_key": file_meta.file_key,
                     "source_db": source_db,
+                    "destination_tier_id": segment_tier_id,
+                    "destination_tier_path": dst_tier_path,
                     **({"asset_target": asset_target} if asset_target else {}),
                 },
             ),
@@ -2994,3 +3141,24 @@ class TimelapseTierHandler(TierHandler):
 
         except Exception as e:  # pylint: disable=broad-except # noqa: BLE001
             self._logger.error(f"Error during timelapse interval cleanup: {e}")
+
+
+def _segment_destination_tier(storage, row, tier_id, tier_path):
+    """Resolve the configured target; only active workers reserve copies."""
+    if (
+        row.category != TIER_CATEGORY_RECORDER
+        or row.subcategory != TIER_SUBCATEGORY_SEGMENTS
+        or not is_run_directory(os.path.basename(row.directory))
+    ):
+        return tier_id + 1
+    destination_id = None
+    for index, handlers in enumerate(
+        storage.camera_tier_handlers[row.camera_identifier][row.category]
+    ):
+        handler = handlers.get(row.subcategory)
+        if handler is not None and handler.tier[CONFIG_PATH] == tier_path:
+            destination_id = index
+            break
+    if destination_id is None or destination_id <= row.tier_id:
+        raise ValueError("Segment destination is not a configured later tier")
+    return destination_id

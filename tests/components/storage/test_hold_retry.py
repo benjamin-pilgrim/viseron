@@ -546,7 +546,7 @@ def test_stalled_source_scan_does_not_block_scheduler():
         release.wait(5)
         finished.set()
 
-    handler._scan_source_intents = blocked_scan
+    handler._replay_segment_moves = blocked_scan
     try:
         handler._reconcile_source_intents()
         assert started.wait(2)
@@ -567,7 +567,7 @@ def test_lost_callback_warned_without_another_incomplete_hold():
     handler._hold_retry_warned = False
     handler._source_scan_lock = threading.Lock()
     handler._logger = Mock()
-    handler._scan_source_intents = Mock()
+    handler._replay_segment_moves = Mock()
     handler._reconcile_source_intents()
     handler._reconcile_source_intents()
     handler._logger.warning.assert_called_once()

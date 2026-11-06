@@ -32,6 +32,7 @@ from viseron.components.storage.source_move_intent import (
     scan_source_intents,
 )
 from viseron.domains.camera.fragmenter_process import FragmenterWork
+from viseron.components.storage.segment_moves import import_legacy
 from viseron.components.storage.tier_handler import TierHandler
 
 
@@ -223,6 +224,16 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
     handler._subcategory = "segments"
     handler._vis = Mock()
     handler.check_tier = Mock()
+    # Legacy markers must be explicitly imported once on upgrade.
+    with get_db_session() as session:
+        import_legacy(
+            session,
+            "test-journal",
+            str(source.parent),
+            str(dest.parent.parent),
+            1,
+            handler._tier["path"],
+        )
     handler._replay_pending_publications()
     event = handler._event_queue.get_nowait()
     # Older journals without source row identity must warn and retain the source.
@@ -320,14 +331,19 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         assert src.exists() and marker_path.exists() and marker_for_source(src).exists()
         completed.assert_not_called()
         with get_db_session() as session:
-            assert session.execute(
-                select(Files.id).where(Files.path == str(src))
-            ).scalar_one() == source_id
+            assert (
+                session.execute(
+                    select(Files.id).where(Files.path == str(src))
+                ).scalar_one()
+                == source_id
+            )
         damaged.write_bytes(original)
 
     with (
-        patch("viseron.components.storage.pending_journal.verify_file_contents",
-              side_effect=OSError("CIFS readback failed")),
+        patch(
+            "viseron.components.storage.pending_journal.verify_file_contents",
+            side_effect=OSError("CIFS readback failed"),
+        ),
         patch("viseron.components.storage.tier_handler.threading.Timer"),
     ):
         handler._on_created(event)
@@ -448,7 +464,9 @@ def test_conflicting_destination_row_is_never_acknowledged(tmp_path, get_db_sess
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session,
     )
     handler._tier_id = 0
     handler._tier = {"path": str(tmp_path)}
@@ -518,7 +536,9 @@ def test_v2_replay_after_crash_before_rename_with_actual_db(tmp_path, get_db_ses
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session,
     )
     handler._tier_id = 0
     handler._tier = {"path": str(tmp_path)}
@@ -560,7 +580,9 @@ def test_v2_collision_does_not_index_old_destination(tmp_path, get_db_session):
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session,
     )
     handler._tier_id = 0
     handler._tier = {"path": str(tmp_path)}
@@ -629,7 +651,9 @@ def test_source_handover_recovers_after_source_unlink(
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session,
     )
     handler._tier_id = 1
     handler._tier = {"path": str(destination_root / "tier1")}
@@ -731,7 +755,9 @@ def test_first_tier_journal_allocates_stable_key_and_keeps_staging(
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session,
     )
     handler._tier_id = 0
     handler._tier = {"path": str(tmp_path)}
@@ -835,7 +861,8 @@ def test_first_tier_release_is_driven_by_real_handler(
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(),
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
         get_session=get_db_session,
         tier_available=lambda _: True,
     )

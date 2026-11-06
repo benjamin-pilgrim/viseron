@@ -175,6 +175,32 @@ class Files(Base):
     )
 
 
+class PendingSegmentMove(Base):
+    """Outstanding segment promotions, independent of source-row lifetime."""
+
+    __tablename__ = "pending_segment_moves"
+    __table_args__ = (
+        Index("idx_segment_moves_source", "camera_identifier", "source_root", "id"),
+        Index(
+            "idx_segment_moves_destination",
+            "camera_identifier",
+            "destination_root",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String, unique=True)
+    destination: Mapped[str] = mapped_column(String, unique=True)
+    camera_identifier: Mapped[str] = mapped_column(String)
+    source_root: Mapped[str] = mapped_column(String)
+    destination_root: Mapped[str] = mapped_column(String)
+    destination_tier_id: Mapped[int] = mapped_column(Integer)
+    destination_tier_path: Mapped[str] = mapped_column(String)
+    metadata_record: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    size: Mapped[int] = mapped_column(BigInteger)
+
+
 @dataclass
 class FilesMeta:
     """Files meta dataclass.

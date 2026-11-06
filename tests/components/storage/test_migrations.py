@@ -119,3 +119,28 @@ def test_asset_move_target_upgrade_preserves_files(
             .all()
         )
         assert indexes == ["idx_files_move_target_path"]
+
+
+def test_pending_segment_moves_upgrade_preserves_files(
+    alembic_runner: MigrationContext, alembic_engine: Engine
+) -> None:
+    """The local retry index is additive and starts empty for explicit legacy import."""
+    alembic_runner.migrate_up_before("c73e8b2a9104")
+    alembic_runner.insert_into("files", [_file_row(1)])
+    alembic_runner.migrate_up_one()
+    with alembic_engine.begin() as connection:
+        assert connection.execute(text("SELECT count(*) FROM files")).scalar_one() == 1
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM pending_segment_moves")
+            ).scalar_one()
+            == 0
+        )
+        indexes = set(
+            connection.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes WHERE tablename = 'pending_segment_moves'"
+                )
+            ).scalars()
+        )
+        assert {"idx_segment_moves_source", "idx_segment_moves_destination"} <= indexes

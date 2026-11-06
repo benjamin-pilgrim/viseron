@@ -4,10 +4,7 @@ FROM ${BASE_IMAGE}
 ARG DIAGNOSTIC_COMMIT
 COPY --chmod=0755 go2rtc /usr/local/bin/go2rtc
 COPY --chmod=0644 stream.py /src/viseron/components/ffmpeg/stream.py
-COPY --chmod=0644 pressure.py /src/viseron/components/storage/pressure.py
-COPY --chmod=0644 config.py /src/viseron/components/storage/config.py
-COPY --chmod=0644 const.py /src/viseron/components/storage/const.py
-COPY --chmod=0644 tier_handler.py /src/viseron/components/storage/tier_handler.py
+COPY storage/ /src/viseron/components/storage/
 ENV VISERON_FLV_TIMING_DIAGNOSTICS=1
 LABEL io.viseron.flv-diagnostics.commit=${DIAGNOSTIC_COMMIT} \
       io.viseron.go2rtc.upstream=b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
