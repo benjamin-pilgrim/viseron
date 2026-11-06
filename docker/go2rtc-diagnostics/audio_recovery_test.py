@@ -1,19 +1,27 @@
 """Exercise real HTTP FLV -> Go2RTC -> restarting FFmpeg consumers."""
 
+import argparse
 import http.server
 import json
 import logging
 import pathlib
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import urllib.request
 from types import SimpleNamespace
 
-binary = sys.argv[1] if len(sys.argv) > 1 else "/usr/local/bin/go2rtc"
+parser = argparse.ArgumentParser()
+parser.add_argument("binary", nargs="?", default="/usr/local/bin/go2rtc")
+parser.add_argument("--viseron-audio", action="store_true")
+parser.add_argument(
+    "--case",
+    choices=("control", "metadata_omits_audio", "audio_delayed_6s", "video_only"),
+)
+args = parser.parse_args()
+binary = args.binary
 root = pathlib.Path(tempfile.mkdtemp(prefix="flv-audio-recovery-"))
 print("RECOVERY_E2E_ARTIFACTS", str(root), flush=True)
 fixture = root / "fixture.flv"
@@ -61,7 +69,7 @@ while pos + 15 < len(b):
     original.append((ts, tag))
     pos += 15 + n
 audio_args = []
-if "--viseron-audio" in sys.argv:
+if args.viseron_audio:
     from viseron.components.ffmpeg.stream import Stream
     from viseron.components.ffmpeg.const import (
         CONFIG_RECORDER_AUDIO_CODEC,
@@ -77,7 +85,12 @@ if "--viseron-audio" in sys.argv:
     )
     audio_args = Stream.get_encoder_audio_codec(owner, None)
 results = []
-for case in ["control", "metadata_omits_audio", "audio_delayed_6s", "video_only"]:
+cases = (
+    [args.case]
+    if args.case
+    else ["control", "metadata_omits_audio", "audio_delayed_6s", "video_only"]
+)
+for case in cases:
     stop = threading.Event()
     tags = []
     requests = [0]
@@ -126,7 +139,7 @@ for case in ["control", "metadata_omits_audio", "audio_delayed_6s", "video_only"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     cfg = root / (case + ".yaml")
     cfg.write_text(
-        'api:\n  listen: "127.0.0.1:19844"\nrtsp:\n  listen: "127.0.0.1:18554"\nwebrtc:\n  listen: ""\nstreams:\n  synthetic: http://127.0.0.1:'
+        'log:\n  level: debug\napi:\n  listen: "127.0.0.1:19844"\nrtsp:\n  listen: "127.0.0.1:18554"\nwebrtc:\n  listen: ""\nstreams:\n  synthetic: http://127.0.0.1:'
         + str(server.server_port)
         + "/fixture.flv\n"
     )

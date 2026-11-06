@@ -364,7 +364,15 @@ diff --git a/internal/streams/producer.go b/internal/streams/producer.go
 diff --git a/internal/streams/stream.go b/internal/streams/stream.go
 --- a/internal/streams/stream.go
 +++ b/internal/streams/stream.go
-@@ -18,14 +18,15 @@
+@@ -2,6 +2,7 @@
+
+ import (
+ 	"encoding/json"
++	"io"
+ 	"sync"
+ 	"sync/atomic"
+
+@@ -18,14 +19,15 @@
  func NewStream(source any) *Stream {
  	switch source := source.(type) {
  	case string:
@@ -383,7 +391,7 @@ diff --git a/internal/streams/stream.go b/internal/streams/stream.go
  		return s
  	case []any:
  		s := new(Stream)
-@@ -37,6 +38,7 @@
+@@ -37,6 +39,7 @@
  			}
  			s.producers = append(s.producers, NewProducer(str))
  		}
@@ -391,7 +399,7 @@ diff --git a/internal/streams/stream.go b/internal/streams/stream.go
  		return s
  	case map[string]any:
  		return NewStream(source["url"])
-@@ -128,3 +130,18 @@
+@@ -128,3 +131,23 @@
  	}
  	return json.Marshal(info)
  }
@@ -408,13 +416,18 @@ diff --git a/internal/streams/stream.go b/internal/streams/stream.go
 +	s.mu.Unlock()
 +	for _, consumer := range consumers {
 +		_ = consumer.Stop()
++		// RTSP Stop can run before SETUP and then leave its socket open.
++		// Interrupt that handshake too, so the client negotiates a fresh SDP.
++		if closer, ok := consumer.(io.Closer); ok {
++			_ = closer.Close()
++		}
 +	}
 +}
 diff --git a/internal/streams/recoverytest/recovery_test.go b/internal/streams/recoverytest/recovery_test.go
 new file mode 100644
 --- /dev/null
 +++ b/internal/streams/recoverytest/recovery_test.go
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,177 @@
 +package recoverytest
 +
 +import (
@@ -573,4 +586,22 @@ new file mode 100644
 +	stream.RemoveConsumer(old)
 +	close(first.release)
 +	wait(t, next.closed, time.Second)
++}
++
++// An RTSP session can be stopped while still in DESCRIBE/StateNone. Its Stop
++// releases tracks but only Close actually interrupts that early handshake.
++type handshakeConsumer struct{ *consumer }
++
++func (c *handshakeConsumer) Stop() error  { return c.Connection.Stop() }
++func (c *handshakeConsumer) Close() error { return c.consumer.Stop() }
++func TestRecoveryClosesConsumerDuringHandshake(t *testing.T) {
++	stream, first, next, _ := recoveryStream(t)
++	old := &handshakeConsumer{newConsumer()}
++	if err := stream.AddConsumer(old); err != nil {
++		t.Fatal(err)
++	}
++	close(first.release)
++	wait(t, old.closed, time.Second)
++	stream.RemoveConsumer(old)
++	_ = next.Stop()
 +}

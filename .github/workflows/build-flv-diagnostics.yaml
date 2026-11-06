@@ -51,7 +51,7 @@ jobs:
             -t "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             docker/go2rtc-diagnostics
       - name: Exercise synthetic FLV stall inside the candidate image
-        timeout-minutes: 2
+        timeout-minutes: 3
         run: |
           mkdir -p "$RUNNER_TEMP/flv-shadow"
           for scenario in steady gap camera-catchup; do
@@ -66,6 +66,14 @@ jobs:
             -v "$RUNNER_TEMP/flv-shadow:/tmp" \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             /diagnostics/audio_recovery_test.py /usr/local/bin/go2rtc --viseron-audio
+          for attempt in 1 2 3; do
+            docker run --rm --network none --entrypoint python3 \
+              -v "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics:/diagnostics:ro" \
+              -v "$RUNNER_TEMP/flv-shadow:/tmp" \
+              "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
+              /diagnostics/audio_recovery_test.py /usr/local/bin/go2rtc \
+              --viseron-audio --case metadata_omits_audio
+          done
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
