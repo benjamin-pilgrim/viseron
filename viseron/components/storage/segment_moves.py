@@ -239,9 +239,11 @@ def import_legacy(
         os.path.abspath(destination_root),
     )
     imported = 0
+    # A source row can be gone while its hold still exists. Destination journals
+    # retain the complete metadata needed to discover that interrupted cleanup.
     for root, prefix in (
-        (source_root, SOURCE_PREFIX),
         (destination_root, DESTINATION_PREFIX),
+        (source_root, SOURCE_PREFIX),
     ):
         for directory, _, names in os.walk(root):
             if not is_run_directory(os.path.basename(directory)):

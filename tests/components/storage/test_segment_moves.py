@@ -24,6 +24,7 @@ from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.segment_moves import (
     acknowledge,
     finish_completed,
+    import_legacy,
     protects,
     reserve,
 )
@@ -486,3 +487,47 @@ def test_incoming_publication_must_finish_before_next_promotion(
     with get_db_session() as session:
         assert session.execute(select(PendingSegmentMove)).first() is None
     assert promotion.src.exists() and not promotion.dst.exists()
+
+
+def test_legacy_import_after_source_row_is_already_gone(promotion, get_db_session):
+    """Destination evidence must discover cleanup interrupted after source deletion."""
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    # Simulate the previous version, before active copies had a DB discovery row.
+    metadata = {
+        key: item.publication_meta[key]
+        for key in ("orig_ctime", "duration", "file_key", "source_db")
+    }
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=metadata,
+    )
+    with get_db_session() as session:
+        row = session.execute(select(Files).where(Files.path == item.src)).scalar_one()
+        session.delete(row)
+        session.commit()
+    promotion.src.unlink()
+    with get_db_session() as session:
+        assert (
+            import_legacy(
+                session,
+                "camera",
+                str(promotion.src.parent.parent),
+                str(promotion.dst.parent.parent),
+                1,
+                str(promotion.dst.parents[2]),
+            )
+            == 1
+        )
+        assert (
+            session.execute(select(PendingSegmentMove))
+            .scalar_one()
+            .metadata_record["source_db"]
+            == metadata["source_db"]
+        )
+    assert marker_for_source(promotion.src).exists()
+    assert promotion.dst.read_bytes() == b"video"
