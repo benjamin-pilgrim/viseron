@@ -1,0 +1,576 @@
+diff --git a/pkg/core/media_changed.go b/pkg/core/media_changed.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/core/media_changed.go
+@@ -0,0 +1,13 @@
++package core
++
++// MediaChangedError hands a live source to a replacement producer when its
++// discovered track set changes. The caller must not close the old transport:
++// ReplacementProducer owns it, including any unread media.
++type MediaChangedError struct {
++	Replacement Producer
++}
++
++func (e *MediaChangedError) Error() string {
++	return "source media changed; renegotiate consumer tracks"
++}
++func (e *MediaChangedError) ReplacementProducer() Producer { return e.Replacement }
+diff --git a/pkg/flv/producer.go b/pkg/flv/producer.go
+--- a/pkg/flv/producer.go
++++ b/pkg/flv/producer.go
+@@ -18,7 +18,8 @@
+ 	core.Connection
+ 	rd *core.ReadBuffer
+
+-	video, audio *core.Receiver
++	video, audio       *core.Receiver
++	mediaChangeHandoff bool
+ }
+
+ func Open(rd io.Reader) (*Producer, error) {
+@@ -87,6 +88,25 @@
+
+ 		switch pkt.PayloadType {
+ 		case TagAudio:
++			if len(pkt.Payload) < 2 {
++				return errors.New("flv: short audio tag")
++			}
++			if c.mediaChangeHandoff && c.audio == nil && pkt.Payload[0]>>4 == CodecAAC && pkt.Payload[1] == 0 && !c.hasAudioMedia() {
++				if len(pkt.Payload) < 4 {
++					continue // Keep video if an optional audio header is incomplete.
++				}
++				codec := aac.ConfigToCodec(pkt.Payload[2:])
++				if codec.Name != core.CodecAAC || codec.ClockRate == 0 || codec.Channels == 0 {
++					continue
++				}
++				codec.RawTimestamp = true
++				media := &core.Media{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec}}
++				next := &Producer{Connection: c.Connection, rd: c.rd}
++				next.ID = core.NewID()
++				next.Medias = append(append([]*core.Media(nil), c.Medias...), media)
++				next.Receivers, next.Senders = nil, nil
++				return &core.MediaChangedError{Replacement: next}
++			}
+ 			if c.audio == nil || pkt.Payload[1] == 0 {
+ 				continue
+ 			}
+@@ -317,3 +337,17 @@
+ func isExHeader(data []byte) bool {
+ 	return data[0]&0b1000_0000 != 0
+ }
++
++func (c *Producer) hasAudioMedia() bool {
++	for _, media := range c.Medias {
++		if media.Kind == core.KindAudio {
++			return true
++		}
++	}
++	return false
++}
++
++// EnableMediaChangeHandoff is called only by a source manager capable of retaining
++// the camera transport and renegotiating consumers. Direct/push callers keep
++// their existing Start contract.
++func (c *Producer) EnableMediaChangeHandoff() { c.mediaChangeHandoff = true }
+diff --git a/pkg/flv/late_audio_test.go b/pkg/flv/late_audio_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/flv/late_audio_test.go
+@@ -0,0 +1,148 @@
++package flv
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++type trackedFLVReader struct {
++	*bytes.Reader
++	closed bool
++}
++
++func (r *trackedFLVReader) Close() error { r.closed = true; return nil }
++
++func lateAudioFixture(audio bool) []byte {
++	data := []byte{'F', 'L', 'V', 1, 0, 0, 0, 0, 9}
++	data = append(data, sourceTimestampTag(TagData, 0, []byte("onMetaData width"))...)
++	data = append(data, sourceTimestampTag(TagVideo, 0, []byte{0x17, 0, 0, 0, 0, 1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce})...)
++	data = append(data, sourceTimestampTag(TagVideo, 1, []byte{0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88})...)
++	if audio {
++		data = append(data, sourceTimestampTag(TagAudio, 2, []byte{0xaf, 0, 0x14, 0x08})...)
++		data = append(data, sourceTimestampTag(TagAudio, 3, []byte{0xaf, 1, 0x11, 0x22})...)
++	}
++	return data
++}
++
++func TestFLVLateAudioRetainsSourceForRenegotiation(t *testing.T) {
++	rd := &trackedFLVReader{Reader: bytes.NewReader(lateAudioFixture(true))}
++	p, err := Open(rd)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(p.Medias) != 1 {
++		t.Fatalf("expected initial video-only discovery: %+v", p.Medias)
++	}
++	video, err := p.GetTrack(p.Medias[0], p.Medias[0].Codecs[0])
++	if err != nil {
++		t.Fatal(err)
++	}
++	frames := 0
++	video.Input = func(*core.Packet) { frames++ }
++	p.EnableMediaChangeHandoff()
++	err = p.Start()
++	var changed interface {
++		error
++		ReplacementProducer() core.Producer
++	}
++	if !errors.As(err, &changed) {
++		t.Fatalf("late AAC must request renegotiation, got %v (video frames=%d)", err, frames)
++	}
++	if frames == 0 {
++		t.Fatal("video was not delivered before audio arrived")
++	}
++	if rd.closed {
++		t.Fatal("camera connection closed during handoff")
++	}
++	next := changed.ReplacementProducer()
++	var audio *core.Receiver
++	for _, m := range next.GetMedias() {
++		if m.Kind == core.KindAudio {
++			audio, err = next.GetTrack(m, m.Codecs[0])
++			if err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	if audio == nil || !audio.Codec.RawTimestamp || audio.Codec.ClockRate != 16000 {
++		t.Fatalf("missing source-clock AAC: %+v", audio)
++	}
++	packets := 0
++	audio.Input = func(*core.Packet) { packets++ }
++	if err = next.Start(); err != io.EOF {
++		t.Fatal(err)
++	}
++	if packets != 1 {
++		t.Fatalf("handoff lost queued audio: %d", packets)
++	}
++	if err = next.Stop(); err != nil || !rd.closed {
++		t.Fatal("replacement did not release camera connection")
++	}
++}
++
++func TestFLVVideoOnlyDoesNotRequestRenegotiation(t *testing.T) {
++	p, err := Open(bytes.NewReader(lateAudioFixture(false)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = p.GetTrack(p.Medias[0], p.Medias[0].Codecs[0]); err != nil {
++		t.Fatal(err)
++	}
++	if err = p.Start(); err != io.EOF {
++		t.Fatalf("video-only source should stay video-only: %v", err)
++	}
++}
++
++func TestFLVUnrequestedAudioDoesNotRefreshVideoConsumer(t *testing.T) {
++	fixture := lateAudioFixture(true)
++	// Without metadata, probing reaches both sequence headers. The consumer only
++	// requests video even though the source correctly advertises audio.
++	fixture = append([]byte{'F', 'L', 'V', 1, 0, 0, 0, 0, 9}, fixture[9+len(sourceTimestampTag(TagData, 0, []byte("onMetaData width"))):]...)
++	p, err := Open(bytes.NewReader(fixture))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(p.Medias) != 2 {
++		t.Fatal("fixture did not discover audio")
++	}
++	if _, err = p.GetTrack(p.Medias[0], p.Medias[0].Codecs[0]); err != nil {
++		t.Fatal(err)
++	}
++	p.EnableMediaChangeHandoff()
++	if err = p.Start(); err != io.EOF {
++		t.Fatalf("intentionally unrequested audio refreshed consumer: %v", err)
++	}
++}
++
++func TestFLVIncompleteLateAudioDoesNotInterruptVideo(t *testing.T) {
++	data := lateAudioFixture(false)
++	data = append(data, sourceTimestampTag(TagAudio, 2, []byte{0xaf, 0})...)
++	p, err := Open(bytes.NewReader(data))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = p.GetTrack(p.Medias[0], p.Medias[0].Codecs[0]); err != nil {
++		t.Fatal(err)
++	}
++	p.EnableMediaChangeHandoff()
++	if err = p.Start(); err != io.EOF {
++		t.Fatalf("bad optional audio interrupted video: %v", err)
++	}
++}
++
++func TestFLVUnmanagedSourceKeepsStartContract(t *testing.T) {
++	p, err := Open(bytes.NewReader(lateAudioFixture(true)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = p.GetTrack(p.Medias[0], p.Medias[0].Codecs[0]); err != nil {
++		t.Fatal(err)
++	}
++	if err = p.Start(); err != io.EOF {
++		t.Fatalf("direct FLV caller unexpectedly needs a handoff manager: %v", err)
++	}
++}
+diff --git a/internal/streams/producer.go b/internal/streams/producer.go
+--- a/internal/streams/producer.go
++++ b/internal/streams/producer.go
+@@ -19,6 +19,7 @@
+ 	stateStart
+ 	stateExternal
+ 	stateInternal
++	stateRenegotiating
+ )
+
+ type Producer struct {
+@@ -31,9 +32,11 @@
+ 	receivers []*core.Receiver
+ 	senders   []*core.Receiver
+
+-	state    state
+-	mu       sync.Mutex
+-	workerID int
++	state              state
++	mu                 sync.Mutex
++	workerID           int
++	onMediaChanged     func()
++	mediaChangePending bool
+ }
+
+ const SourceTemplate = "{input}"
+@@ -58,6 +61,9 @@
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+
++	if p.state == stateRenegotiating {
++		return errors.New("streams: source media changing; retry consumer")
++	}
+ 	if p.state == stateNone {
+ 		conn, err := GetProducer(p.url)
+ 		if err != nil {
+@@ -89,6 +95,9 @@
+ 	if p.state == stateNone {
+ 		return nil, errors.New("get track from none state")
+ 	}
++	if p.state == stateRenegotiating {
++		return nil, errors.New("streams: source media changing; retry consumer")
++	}
+
+ 	for _, track := range p.receivers {
+ 		if track.Codec == codec {
+@@ -152,13 +161,23 @@
+ 	log.Debug().Msgf("[streams] start producer url=%s", p.url)
+
+ 	p.state = stateStart
++	p.mediaChangePending = false
+ 	p.workerID++
+
+ 	go p.worker(p.conn, p.workerID)
+ }
+
+ func (p *Producer) worker(conn core.Producer, workerID int) {
++	if source, ok := conn.(interface{ EnableMediaChangeHandoff() }); ok {
++		source.EnableMediaChangeHandoff()
++	}
+ 	if err := conn.Start(); err != nil {
++		var changed *core.MediaChangedError
++		if errors.As(err, &changed) {
++			log.Info().Msg("[streams] source tracks changed; refreshing affected consumers")
++			p.renegotiate(changed.ReplacementProducer(), workerID, 30*time.Second)
++			return
++		}
+ 		p.mu.Lock()
+ 		closed := p.workerID != workerID
+ 		p.mu.Unlock()
+@@ -245,7 +264,13 @@
+ func (p *Producer) stop() {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+-
++	if p.mediaChangePending {
++		return // Retain the live source while clients renegotiate, with a deadline.
++	}
++	p.stopLocked()
++}
++
++func (p *Producer) stopLocked() {
+ 	switch p.state {
+ 	case stateExternal:
+ 		log.Trace().Msgf("[streams] skip stop external producer")
+@@ -265,6 +290,49 @@
+ 	}
+
+ 	p.state = stateNone
++	p.mediaChangePending = false
+ 	p.receivers = nil
+ 	p.senders = nil
+ }
++
++// renegotiate keeps the camera reader and queued packets alive while consumers
++// reconnect with a new SDP. It never dials another camera connection.
++func (p *Producer) renegotiate(next core.Producer, workerID int, grace time.Duration) {
++	p.mu.Lock()
++	if p.workerID != workerID {
++		p.mu.Unlock()
++		_ = next.Stop()
++		return
++	}
++	receivers := p.receivers
++	p.conn = next
++	p.receivers, p.senders = nil, nil
++	p.state = stateRenegotiating
++	p.mediaChangePending = true
++	p.workerID++
++	generation := p.workerID
++	callback := p.onMediaChanged
++	p.mu.Unlock()
++
++	time.AfterFunc(grace, func() {
++		p.mu.Lock()
++		defer p.mu.Unlock()
++		if p.workerID == generation && p.mediaChangePending {
++			p.mediaChangePending = false
++			p.stopLocked()
++		}
++	})
++
++	// Stop sessions outside the producer mutex: their cleanup can call p.stop.
++	if callback != nil {
++		callback()
++	}
++	for _, receiver := range receivers {
++		receiver.Close()
++	}
++	p.mu.Lock()
++	if p.workerID == generation && p.state == stateRenegotiating {
++		p.state = stateMedias
++	}
++	p.mu.Unlock()
++}
+diff --git a/internal/streams/stream.go b/internal/streams/stream.go
+--- a/internal/streams/stream.go
++++ b/internal/streams/stream.go
+@@ -18,14 +18,15 @@
+ func NewStream(source any) *Stream {
+ 	switch source := source.(type) {
+ 	case string:
+-		return &Stream{
+-			producers: []*Producer{NewProducer(source)},
+-		}
++		s := &Stream{producers: []*Producer{NewProducer(source)}}
++		s.bindMediaChanges()
++		return s
+ 	case []string:
+ 		s := new(Stream)
+ 		for _, str := range source {
+ 			s.producers = append(s.producers, NewProducer(str))
+ 		}
++		s.bindMediaChanges()
+ 		return s
+ 	case []any:
+ 		s := new(Stream)
+@@ -37,6 +38,7 @@
+ 			}
+ 			s.producers = append(s.producers, NewProducer(str))
+ 		}
++		s.bindMediaChanges()
+ 		return s
+ 	case map[string]any:
+ 		return NewStream(source["url"])
+@@ -128,3 +130,18 @@
+ 	}
+ 	return json.Marshal(info)
+ }
++
++func (s *Stream) bindMediaChanges() {
++	for _, producer := range s.producers {
++		producer.onMediaChanged = s.refreshConsumers
++	}
++}
++
++func (s *Stream) refreshConsumers() {
++	s.mu.Lock()
++	consumers := append([]core.Consumer(nil), s.consumers...)
++	s.mu.Unlock()
++	for _, consumer := range consumers {
++		_ = consumer.Stop()
++	}
++}
+diff --git a/internal/streams/recoverytest/recovery_test.go b/internal/streams/recoverytest/recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/streams/recoverytest/recovery_test.go
+@@ -0,0 +1,159 @@
++package recoverytest
++
++import (
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++type source struct {
++	core.Connection
++	release chan struct{}
++	closed  chan struct{}
++	once    sync.Once
++	next    core.Producer
++}
++
++func (s *source) Start() error {
++	if s.next != nil {
++		<-s.release
++		return &core.MediaChangedError{Replacement: s.next}
++	}
++	<-s.closed
++	return nil
++}
++func (s *source) Stop() error { s.once.Do(func() { close(s.closed) }); return nil }
++func newSource(audio bool) *source {
++	medias := []*core.Media{{Kind: core.KindVideo, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{{Name: core.CodecH264, ClockRate: 90000}}}}
++	if audio {
++		medias = append(medias, &core.Media{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{{Name: core.CodecAAC, ClockRate: 16000}}})
++	}
++	return &source{Connection: core.Connection{Medias: medias}, closed: make(chan struct{})}
++}
++
++type consumer struct {
++	core.Connection
++	closed chan struct{}
++	once   sync.Once
++}
++
++func newConsumer() *consumer {
++	return &consumer{Connection: core.Connection{Medias: []*core.Media{{Kind: core.KindVideo, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: core.CodecH264}}}, {Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: core.CodecAAC}}}}}, closed: make(chan struct{})}
++}
++func (c *consumer) AddTrack(media *core.Media, codec *core.Codec, receiver *core.Receiver) error {
++	c.Senders = append(c.Senders, core.NewSender(media, codec).WithParent(receiver))
++	return nil
++}
++func (c *consumer) Stop() error {
++	c.once.Do(func() { _ = c.Connection.Stop(); close(c.closed) })
++	return nil
++}
++func wait(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(timeout):
++		t.Fatal("timed out")
++	}
++}
++
++func recoveryStream(t *testing.T) (*streams.Stream, *source, *source, *atomic.Int32) {
++	t.Helper()
++	next := newSource(true)
++	first := newSource(false)
++	first.next = next
++	first.release = make(chan struct{})
++	dials := new(atomic.Int32)
++	scheme := "recover" + t.Name()
++	streams.HandleFunc(scheme, func(string) (core.Producer, error) { dials.Add(1); return first, nil })
++	return streams.NewStream(scheme + ":synthetic"), first, next, dials
++}
++func TestRecoveryReusesSourceAfterConsumerCleanup(t *testing.T) {
++	stream, first, next, dials := recoveryStream(t)
++	old := newConsumer()
++	if err := stream.AddConsumer(old); err != nil {
++		t.Fatal(err)
++	}
++	cleanup := make(chan struct{})
++	go func() { <-old.closed; stream.RemoveConsumer(old); close(cleanup) }()
++	close(first.release)
++	wait(t, cleanup, time.Second)
++	select {
++	case <-next.closed:
++		t.Fatal("cleanup closed handed-off source")
++	default:
++	}
++	fresh := newConsumer()
++	deadline := time.Now().Add(time.Second)
++	for {
++		err := stream.AddConsumer(fresh)
++		if err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal(err)
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if len(fresh.Senders) != 2 {
++		t.Fatalf("new consumer did not negotiate both tracks: %d", len(fresh.Senders))
++	}
++	if dials.Load() != 1 {
++		t.Fatalf("camera redialed: %d", dials.Load())
++	}
++	select {
++	case <-first.closed:
++		t.Fatal("old producer closed shared transport")
++	default:
++	}
++	stream.RemoveConsumer(fresh)
++	wait(t, next.closed, time.Second)
++}
++func TestRecoveryClosesAbandonedSource(t *testing.T) {
++	stream, first, next, dials := recoveryStream(t)
++	old := newConsumer()
++	if err := stream.AddConsumer(old); err != nil {
++		t.Fatal(err)
++	}
++	go func() { <-old.closed; stream.RemoveConsumer(old) }()
++	close(first.release)
++	wait(t, next.closed, 35*time.Second)
++	if dials.Load() != 1 {
++		t.Fatal("unexpected camera connection")
++	}
++}
++func TestVideoOnlySourceDoesNotRefreshConsumer(t *testing.T) {
++	only := newSource(false)
++	scheme := "videoonly"
++	streams.HandleFunc(scheme, func(string) (core.Producer, error) { return only, nil })
++	stream := streams.NewStream(scheme + ":synthetic")
++	c := newConsumer()
++	if err := stream.AddConsumer(c); err != nil {
++		t.Fatal(err)
++	}
++	if len(c.Senders) != 1 {
++		t.Fatal("wrong video-only track count")
++	}
++	select {
++	case <-c.closed:
++		t.Fatal("video-only consumer was refreshed")
++	case <-time.After(20 * time.Millisecond):
++	}
++	stream.RemoveConsumer(c)
++	wait(t, only.closed, time.Second)
++}
++
++func TestStoppedRecoveryReleasesReplacement(t *testing.T) {
++	stream, first, next, _ := recoveryStream(t)
++	old := newConsumer()
++	if err := stream.AddConsumer(old); err != nil {
++		t.Fatal(err)
++	}
++	stream.RemoveConsumer(old)
++	close(first.release)
++	wait(t, next.closed, time.Second)
++}

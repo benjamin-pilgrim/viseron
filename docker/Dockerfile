@@ -20,7 +20,9 @@ WORKDIR /src
 RUN git clone --depth 1 --branch v${GO2RTC_VERSION} https://github.com/AlexxIT/go2rtc.git . \
   && test "$(git rev-parse HEAD)" = b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
 COPY docker/go2rtc/flv-audio-timestamps.patch /tmp/flv-audio-timestamps.patch
+COPY docker/go2rtc/flv-audio-recovery.patch /tmp/flv-audio-recovery.patch
 RUN git apply /tmp/flv-audio-timestamps.patch \
+  && git apply /tmp/flv-audio-recovery.patch \
   && case "$ARCH" in \
     amd64|amd64-cuda) PLATFORM=amd64 ;; \
     armhf|rpi3) PLATFORM=arm ;; \

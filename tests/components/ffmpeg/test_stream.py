@@ -202,7 +202,7 @@ class TestStream:
             (DEFAULT_RECORDER_AUDIO_CODEC, "aac", ["-c:a", "copy"]),
             (DEFAULT_RECORDER_AUDIO_CODEC, "pcm_alaw", ["-c:a", "aac"]),
             ("test_codec", "pcm_alaw", ["-c:a", "test_codec"]),
-            (DEFAULT_RECORDER_AUDIO_CODEC, None, ["-an"]),
+            (DEFAULT_RECORDER_AUDIO_CODEC, None, ["-c:a", "copy"]),
             (None, None, ["-an"]),
             (None, "aac", ["-an"]),
         ],

@@ -19,6 +19,7 @@
 !docker/opencv-python-headless-setup.py
 !docker/jetson-nano/opencv-tuple.patch
 !docker/go2rtc/flv-audio-timestamps.patch
+!docker/go2rtc/flv-audio-recovery.patch
 !rootfs/
 !frontend/
 frontend/node_modules

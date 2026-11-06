@@ -6,6 +6,7 @@ on:
     paths:
       - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
+      - viseron/components/ffmpeg/stream.py
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
 
@@ -24,6 +25,7 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/go2rtc" rev-parse HEAD)" = b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
           git -C "$RUNNER_TEMP/go2rtc" apply "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics/timing.patch"
           git -C "$RUNNER_TEMP/go2rtc" apply "$GITHUB_WORKSPACE/docker/go2rtc/flv-audio-timestamps.patch"
+          git -C "$RUNNER_TEMP/go2rtc" apply "$GITHUB_WORKSPACE/docker/go2rtc/flv-audio-recovery.patch"
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
@@ -31,7 +33,7 @@ jobs:
       - name: Test diagnostics, packet equivalence, and synthetic timestamp gaps
         run: |
           cd "$RUNNER_TEMP/go2rtc"
-          go test -race ./pkg/core ./pkg/flv ./internal/api ./pkg/rtsp
+          go test -race ./pkg/core ./pkg/flv ./internal/api ./pkg/rtsp ./internal/streams/recoverytest
           go test -race ./pkg/aac -run 'TestBuggy_RTSP_AAC|TestRTPPay'
           go test ./pkg/flv -run TestLegacyAACSampleClockCompressesTimestampGaps -v
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics/go2rtc" .
@@ -43,6 +45,8 @@ jobs:
       - name: Build diagnostic overlay
         timeout-minutes: 8
         run: |
+          cp viseron/components/ffmpeg/stream.py docker/go2rtc-diagnostics/stream.py
+          cp viseron/components/storage/pressure.py docker/go2rtc-diagnostics/pressure.py
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \
             -t "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             docker/go2rtc-diagnostics
@@ -57,6 +61,11 @@ jobs:
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
             /diagnostics/shadow_flv_test.py /usr/local/bin/go2rtc --case "$scenario"
           done
+          docker run --rm --network none --entrypoint python3 \
+            -v "$GITHUB_WORKSPACE/docker/go2rtc-diagnostics:/diagnostics:ro" \
+            -v "$RUNNER_TEMP/flv-shadow:/tmp" \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" \
+            /diagnostics/audio_recovery_test.py /usr/local/bin/go2rtc --viseron-audio
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -72,7 +81,9 @@ jobs:
         if: always()
         with:
           name: flv-diagnostic-smoke-artifacts
-          path: ${{ runner.temp }}/smoke-artifacts
+          path: |
+            ${{ runner.temp }}/smoke-artifacts
+            ${{ runner.temp }}/flv-shadow
           if-no-files-found: ignore
       - name: Publish tested image
         run: docker push "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}"
