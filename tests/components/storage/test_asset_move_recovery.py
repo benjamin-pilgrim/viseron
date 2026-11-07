@@ -472,3 +472,64 @@ def test_replay_batch_survives_scoped_session_move_commits(case):
     finally:
         storage._get_session.remove()
         storage._get_session_expire.remove()
+
+
+@pytest.mark.parametrize("registration", ["source_constructing", "destination_missing"])
+def test_replay_waits_for_asset_handler_registration(case, registration, caplog):
+    """An early recovery pass preserves the move and succeeds after registration."""
+    handler = _handler(case)
+    tiers = handler._storage.camera_tier_handlers["camera"]["recorder"]
+    complete = [dict(tier) for tier in tiers]
+    if registration == "source_constructing":
+        tiers[:] = [{}, {}]
+    else:
+        tiers[1].pop(case.kind)
+    with caplog.at_level(logging.WARNING, logger=case.logger.name):
+        handler._replay_asset_moves()
+    handler._storage.tier_check_worker_send_command.assert_not_called()
+    assert handler._storage.pending_moves == {}
+    assert handler._storage.temporary_files_meta == {}
+    _assert_link(case)
+    assert not caplog.records
+
+    tiers[:] = complete
+    # The rotating cursor wraps on the next empty pass, then retries the
+    # still-reserved asset without needing a new handler or a watcher event.
+    handler._replay_asset_moves()
+    handler._replay_asset_moves()
+    command = handler._storage.tier_check_worker_send_command.call_args
+    item = command.args[0]
+    move_file(
+        case.get_session,
+        item.src,
+        item.dst,
+        case.logger,
+        camera_identifier=item.camera_identifier,
+        publication_meta=item.publication_meta,
+    )
+    command.kwargs["callback"](item)
+    _assert_link(case, destination=True)
+    assert not case.source.exists()
+
+
+def test_unconfigured_asset_destination_is_still_rejected(case):
+    """Complete registration cannot authorize a reservation for another root."""
+    handler = _handler(case)
+    destination = handler._storage.camera_tier_handlers["camera"]["recorder"][1]
+    destination[case.kind].tier["path"] = "/different-tier"
+    with pytest.raises(OSError, match="no longer configured"):
+        dispatch_move(
+            handler._vis,
+            handler._storage,
+            case.get_session,
+            "camera",
+            0,
+            "recorder",
+            case.kind,
+            str(case.source),
+            str(case.destination),
+            str(case.destination.parents[2]),
+            case.logger,
+        )
+    handler._storage.tier_check_worker_send_command.assert_not_called()
+    _assert_link(case)

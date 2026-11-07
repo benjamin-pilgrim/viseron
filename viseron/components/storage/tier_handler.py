@@ -2829,14 +2829,25 @@ def move_file(
                 handlers = storage.camera_tier_handlers[camera_identifier][
                     curr_tier_category
                 ]
-                for index, handler in enumerate(handlers):
-                    if (
-                        handler[curr_tier_subcategory].tier[CONFIG_PATH]
-                        == dst_tier_path
-                    ):
+                waiting_for_handlers = not handlers
+                for index, group in enumerate(handlers):
+                    handler = group.get(curr_tier_subcategory)
+                    if handler is None:
+                        waiting_for_handlers = True
+                        continue
+                    if handler.tier[CONFIG_PATH] == dst_tier_path:
                         destination_tier_id = index
                         break
                 if destination_tier_id is None:
+                    if waiting_for_handlers:
+                        # Recovery is scheduled during handler construction,
+                        # before later asset handlers have entered the registry.
+                        # Keep the reservation for the next bounded replay pass.
+                        logger.debug(
+                            "Deferring asset move until tier handlers are ready: %s",
+                            src,
+                        )
+                        return
                     raise OSError("Asset destination tier is no longer configured")
                 asset_target = reserve_asset_move(
                     res, dst, destination_tier_id, dst_tier_path
