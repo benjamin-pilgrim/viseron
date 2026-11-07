@@ -820,8 +820,9 @@ def get_recordings_to_move(
     # Sort files_data by orig_ctime (ascending) for efficient searching
     files_data.sort(order="orig_ctime")
 
-    recordings_size = np.zeros(len(recordings_data), dtype=np.int64)
+    additional_recording_sizes = np.zeros(len(recordings_data), dtype=np.int64)
     associated_files_data_list = []
+    associated_file_ids_set: set[int] = set()
 
     for i, recording in enumerate(recordings_data):
         if files_data.size > 0:
@@ -850,7 +851,7 @@ def get_recordings_to_move(
         else:
             relevant_files_for_recording = np.empty(0, dtype=files_data.dtype)
 
-        current_recording_total_size = 0
+        additional_recording_bytes = 0
         if relevant_files_for_recording.size > 0:
             for file_row in relevant_files_for_recording:
                 associated_files_data_list.append(
@@ -863,10 +864,14 @@ def get_recordings_to_move(
                         file_row["tier_path"],
                     )
                 )
-                current_recording_total_size += file_row["size"]
-        recordings_size[i] = current_recording_total_size
-
-    associated_file_ids_set = {tup[1] for tup in associated_files_data_list}
+                # The cumulative budget follows newest-first event prefixes.
+                # Charge shared bytes only once, but retain every association
+                # above so an unexpired event still protects its shared files.
+                file_id = int(file_row["id"])
+                if file_id not in associated_file_ids_set:
+                    additional_recording_bytes += file_row["size"]
+                    associated_file_ids_set.add(file_id)
+        additional_recording_sizes[i] = additional_recording_bytes
 
     other_files_data_list = []
     if files_data.size > 0:
@@ -894,7 +899,7 @@ def get_recordings_to_move(
     # Although file IDs should be unique.
     recordings_files.sort(order=["id", "orig_ctime"])
 
-    recording_cumulative_sizes = np.cumsum(recordings_size)
+    recording_cumulative_sizes = np.cumsum(additional_recording_sizes)
 
     bytes_indices_to_move_recordings = np.empty(0, dtype=np.int64)
     if max_bytes > 0:

@@ -81,6 +81,7 @@ def _case(tmp_path, get_session, count=1):
     storage.camera_requested_files_count = {"test": SimpleNamespace(filenames=set())}
     thumbnail, clip, segments = Mock(), Mock(), Mock()
     segments._check_tier_lock = threading.Lock()
+    segments.tier = {"path": str(tmp_path)}
     storage.camera_tier_handlers = {
         "test": {
             "recorder": [
@@ -217,6 +218,9 @@ def test_move_acknowledgement_follows_database_handover(tmp_path, get_db_session
     destination = tmp_path / "next" / source.name
     destination.parent.mkdir()
     destination.write_bytes(source.read_bytes())
+    case.storage.camera_tier_handlers["test"]["recorder"].append(
+        {"segments": SimpleNamespace(tier={"path": str(destination.parent)})}
+    )
     committed = Mock()
     move_file(
         case.handler._vis,
