@@ -7,7 +7,6 @@ on:
     paths-ignore:
       - docker/go2rtc-diagnostics/**
       - .github/workflows/build-flv-diagnostics.yaml
-      - .scratch/**
       - UPSTREAM_PORT_ASSESSMENT.md
   workflow_dispatch:
 

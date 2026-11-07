@@ -156,3 +156,6 @@
 !/config
 
 *__pycache*
+
+# Local experiments and diagnostics
+/.scratch/

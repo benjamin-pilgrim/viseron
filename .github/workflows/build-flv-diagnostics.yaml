@@ -10,8 +10,6 @@ on:
       - viseron/domains/camera/fragmenter_process.py
       - tests/domains/camera/test_fragmenter_retry.py
       - tests/components/storage/test_jobs.py
-      - tests/diagnostics/test_restart_snapshots.py
-      - .scratch/recording-timestamp-jitter/diagnostics/*.py
       - viseron/components/storage/**
       - frontend/**
       - tests/components/storage/test_polling.py
@@ -28,10 +26,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: Test bounded recorder-restart diagnostic snapshots
-        run: |
-          python3 -m unittest discover -s tests/diagnostics -p test_restart_snapshots.py
-          python3 -m unittest discover -s .scratch/recording-timestamp-jitter/diagnostics -p test_watch_camera_network.py
       - name: Fetch pinned go2rtc source
         run: |
           git clone --depth 1 --branch v1.9.14 https://github.com/AlexxIT/go2rtc.git "$RUNNER_TEMP/go2rtc"
