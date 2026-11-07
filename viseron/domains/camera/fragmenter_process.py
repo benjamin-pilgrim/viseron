@@ -51,6 +51,9 @@ if TYPE_CHECKING:
 
 TIMELAPSE_FFMPEG_TIMEOUT = 10
 MISSING_TIMING_GRACE_SECONDS = 30
+METADATA_RETRY_INITIAL_SECONDS = 5
+METADATA_RETRY_MAX_SECONDS = 60
+METADATA_WARNING_INTERVAL_SECONDS = 60
 
 
 def _get_open_files(path: str, process: psutil.Process) -> list[str]:
@@ -200,6 +203,8 @@ class FragmenterWork(ChildProcessWork):
         self._last_recent: str | None = None
         self._last_missing_timestamp_warning: float | None = None
         self._first_missing_timing: dict[str, float] = {}
+        self._metadata_retry: dict[str, tuple[float, float]] = {}
+        self._last_missing_duration_warning: float | None = None
         self._last_reaped_run: str | None = None
         self._storage_blocked = False
         self._blocked_sequences: dict[str, int] = {}
@@ -261,6 +266,18 @@ class FragmenterWork(ChildProcessWork):
             for name, first_seen in self._first_missing_timing.items()
             if name in staged
         }
+        self._metadata_retry = {
+            name: retry
+            for name, retry in self._metadata_retry.items()
+            if name in staged
+        }
+        if cmd == "fragment":
+            now = time.monotonic()
+            mp4s = [
+                name
+                for name in mp4s
+                if now >= self._metadata_retry.get(name, (0, 0))[0]
+            ]
         if cmd == "fragment" and mp4s:
             # Keep current playlist entries moving even if old unindexed
             # fragments accumulate. Revisit one old item per pass to report it.
@@ -778,6 +795,15 @@ class FragmenterWork(ChildProcessWork):
         except FileNotFoundError as err:
             self._logger.error("Failed to clean converted fragment", exc_info=err)
 
+    def _defer_metadata_retry(self, file: str, now: float) -> None:
+        """Retry uncertain metadata without repeatedly processing old fragments."""
+        previous_delay = self._metadata_retry.get(file, (0, 0))[1]
+        delay = min(
+            METADATA_RETRY_MAX_SECONDS,
+            max(METADATA_RETRY_INITIAL_SECONDS, previous_delay * 2),
+        )
+        self._metadata_retry[file] = (now + delay, delay)
+
     def _handle_m4s(self, file: str) -> None:
         """Handle completed fragments; preserve media with uncertain timing."""
         try:
@@ -848,11 +874,14 @@ class FragmenterWork(ChildProcessWork):
                         file,
                     )
                     self._last_missing_timestamp_warning = now
+                if now - first_seen >= MISSING_TIMING_GRACE_SECONDS:
+                    self._defer_metadata_retry(file, now)
                 return
             self._first_missing_timing.pop(file, None)
             if extinf is None:
                 extinf = _filename_duration(name)
             if extinf:
+                self._metadata_retry.pop(file, None)
                 orig_ctime = _get_orig_ctime(file, program_date_time)
                 self._send_files_metadata(
                     os.path.join(self.segments_folder, file), orig_ctime, extinf
@@ -861,9 +890,19 @@ class FragmenterWork(ChildProcessWork):
                     file, orig_ctime, extinf, expected_identity, expected_digest
                 )
             else:
-                self._logger.warning(
-                    "No known duration for %s; leaving fragment and init in staging for recovery.",  # noqa: E501
-                    file,
-                )
+                now = time.monotonic()
+                self._defer_metadata_retry(file, now)
+                if (
+                    self._last_missing_duration_warning is None
+                    or now - self._last_missing_duration_warning
+                    >= METADATA_WARNING_INTERVAL_SECONDS
+                ):
+                    self._logger.warning(
+                        "No known duration for %s; retaining fragment and init in "
+                        "staging and retrying with backoff. Further duration warnings "
+                        "are limited to once a minute.",
+                        file,
+                    )
+                    self._last_missing_duration_warning = now
         except Exception as err:  # pylint: disable=broad-except
             self._logger.error(f"Failed to process m4s file {file}", exc_info=err)

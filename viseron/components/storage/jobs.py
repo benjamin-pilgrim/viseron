@@ -32,6 +32,7 @@ from viseron.components.storage.source_move_intent import (
     source_move_pending,
 )
 from viseron.components.storage.run_lifecycle import (
+    CameraLockBusy,
     camera_lock,
     empty_recording_run,
     is_run_directory,
@@ -349,6 +350,7 @@ class OrphanedFilesCleanup(BaseCleanupJob):
             return
 
         total_files_processed = 0
+        deferred_cameras: set[str] = set()
         with runner.get_session() as session:
             for path in runner.paths:
                 if runner.kill_event.is_set():
@@ -357,10 +359,21 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                     LOGGER.warning("Skipping cleanup of unavailable tier %s", path)
                     continue
                 LOGGER.debug("%s checking %s", runner.name, path)
-                for root, _, files in os.walk(path):
+                for root, directories, files in os.walk(path):
                     if runner.kill_event.is_set():
                         break
 
+                    camera = (
+                        os.path.abspath(os.path.dirname(root))
+                        if is_run_directory(os.path.basename(root))
+                        else None
+                    )
+                    if (
+                        camera in deferred_cameras
+                        or os.path.abspath(root) in deferred_cameras
+                    ):
+                        directories.clear()
+                        continue
                     files_processed = 0
                     for file in files:
                         if runner.kill_event.is_set():
@@ -393,6 +406,14 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                                             ),
                                         ):
                                             deleted_count += 1
+                                except CameraLockBusy:
+                                    deferred_cameras.add(camera)
+                                    LOGGER.debug(
+                                        "Deferring cleanup of busy camera %s "
+                                        "until next pass",
+                                        camera,
+                                    )
+                                    break
                                 except OSError:
                                     LOGGER.debug(
                                         "Cannot clean temporary %s",
@@ -449,6 +470,18 @@ class OrphanedFilesCleanup(BaseCleanupJob):
                                     ):
                                         os.remove(file_path)
                                         deleted_count += 1
+                        except CameraLockBusy:
+                            if camera is not None:
+                                deferred_cameras.add(camera)
+                                LOGGER.debug(
+                                    "Deferring cleanup of busy camera %s "
+                                    "until next pass",
+                                    camera,
+                                )
+                                break
+                            LOGGER.debug(
+                                "Deferring cleanup of busy asset %s", file_path
+                            )
                         except OSError:
                             LOGGER.warning(
                                 "Unable to check cleanup candidate %s",

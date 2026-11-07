@@ -17,6 +17,8 @@ import subprocess
 import threading
 import time
 
+from restart_snapshots import RecordingRunFollower, RestartSnapshots
+
 
 def delta32(a, b):
     return (a - b + 2**31) % 2**32 - 2**31
@@ -284,6 +286,18 @@ def main():
                     except FileNotFoundError:
                         pass  # Timing observer may rotate concurrently.
 
+    def restart_copy(destination):
+        with handler.lock:
+            copy_snapshot(destination)
+
+    restarts = RestartSnapshots(root / 'restart-incidents', restart_copy, emit)
+    run_follower = (
+        RecordingRunFollower(Path(args.timing_directory) / 'timing.jsonl')
+        if args.timing_directory else None
+    )
+    if run_follower:
+        run_follower.poll()  # Existing history establishes the baseline only.
+
     pid = subprocess.check_output(['podman', 'inspect', '--format', '{{.State.Pid}}', args.container], text=True).strip()
     interfaces = set()
     for address in targets.values():
@@ -338,6 +352,10 @@ def main():
                         previous.clear()
                 except Exception as exc:
                     emit({'event': 'socket_probe_failed', 'camera': camera, 'error_type': type(exc).__name__})
+            if run_follower:
+                for transition in run_follower.poll():
+                    emit(transition)
+                    restarts.trigger(transition)
             tick += 1
             if tick % 60 == 0 and capture.poll() is None:
                 capture.send_signal(signal.SIGUSR1)
@@ -346,7 +364,7 @@ def main():
     threading.Thread(target=capture_status, daemon=True).start()
     threading.Thread(target=sockets, daemon=True).start()
     emit({'event': 'network_observer_started', 'container_pid': int(pid), 'hours': args.hours,
-          'cameras': list(targets), 'snaplen': 128, 'ring_max_bytes': 8*1024*1024})
+          'cameras': list(targets), 'snaplen': 128, 'ring_max_bytes': 8*1024*1024, 'restart_snapshot_limit': 3, 'restart_cooldown_seconds': 600})
     observer = Headers(targets, emit)
     try:
         header = capture.stdout.read(24)
@@ -371,6 +389,7 @@ def main():
     finally:
         stop.set()
         timer.cancel()
+        restarts.close()
         capture.terminate()
         capture.wait(timeout=5)
         observer.flush()

@@ -7,6 +7,11 @@ on:
       - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
       - viseron/components/ffmpeg/stream.py
+      - viseron/domains/camera/fragmenter_process.py
+      - tests/domains/camera/test_fragmenter_retry.py
+      - tests/components/storage/test_jobs.py
+      - tests/diagnostics/test_restart_snapshots.py
+      - .scratch/recording-timestamp-jitter/diagnostics/*.py
       - viseron/components/storage/**
       - frontend/**
       - tests/components/storage/test_polling.py
@@ -23,6 +28,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+      - name: Test bounded recorder-restart diagnostic snapshots
+        run: |
+          python3 -m unittest discover -s tests/diagnostics -p test_restart_snapshots.py
+          python3 -m unittest discover -s .scratch/recording-timestamp-jitter/diagnostics -p test_watch_camera_network.py
       - name: Fetch pinned go2rtc source
         run: |
           git clone --depth 1 --branch v1.9.14 https://github.com/AlexxIT/go2rtc.git "$RUNNER_TEMP/go2rtc"
@@ -61,6 +70,7 @@ jobs:
         timeout-minutes: 8
         run: |
           cp viseron/components/ffmpeg/stream.py docker/go2rtc-diagnostics/stream.py
+          cp viseron/domains/camera/fragmenter_process.py docker/go2rtc-diagnostics/fragmenter_process.py
           cp -R viseron/components/storage docker/go2rtc-diagnostics/storage
           cp -R frontend/dist docker/go2rtc-diagnostics/frontend-dist
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \
@@ -74,6 +84,7 @@ jobs:
             --tmpfs /event_clips:rw,mode=1777 --tmpfs /snapshots:rw,mode=1777 \
             -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
             -e PYTHONPATH=/tmp/testdeps:/src -e VISERON_TESTS=true \
+            -e PATH=/ffmpeg/bin:/usr/local/bin:/usr/bin:/bin \
             -w /src \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/viseron:flv-diagnostics-${GITHUB_SHA}" -c '
             python3 -m pip install --quiet --target /tmp/testdeps \
@@ -90,7 +101,11 @@ jobs:
               tests/components/storage/test_migrations.py \
               tests/components/storage/test_tier_handler.py \
               tests/components/storage/test_jobs.py \
-              tests/components/storage/test_asset_move_recovery.py'
+              tests/components/storage/test_asset_move_recovery.py \
+              tests/domains/camera/test_fragmenter.py \
+              tests/domains/camera/test_fragmenter_retry.py \
+              tests/domains/camera/test_backlog_timing.py \
+              tests/domains/camera/test_run_recording.py'
       - name: Exercise synthetic FLV stall inside the candidate image
         timeout-minutes: 3
         run: |

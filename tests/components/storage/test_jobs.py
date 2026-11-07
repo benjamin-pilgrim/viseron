@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import logging
 import os
 import pickle
@@ -173,3 +175,68 @@ def test_run_executes_the_job_in_a_child_process(storage_dir: str) -> None:
     assert not os.path.exists(empty_folder)
     assert os.path.exists(kept_folder)
     assert job.running is False
+
+
+@pytest.mark.parametrize("busy", [True, False], ids=["camera_busy", "permission_error"])
+def test_orphan_cleanup_defers_busy_camera_without_hiding_io_errors(
+    tmp_path, monkeypatch, caplog, busy
+) -> None:
+    """Contention defers a camera once; actual I/O failures remain warnings."""
+    from viseron.components.storage import jobs  # noqa: PLC0415
+    from viseron.components.storage.run_lifecycle import camera_lock  # noqa: PLC0415
+
+    cameras = [tmp_path / name for name in ("busy_camera", "other_camera")]
+    files = []
+    for camera, count in zip(cameras, (3, 1)):
+        run = camera / "20261107T010000.000000Z-0123456789ab"
+        run.mkdir(parents=True)
+        for index in range(count):
+            if index == 2:
+                run = camera / "20261107T010001.000000Z-0123456789ab"
+                run.mkdir()
+            file = run / f"{index}.m4s"
+            file.write_bytes(b"test segment")
+            files.append(file)
+    lock_root = str(tmp_path / "locks")
+    attempts = []
+
+    @contextlib.contextmanager
+    def acquire(_root, camera):
+        attempts.append(camera)
+        if not busy and camera == str(cameras[0]):
+            raise PermissionError(errno.EACCES, "permission denied")
+        with camera_lock(lock_root, camera):
+            yield
+
+    session = MagicMock()
+    session.execute.return_value.first.return_value = None
+    runner = SimpleNamespace(
+        name="test",
+        paths=[str(camera) for camera in cameras],
+        tier_markers={},
+        ignored_files=frozenset(),
+        kill_event=threading.Event(),
+        get_session=lambda: contextlib.nullcontext(session),
+        log_progress=MagicMock(),
+    )
+    monkeypatch.setattr(jobs, "camera_lock", acquire)
+    monkeypatch.setattr(jobs, "tier_markers_available", lambda *_args: True)
+    monkeypatch.setattr(jobs, "segment_move_pending", lambda *_args: False)
+    with camera_lock(lock_root, str(cameras[0])):
+        OrphanedFilesCleanup.work(runner)
+    assert all(file.exists() for file in files[:3])
+    assert not files[-1].exists()
+    warnings = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    if busy:
+        assert not warnings
+        assert attempts.count(str(cameras[0])) == 1
+        # Deferral lasts only for this pass; a later pass can reclaim the files.
+        OrphanedFilesCleanup.work(runner)
+        assert not any(file.exists() for file in files)
+    else:
+        assert len(warnings) == 3
+        assert all(
+            isinstance(record.exc_info[1], PermissionError) for record in warnings
+        )

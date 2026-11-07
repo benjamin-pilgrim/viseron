@@ -134,4 +134,71 @@ class MainTest(unittest.TestCase):
             for handler in list(network.logging.getLogger('camera-network').handlers):
                 handler.close();network.logging.getLogger('camera-network').removeHandler(handler)
 
+
+    def test_recorder_restart_freezes_capture_without_a_tcp_gap(self):
+        """A run change must preserve evidence even when no receive-gap event fires."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            targets = root / 'targets.json'
+            targets.write_text(json.dumps({'camera': '192.0.2.40'}))
+            timing = root / 'timing'
+            timing.mkdir()
+            timing_log = timing / 'timing.jsonl'
+            sample = {'event': 'media_sample', 'camera': 'camera',
+                      'run': '20240101T000000.000000Z-0123456789ab',
+                      'observed_at': 1, 'state': 'waiting_for_closed_segments'}
+            timing_log.write_text(json.dumps(sample) + '\n')
+
+            class Stop:
+                def __init__(self): self.stopped = False; self.ticks = 0
+                def is_set(self): return self.stopped
+                def set(self): self.stopped = True
+                def wait(self, _timeout=None):
+                    self.ticks += 1
+                    if self.ticks == 1:
+                        sample.update(run='20240101T000001.000000Z-abcdef012345', observed_at=2)
+                        with timing_log.open('a') as output:
+                            output.write(json.dumps(sample) + '\n')
+                    else:
+                        self.stopped = True
+                    return self.stopped
+
+            class Timer:
+                def __init__(self, seconds, function, args=()):
+                    self.seconds, self.function, self.args = seconds, function, args
+                def start(self):
+                    if self.seconds == 60: self.function(*self.args)
+                def cancel(self): pass
+                def is_alive(self): return False
+
+            capture = types.SimpleNamespace(
+                stdout=io.BytesIO(struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 128, 1)),
+                stderr=io.BytesIO(), returncode=0, terminate=lambda: None,
+                wait=lambda timeout: 0, poll=lambda: None)
+            def output(command, **_kwargs):
+                return '123' if command[0] == 'podman' else '[{"dev":"eth0"}]'
+            snapshots = network.RestartSnapshots
+            with (
+                patch.object(network, 'RestartSnapshots', lambda *args: snapshots(*args, timer=Timer)),
+                patch.object(network.subprocess, 'check_output', side_effect=output),
+                patch.object(network.subprocess, 'Popen', return_value=capture),
+                patch.object(network.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout='')),
+                patch.object(network.threading, 'Event', Stop),
+                patch.object(network.threading, 'Timer', Timer),
+                patch.object(network.threading.Thread, 'start', lambda thread: thread._target(*thread._args, **thread._kwargs)),
+                patch.object(network.signal, 'signal'),
+                patch('sys.argv', ['observer', '--targets', str(targets), '--output', str(root/'network.jsonl'), '--timing-directory', str(timing)]),
+            ):
+                try:
+                    network.main()
+                finally:
+                    logger = network.logging.getLogger('camera-network')
+                    for handler in list(logger.handlers):
+                        handler.close(); logger.removeHandler(handler)
+            incidents = list((root / 'restart-incidents').iterdir())
+            self.assertEqual(len(incidents), 1)
+            self.assertTrue((incidents[0] / 'initial/network.jsonl').exists())
+            self.assertTrue((incidents[0] / 'post_restart/recording-timing/timing.jsonl').exists())
+            self.assertFalse((root / 'first-stall').exists())
+
 if __name__=='__main__':unittest.main()
