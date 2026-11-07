@@ -332,55 +332,59 @@ class TierHandler(FileSystemEventHandler):
             raise
 
     def _replay_asset_moves(self) -> None:
-        """Resume a rotating batch from destinations stored on existing file rows."""
+        """Resume a rotating batch without retaining ORM state across dispatches."""
         with self._storage.get_session() as session:
-            rows = (
-                session.execute(
-                    select(Files)
-                    .where(
-                        Files.camera_identifier == self._camera.identifier,
-                        Files.category == self._category,
-                        Files.subcategory == self._subcategory,
-                        Files.tier_id == self._tier_id,
-                        Files.tier_path == self._tier[CONFIG_PATH],
-                        Files.move_target.is_not(None),
-                        Files.id > self._asset_move_cursor,
-                    )
-                    .order_by(Files.id)
-                    .limit(20)
+            rows = session.execute(
+                select(
+                    Files.id,
+                    Files.path,
+                    Files.move_target["path"].astext,
+                    Files.move_target["tier_path"].astext,
                 )
-                .scalars()
-                .all()
-            )
-            if not rows:
-                self._asset_move_cursor = 0
+                .where(
+                    Files.camera_identifier == self._camera.identifier,
+                    Files.category == self._category,
+                    Files.subcategory == self._subcategory,
+                    Files.tier_id == self._tier_id,
+                    Files.tier_path == self._tier[CONFIG_PATH],
+                    Files.move_target.is_not(None),
+                    Files.id > self._asset_move_cursor,
+                )
+                .order_by(Files.id)
+                .limit(20)
+            ).all()
+
+        # move_file commits and closes a thread-scoped session. Materialize only
+        # scalar work items and release the query session before dispatching; an
+        # ORM batch would be expired/detached by the first move's transaction.
+        if not rows:
+            self._asset_move_cursor = 0
+            return
+        for file_id, source, destination, tier_path in rows:
+            self._asset_move_cursor = file_id
+            if self._tier_check_stopping:
                 return
-            for row in rows:
-                self._asset_move_cursor = row.id
-                target = row.move_target
-                if self._tier_check_stopping:
-                    return
-                if not (
-                    self._storage.tier_available(row.path)
-                    and self._storage.tier_available(target["path"])
-                ):
-                    continue
-                try:
-                    move_file(
-                        self._vis,
-                        self._storage,
-                        self._storage.get_session,
-                        self._camera.identifier,
-                        self._tier_id,
-                        self._category,
-                        self._subcategory,
-                        row.path,
-                        target["path"],
-                        target["tier_path"],
-                        self._logger,
-                    )
-                except (OSError, SQLAlchemyError, StorageCallbackCapacityError):
-                    self._logger.warning("Deferred asset move for %s", row.path)
+            if not (
+                self._storage.tier_available(source)
+                and self._storage.tier_available(destination)
+            ):
+                continue
+            try:
+                move_file(
+                    self._vis,
+                    self._storage,
+                    self._storage.get_session,
+                    self._camera.identifier,
+                    self._tier_id,
+                    self._category,
+                    self._subcategory,
+                    source,
+                    destination,
+                    tier_path,
+                    self._logger,
+                )
+            except (OSError, SQLAlchemyError, StorageCallbackCapacityError):
+                self._logger.warning("Deferred asset move for %s", source)
 
     def _asset_destination_pending(self, path: str) -> bool:
         with self._storage.get_session() as session:

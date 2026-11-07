@@ -9,9 +9,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import scoped_session, sessionmaker
 from watchdog.events import FileCreatedEvent, FileDeletedEvent
 
-from viseron.components.storage import asset_moves
+from viseron.components.storage import Storage, asset_moves
 from viseron.components.storage.asset_moves import reserve
 from viseron.components.storage.check_tier import delete_file, move_file
 from viseron.components.storage.jobs import (
@@ -384,3 +385,90 @@ def test_abandoned_private_copies_are_reclaimed_after_grace(case, monkeypatch):
     assert not stale.exists()
     assert young.exists()
     _assert_link(case)
+
+
+def test_replay_batch_survives_scoped_session_move_commits(case):
+    """Both reserved assets recover when each dispatch closes the shared session."""
+    second_source = case.source.with_name("2.jpg")
+    second_destination = case.destination.with_name("2.jpg")
+    second_source.write_bytes(b"asset contents")
+    now = datetime.now(UTC)
+    with case.get_session() as session:
+        recording = Recordings(
+            camera_identifier="camera",
+            start_time=now,
+            adjusted_start_time=now,
+            end_time=now + timedelta(seconds=1),
+            **{case.field: str(second_source)},
+        )
+        row = Files(
+            tier_id=0,
+            tier_path=str(second_source.parents[2]),
+            camera_identifier="camera",
+            category="recorder",
+            subcategory=case.kind,
+            path=str(second_source),
+            directory=str(second_source.parent),
+            filename=second_source.name,
+            size=14,
+            orig_ctime=now,
+        )
+        session.add_all([recording, row])
+        session.flush()
+        reserve(row, str(second_destination), 1, str(second_destination.parents[2]))
+        session.commit()
+        second_event_id = recording.id
+        second_file_key = row.file_key
+
+    # Use the real Storage accessor and its thread-scoped, expiring session
+    # factories. The ordinary test factory does not expire objects on commit.
+    storage = Storage.__new__(Storage)
+    storage._get_session = scoped_session(
+        sessionmaker(bind=case.get_session.kw["bind"])
+    )
+    storage._get_session_expire = scoped_session(
+        sessionmaker(bind=case.get_session.kw["bind"], expire_on_commit=True)
+    )
+    handler = _handler(case)
+    handler._storage.get_session = storage.get_session
+    try:
+        handler._replay_asset_moves()
+        commands = handler._storage.tier_check_worker_send_command.call_args_list
+        assert [command.args[0].src for command in commands] == [
+            str(case.source),
+            str(second_source),
+        ]
+        for command in commands:
+            item = command.args[0]
+            move_file(
+                storage.get_session,
+                item.src,
+                item.dst,
+                case.logger,
+                camera_identifier=item.camera_identifier,
+                publication_meta=item.publication_meta,
+            )
+            command.kwargs["callback"](item)
+        assert handler._storage.pending_moves == {}
+        assert handler._storage.temporary_files_meta == {}
+        for event_id, destination, file_key in (
+            (case.event_id, case.destination, case.file_key),
+            (second_event_id, second_destination, second_file_key),
+        ):
+            with storage.get_session() as session:
+                assert getattr(session.get(Recordings, event_id), case.field) == str(
+                    destination
+                )
+                moved = session.execute(
+                    select(Files).where(Files.path == str(destination))
+                ).scalar_one()
+                assert moved.file_key == file_key
+                assert moved.move_target is None
+            assert destination.read_bytes() == b"asset contents"
+        assert not case.source.exists()
+        assert not second_source.exists()
+        handler._replay_asset_moves()
+        assert handler._asset_move_cursor == 0
+    finally:
+        storage._get_session.remove()
+        storage._get_session_expire.remove()
