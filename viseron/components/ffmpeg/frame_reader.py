@@ -20,7 +20,12 @@ import setproctitle
 
 from viseron.helpers.logs import UnhelpfullLogFilter, enable_child_logging
 
-from .const import FFMPEG_LOGLEVELS, MAX_EMPTY_FRAMES
+from .const import (
+    DEFAULT_RESTART_DELAY,
+    FFMPEG_LOGLEVELS,
+    MAX_EMPTY_FRAMES,
+    MAX_RESTART_DELAY,
+)
 from .pipe import FFmpegPipe
 
 if TYPE_CHECKING:
@@ -79,6 +84,7 @@ def run_frame_reader(
     )
 
     decode_error.clear()
+    restart_delay = DEFAULT_RESTART_DELAY
     empty_frames = 0
 
     pipe.start()
@@ -88,7 +94,11 @@ def run_frame_reader(
         if decode_error.is_set():
             # Check for shutdown during backoff instead of sleeping through
             # the parent's stop deadline and restarting a dying camera.
-            for _ in range(50):
+            logger.warning(
+                "Camera failed to produce frames, restarting in %s seconds",
+                restart_delay,
+            )
+            for _ in range(restart_delay * 10):
                 if not capture_frames.is_set():
                     break
                 time.sleep(0.1)
@@ -105,9 +115,11 @@ def run_frame_reader(
                 break
             decode_error.clear()
             empty_frames = 0
+            restart_delay = min(restart_delay * 2, MAX_RESTART_DELAY)
 
         frame_bytes = pipe.read(config.frame_bytes_size)
         if frame_bytes:
+            restart_delay = DEFAULT_RESTART_DELAY
             empty_frames = 0
             # Dont queue frames if consumer is not ready
             with contextlib.suppress(Full):

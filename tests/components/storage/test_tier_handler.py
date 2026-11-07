@@ -8,7 +8,10 @@ import os
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -19,9 +22,9 @@ from sqlalchemy.exc import NoResultFound
 from watchdog.events import FileCreatedEvent, FileDeletedEvent
 
 from viseron.components.storage import TIER_CATEGORIES, Storage
+from viseron.components.storage.config import RecorderTier, Tier
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
-    CONFIG_DRAIN,
     CONFIG_PATH,
     CONFIG_RECORDER,
     LATEST_SNAPSHOT_FILENAME,
@@ -42,13 +45,16 @@ from viseron.components.storage.models import (
     PostProcessorResults,
     Recordings,
 )
+from viseron.components.storage.run_lifecycle import camera_lock
 from viseron.components.storage.storage_subprocess import (
+    DataItemDeleteFile,
     DataItemMoveFile,
     StorageCallbackCapacityError,
 )
 from viseron.components.storage.tier_handler import (
     SNAPSHOT_REFERENCE_MODELS,
     EventClipTierHandler,
+    RetentionTierHandler,
     SegmentsTierHandler,
     SnapshotTierHandler,
     ThumbnailTierHandler,
@@ -70,8 +76,6 @@ from viseron.helpers import utcnow
 from tests.common import BaseTestWithRecordings
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from numpy._typing._array_like import NDArray
     from sqlalchemy.engine import ExceptionContext
     from sqlalchemy.orm import Session, sessionmaker
@@ -87,9 +91,7 @@ _TierHandlerT = TypeVar("_TierHandlerT", bound=TierHandler)
 def test_handle_file_delete(mock_delete_file: Mock, vis: MockViseron) -> None:
     """Test handle_file."""
     file = "/tmp/tier1/file1"
-    tier_1 = {
-        "path": "/tmp/tier1",
-    }
+    tier_1 = Tier(path="/tmp/tier1")
     tier_2 = None
     session = MagicMock()
     logger = MagicMock()
@@ -117,12 +119,8 @@ def test_handle_file_move(mock_move_file: Mock, vis: MockViseron) -> None:
     """Test handle_file."""
     tier_1_file = "/tmp/tier1/file1"
     tier_2_file = "/tmp/tier2/file1"
-    tier_1 = {
-        "path": "/tmp/tier1/",
-    }
-    tier_2 = {
-        "path": "/tmp/tier2/",
-    }
+    tier_1 = Tier(path="/tmp/tier1/")
+    tier_2 = Tier(path="/tmp/tier2/")
     storage = MagicMock()
     session = MagicMock()
     logger = MagicMock()
@@ -173,8 +171,8 @@ def test_handle_file_force_delete_ignores_unavailable_destination(
         0,
         TIER_CATEGORY_RECORDER,
         TIER_SUBCATEGORY_SEGMENTS,
-        {"path": "/tier1"},
-        {"path": "/tier2"},
+        Tier.model_construct(path="/tier1"),
+        Tier.model_construct(path="/tier2"),
         "/tier1/old.m4s",
         "/tier1",
         MagicMock(),
@@ -200,8 +198,8 @@ def test_handle_file_unavailable_destination_preserves_promotion_source(
         0,
         TIER_CATEGORY_RECORDER,
         TIER_SUBCATEGORY_SEGMENTS,
-        {"path": "/tier1"},
-        {"path": "/tier2"},
+        Tier.model_construct(path="/tier1"),
+        Tier.model_construct(path="/tier2"),
         "/tier1/old.m4s",
         "/tier1",
         MagicMock(),
@@ -226,8 +224,8 @@ def test_handle_file_skips_recently_requested_basename(
         0,
         TIER_CATEGORY_RECORDER,
         TIER_SUBCATEGORY_SEGMENTS,
-        {"path": "/tier1"},
-        {"path": "/tier2"},
+        Tier.model_construct(path="/tier1"),
+        Tier.model_construct(path="/tier2"),
         "/tier1/camera/run/old.m4s",
         "/tier1",
         MagicMock(),
@@ -243,7 +241,7 @@ def test_snapshot_tier_handler_ignores_the_latest_snapshot() -> None:
     tier_handler._storage = MagicMock(spec=Storage)
     tier_handler.add_file_handler = MagicMock()  # type: ignore[method-assign]
 
-    with patch.object(TierHandler, "initialize"):
+    with patch.object(RetentionTierHandler, "initialize"):
         tier_handler.initialize()
 
     tier_handler._storage.ignore_file.assert_called_once_with(LATEST_SNAPSHOT_FILENAME)
@@ -268,37 +266,15 @@ class MockFilesQueryResult:
     tier_path: str
 
 
-def _get_tier_config(events: bool, continuous: bool) -> dict[str, Any]:
+def _get_tier_config(events: bool, continuous: bool) -> RecorderTier:
     """Get tier config for test."""
-    max_age_events = None
-    max_age_continuous = None
-    if events:
-        max_age_events = 1
-    if continuous:
-        max_age_continuous = 1
-    return {
-        "path": "/",
-        "events": {
-            "max_age": {"days": max_age_events, "hours": None, "minutes": None},
-            "min_age": {"hours": None, "days": None, "minutes": None},
-            "min_size": {"gb": None, "mb": None},
-            "max_size": {"gb": None, "mb": None},
-        },
-        "move_on_shutdown": False,
-        "poll": False,
-        "continuous": {
-            "max_age": {"minutes": max_age_continuous, "hours": None, "days": None},
-            "min_age": {"minutes": None, "hours": None, "days": None},
-            "min_size": {"gb": None, "mb": None},
-            "max_size": {"gb": None, "mb": None},
-        },
-        "check_interval": {
-            "days": 0,
-            "hours": 0,
-            "minutes": 1,
-            "seconds": 0,
-        },
-    }
+    return RecorderTier.model_validate(
+        {
+            "path": "/",
+            "events": {"max_age": {"days": 1 if events else None}},
+            "continuous": {"max_age": {"minutes": 1 if continuous else None}},
+        }
+    )
 
 
 class TestSegmentsTierHandler(BaseTestWithRecordings):
@@ -399,7 +375,7 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
     def test__check_tier(
         self,
         vis: MockViseron,
-        tier: dict[str, Any],
+        tier: RecorderTier,
         data: NDArray[Any],
         recordings_amount: Literal[2, 3],
         first_recording_id: Literal[3, 1],
@@ -500,7 +476,7 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
     def test__check_tier_next_tier(
         self,
         vis: Viseron,
-        tiers_config: list[dict[str, Any]],
+        tiers_config: list[RecorderTier],
         recording_id: int,
         force_delete: bool,
         next_tier_index: int | None,
@@ -642,10 +618,9 @@ class TestCheckTierCallbackLifecycle:
                 CONFIG_SCHEDULE: None,
             }
         }
-        # _create_dataitem reads CONFIG_DRAIN, which _get_tier_config omits.
         tier_config = _get_tier_config(events=True, continuous=True)
-        tier_config[CONFIG_DRAIN] = False
-        tier_config[CONFIG_PATH] = self._tier_path
+        tier_config.drain = False
+        tier_config.path = self._tier_path
 
         tier_handler = SegmentsTierHandler(
             vis,
@@ -925,7 +900,6 @@ def test_continuous_enabled_is_structural_only(vis: MockViseron) -> None:
     }
 
     tier = _get_tier_config(events=True, continuous=True)
-    tier[CONFIG_DRAIN] = False
     tier_handler = SegmentsTierHandler(
         vis,
         mock_camera,
@@ -961,7 +935,6 @@ def test_create_dataitem_passes_continuous_schedule_entries(
     }
 
     tier = _get_tier_config(events=True, continuous=True)
-    tier[CONFIG_DRAIN] = False
     tier_handler = SegmentsTierHandler(
         vis,
         mock_camera,
@@ -995,7 +968,6 @@ def test_create_dataitem_continuous_schedule_none_when_omitted(
     }
 
     tier = _get_tier_config(events=True, continuous=True)
-    tier[CONFIG_DRAIN] = False
     tier_handler = SegmentsTierHandler(
         vis,
         mock_camera,
@@ -1057,7 +1029,7 @@ def _make_bare_tier_handler(
     tier_handler._storage = storage
     tier_handler._camera = Mock(identifier="test")
     tier_handler._tier_id = tier_id
-    tier_handler._tier = {CONFIG_PATH: tier_path}
+    tier_handler._tier = Tier(path=tier_path)
     tier_handler._category = category
     tier_handler._subcategory = subcategory
     tier_handler.check_tier = Mock()  # type: ignore[method-assign]
@@ -1389,6 +1361,34 @@ def test_failed_move_does_not_hand_over_row(
     assert not _file_keys(db_storage)
 
 
+def test_move_file_without_row_preserves_unindexed_footage(
+    vis: MockViseron, db_storage: Mock, tmp_path: Path
+) -> None:
+    """Missing metadata is not permission to delete the only recording copy."""
+    src = os.path.join(tmp_path, "tier0", "1.m4s")
+    dst = os.path.join(tmp_path, "tier1", "1.m4s")
+    os.makedirs(os.path.dirname(src))
+    with open(src, "wb") as recording:
+        recording.write(b"only copy")
+
+    move_file(
+        vis,
+        db_storage,
+        db_storage.get_session,
+        "test",
+        0,
+        TIER_CATEGORY_RECORDER,
+        TIER_SUBCATEGORY_SEGMENTS,
+        src,
+        dst,
+        os.path.join(tmp_path, "tier1"),
+        logging.getLogger(__name__),
+    )
+
+    db_storage.tier_check_worker_send_command.assert_not_called()
+    assert Path(src).read_bytes() == b"only copy"
+
+
 def test_new_files_get_distinct_file_keys(
     vis: MockViseron, db_storage: Mock, tmp_path: Path
 ) -> None:
@@ -1684,8 +1684,14 @@ def test_missing_move_metadata_does_not_schedule_deletion_or_move(
     ],
 )
 def test_stale_move_selection_requires_an_indexed_destination(
-    vis, get_db_session, tmp_path, caplog,
-    source_present, destination_present, destination_indexed, warn,
+    vis,
+    get_db_session,
+    tmp_path,
+    caplog,
+    source_present,
+    destination_present,
+    destination_indexed,
+    warn,
 ):
     """A completed move is quiet; uncertain or unindexed data still warns."""
     src = tmp_path / "local" / "run" / "one.m4s"
@@ -1699,12 +1705,19 @@ def test_stale_move_selection_requires_an_indexed_destination(
     if destination_indexed:
         with get_db_session() as session:
             record = Files(
-                tier_id=1, tier_path=str(tmp_path / "nas"),
+                tier_id=1,
+                tier_path=str(tmp_path / "nas"),
                 camera_identifier=(
                     "other_camera" if destination_indexed == "wrong-camera" else "test"
-                ), category="recorder", subcategory="segments",
-                path=str(dst), directory=str(dst.parent), filename=dst.name,
-                size=19, duration=5.0, orig_ctime=utcnow(),
+                ),
+                category="recorder",
+                subcategory="segments",
+                path=str(dst),
+                directory=str(dst.parent),
+                filename=dst.name,
+                size=19,
+                duration=5.0,
+                orig_ctime=utcnow(),
             )
             session.add(record)
             session.commit()
@@ -1714,8 +1727,17 @@ def test_stale_move_selection_requires_an_indexed_destination(
     storage.pending_moves_lock = threading.Lock()
     with caplog.at_level(logging.WARNING):
         move_file(
-            vis, storage, get_db_session, "test", 0, "recorder", "segments",
-            str(src), str(dst), str(tmp_path / "nas"), logging.getLogger(__name__),
+            vis,
+            storage,
+            get_db_session,
+            "test",
+            0,
+            "recorder",
+            "segments",
+            str(src),
+            str(dst),
+            str(tmp_path / "nas"),
+            logging.getLogger(__name__),
         )
     assert ("source metadata is missing" in caplog.text) is warn
     assert src.exists() is source_present
@@ -1723,7 +1745,9 @@ def test_stale_move_selection_requires_an_indexed_destination(
     storage.tier_check_worker_send_command.assert_not_called()
 
 
-def test_tier_selection_can_outlive_a_completed_move(vis, get_db_session, tmp_path, caplog):
+def test_tier_selection_can_outlive_a_completed_move(
+    vis, get_db_session, tmp_path, caplog
+):
     """A batch selected before promotion can be processed after it commits."""
     local, nas = tmp_path / "local", tmp_path / "nas"
     src, dst = local / "run" / "one.m4s", nas / "run" / "one.m4s"
@@ -1732,9 +1756,16 @@ def test_tier_selection_can_outlive_a_completed_move(vis, get_db_session, tmp_pa
     src.write_bytes(b"recording")
     with get_db_session() as session:
         row = Files(
-            tier_id=0, tier_path=str(local), camera_identifier="test",
-            category="recorder", subcategory="segments", path=str(src),
-            directory=str(src.parent), filename=src.name, size=9, duration=5.0,
+            tier_id=0,
+            tier_path=str(local),
+            camera_identifier="test",
+            category="recorder",
+            subcategory="segments",
+            path=str(src),
+            directory=str(src.parent),
+            filename=src.name,
+            size=9,
+            duration=5.0,
             orig_ctime=utcnow(),
         )
         session.add(row)
@@ -1744,7 +1775,10 @@ def test_tier_selection_can_outlive_a_completed_move(vis, get_db_session, tmp_pa
         )
         src.rename(dst)
         row.path, row.directory, row.tier_path, row.tier_id = (
-            str(dst), str(dst.parent), str(nas), 1
+            str(dst),
+            str(dst.parent),
+            str(nas),
+            1,
         )
         session.commit()
 
@@ -1758,8 +1792,15 @@ def test_tier_selection_can_outlive_a_completed_move(vis, get_db_session, tmp_pa
     handler = TierHandler.__new__(TierHandler)
     handler._vis, handler._storage = vis, storage
     handler._camera = Mock(identifier="test")
-    handler._tier_id, handler._category, handler._subcategory = 0, "recorder", "segments"
-    handler._tier, handler._next_tier = {"path": str(local)}, {"path": str(nas)}
+    handler._tier_id, handler._category, handler._subcategory = (
+        0,
+        "recorder",
+        "segments",
+    )
+    handler._tier, handler._next_tier = (
+        Tier.model_construct(path=str(local)),
+        Tier.model_construct(path=str(nas)),
+    )
     handler._logger = logging.getLogger(__name__)
     with caplog.at_level(logging.WARNING):
         handler._check_tier(get_db_session, selected)
@@ -1786,8 +1827,17 @@ def test_deferred_move_clears_own_state_and_schedules_source_retry(
     handler._check_tier_lock = threading.Lock()
     storage.camera_tier_handlers = {"test": {"recorder": [{"segments": handler}]}}
     move_file(
-        vis, storage, lambda: session, "test", 0, "recorder", "segments",
-        src, dst, str(tmp_path), logging.getLogger(__name__),
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
     )
     callback = storage.tier_check_worker_send_command.call_args.kwargs["callback"]
     replacement = object()
@@ -1802,14 +1852,28 @@ def test_deferred_move_clears_own_state_and_schedules_source_retry(
 def test_duplicate_move_is_not_dispatched(vis: MockViseron, tmp_path: Path) -> None:
     """Concurrent checks must not overwrite an existing move or submit another."""
     src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
-    row = Mock(orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/")
+    row = Mock(
+        orig_ctime=utcnow(), duration=1.0, file_key=123, id=5, tier_id=0, tier_path="/"
+    )
     session = MagicMock()
     session.__enter__.return_value.execute.return_value.scalar_one.return_value = row
     storage = Mock(spec=Storage)
     storage.temporary_files_meta = {}
     storage.pending_moves = {}
     storage.pending_moves_lock = threading.Lock()
-    args = (vis, storage, lambda: session, "test", 0, "recorder", "segments", src, dst, str(tmp_path), logging.getLogger(__name__))
+    args = (
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
     move_file(*args)
     pending = storage.pending_moves[src]
     meta = storage.temporary_files_meta[dst]
@@ -1819,10 +1883,10 @@ def test_duplicate_move_is_not_dispatched(vis: MockViseron, tmp_path: Path) -> N
     assert storage.temporary_files_meta[dst] is meta
 
 
-def test_contended_deletion_retries_and_stop_cancels(tmp_path: Path, get_db_session) -> None:
+def test_contended_deletion_retries_and_stop_cancels(
+    tmp_path: Path, get_db_session
+) -> None:
     """A busy lock keeps the deletion event queued, with shutdown fencing it."""
-    from queue import Queue
-    from viseron.components.storage.run_lifecycle import camera_lock
 
     handler = TierHandler.__new__(TierHandler)
     handler._logger = logging.getLogger(__name__)
@@ -1853,7 +1917,6 @@ def test_concurrent_duplicate_moves_send_one_command(
     vis: MockViseron, tmp_path: Path
 ) -> None:
     """Two tier scans racing on one source reserve just one move."""
-    from concurrent.futures import ThreadPoolExecutor
 
     src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
     row = Mock(
@@ -1895,7 +1958,6 @@ def test_concurrent_duplicate_moves_send_one_command(
 
 def test_contended_retention_deletion_schedules_source_check(vis: MockViseron) -> None:
     """A locked retention target is reconsidered rather than silently lost."""
-    from viseron.components.storage.storage_subprocess import DataItemDeleteFile
 
     storage = MagicMock()
     handler = Mock()
@@ -1909,7 +1971,7 @@ def test_contended_retention_deletion_schedules_source_check(vis: MockViseron) -
         0,
         "recorder",
         "segments",
-        {"path": "/tier1"},
+        Tier.model_construct(path="/tier1"),
         None,
         "/tier1/old.m4s",
         "/tier1",
@@ -1965,7 +2027,6 @@ def test_deferred_cleanup_cannot_remove_new_move_metadata(
     vis: MockViseron, tmp_path: Path
 ) -> None:
     """A replacement reservation cannot interleave with deferred cleanup."""
-    from concurrent.futures import ThreadPoolExecutor
 
     entered, release = threading.Event(), threading.Event()
 
@@ -2031,9 +2092,9 @@ def test_last_tier_warning_honors_shared_size_budget(vis, tmp_path, caplog, maxi
         }
     }
     tier = _get_tier_config(events=False, continuous=False)
-    tier[CONFIG_PATH] = str(tmp_path)
+    tier.path = str(tmp_path)
     if maximum is not None:
-        tier["retention"] = {"max_size": maximum}
+        tier.retention = {"max_size": maximum}
     with caplog.at_level(logging.WARNING):
         SegmentsTierHandler(vis, camera, 0, "recorder", "segments", tier, None)
     warnings = [record.message for record in caplog.records]

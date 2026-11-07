@@ -25,6 +25,7 @@ from viseron.domains.camera.recorder import (
     AbstractRecorder,
     RecorderBase,
     Recording,
+    RecordingInProgressError,
     delete_recordings,
     get_recordings,
 )
@@ -37,8 +38,6 @@ if TYPE_CHECKING:
 
 def test_manual_delete_waits_until_recording_ends(get_db_session):
     """Deleting a recording must not remove an event still in progress."""
-    from viseron.domains.camera.recorder import RecordingInProgressError
-
     now = datetime.datetime.now(datetime.timezone.utc)
     with get_db_session() as session:
         event = Recordings(
@@ -59,32 +58,43 @@ def test_manual_delete_waits_until_recording_ends(get_db_session):
         assert event is not None
         event.end_time = now + datetime.timedelta(seconds=1)
         session.commit()
-    assert len(
-        delete_recordings(
-            get_db_session, "cam", datetime.timedelta(), recording_id=event_id
+    assert (
+        len(
+            delete_recordings(
+                get_db_session, "cam", datetime.timedelta(), recording_id=event_id
+            )
         )
-    ) == 1
+        == 1
+    )
 
 
 def test_bulk_delete_preserves_all_events_if_any_is_active(get_db_session):
     """A rejected bulk request must not silently remove only some events."""
-    from viseron.domains.camera.recorder import RecordingInProgressError
-
     now = datetime.datetime.now(datetime.timezone.utc)
     with get_db_session() as session:
         session.add_all(
             [
-                Recordings(camera_identifier="cam", start_time=now,
-                           adjusted_start_time=now, end_time=now),
-                Recordings(camera_identifier="cam", start_time=now,
-                           adjusted_start_time=now, end_time=None),
+                Recordings(
+                    camera_identifier="cam",
+                    start_time=now,
+                    adjusted_start_time=now,
+                    end_time=now,
+                ),
+                Recordings(
+                    camera_identifier="cam",
+                    start_time=now,
+                    adjusted_start_time=now,
+                    end_time=None,
+                ),
             ]
         )
         session.commit()
     with pytest.raises(RecordingInProgressError):
         delete_recordings(get_db_session, "cam", datetime.timedelta())
     with get_db_session() as session:
-        assert len(session.query(Recordings).filter_by(camera_identifier="cam").all()) == 2
+        assert (
+            len(session.query(Recordings).filter_by(camera_identifier="cam").all()) == 2
+        )
 
 
 def test_delete_serializes_with_recorder_stop(vis, get_db_session):
@@ -92,14 +102,19 @@ def test_delete_serializes_with_recorder_stop(vis, get_db_session):
     now = datetime.datetime.now(datetime.timezone.utc)
     with get_db_session() as session:
         event = Recordings(
-            camera_identifier="cam", start_time=now, adjusted_start_time=now, end_time=None
+            camera_identifier="cam",
+            start_time=now,
+            adjusted_start_time=now,
+            end_time=None,
         )
         session.add(event)
         session.commit()
         event_id = event.id
     recorder = object.__new__(ConcreteTestRecorder)
     RecorderBase.__init__(
-        recorder, vis, {CONFIG_RECORDER: {CONFIG_CREATE_EVENT_CLIP: False}},
+        recorder,
+        vis,
+        {CONFIG_RECORDER: {CONFIG_CREATE_EVENT_CLIP: False}},
         MockCamera(identifier="cam"),
     )
     recorder._storage = MagicMock(get_session=get_db_session)
@@ -455,13 +470,19 @@ def fixture_add_segment_to_session(
 
 
 @pytest.fixture(name="recorder")
-def fixture_patched_recorder(vis: Viseron):
+def fixture_patched_recorder(vis: Viseron, tmp_path):
     """Fixture to create a test recorder with mocked vis.add_entity."""
     with patch.object(vis, "add_entity") as mock_add_entity:
         config = MagicMock()
         nested_dict = {"filename_pattern": "%H-%M-%S"}
         config.__getitem__.return_value.__getitem__.side_effect = nested_dict.get
-        recorder = ConcreteTestRecorder(vis, config, MockCamera())
+        camera = MockCamera(
+            event_clips_folder=str(tmp_path / "event_clips"),
+            segments_folder=str(tmp_path / "segments"),
+            temp_segments_folder=str(tmp_path / "spool"),
+            thumbnails_folder=str(tmp_path / "thumbnails"),
+        )
+        recorder = ConcreteTestRecorder(vis, config, camera)
         # pylint: disable=protected-access
         recorder._logger = MagicMock()
         assert mock_add_entity.call_count == 2

@@ -5,9 +5,9 @@
       {
         "type": "integer",
         "name": "tier_check_cpu_limit",
-        "description": "CPU limit for the tier check process. This is used to limit the CPU usage of the process that checks for files to move or delete. This is useful to not overload the system with the tier check process. The value is an integer between 1 and 100, where 100 is 100% CPU usage. ",
+        "description": "Optional signal-based CPU limit for the storage process. Disabled by default. Leave disabled for network storage: stop/resume signals can interrupt writes. This is used to limit the CPU usage of the process that checks for files to move or delete. This is useful to not overload the system with the tier check process. The value is an integer between 1 and 100, where 100 is 100% CPU usage. ",
         "optional": true,
-        "default": 10
+        "default": null
       },
       {
         "type": "integer",
@@ -40,6 +40,7 @@
               [
                 {
                   "type": "string",
+                  "lengthMin": 1,
                   "name": "path",
                   "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                   "required": true,
@@ -51,6 +52,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
@@ -338,6 +347,60 @@
                   "description": "Retention rules for event recordings.",
                   "optional": true,
                   "default": null
+                },
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "type": "select",
+                      "options": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": "max_age or max_size"
+                    }
+                  ],
+                  "name": "retention",
+                  "description": "Combined recording retention: max_age (e.g. 30d) and shared tier max_size (e.g. 3TB or 80%). Use instead of continuous/events rules.",
+                  "optional": true,
+                  "default": null
+                },
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "type": "select",
+                      "options": [
+                        {
+                          "type": "constant",
+                          "value": "oldest_first"
+                        },
+                        {
+                          "type": "constant",
+                          "value": "ordinary_first"
+                        },
+                        {
+                          "type": "constant",
+                          "value": "preserve_events"
+                        }
+                      ],
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": "policy"
+                    }
+                  ],
+                  "name": "on_full",
+                  "description": "Full-tier policy: oldest_first, ordinary_first or preserve_events.",
+                  "optional": true,
+                  "default": null
                 }
               ]
             ],
@@ -477,6 +540,7 @@
                 },
                 {
                   "type": "string",
+                  "lengthMin": 1,
                   "name": "path",
                   "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                   "required": true,
@@ -488,6 +552,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
@@ -676,6 +748,7 @@
                     },
                     {
                       "type": "string",
+                      "lengthMin": 1,
                       "name": "path",
                       "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                       "required": true,
@@ -687,6 +760,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -874,6 +955,7 @@
                     },
                     {
                       "type": "string",
+                      "lengthMin": 1,
                       "name": "path",
                       "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                       "required": true,
@@ -885,6 +967,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1072,6 +1162,7 @@
                     },
                     {
                       "type": "string",
+                      "lengthMin": 1,
                       "name": "path",
                       "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                       "required": true,
@@ -1083,6 +1174,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1270,6 +1369,7 @@
                     },
                     {
                       "type": "string",
+                      "lengthMin": 1,
                       "name": "path",
                       "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                       "required": true,
@@ -1281,6 +1381,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1468,6 +1576,7 @@
                     },
                     {
                       "type": "string",
+                      "lengthMin": 1,
                       "name": "path",
                       "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                       "required": true,
@@ -1479,6 +1588,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1672,6 +1789,7 @@
                 },
                 {
                   "type": "string",
+                  "lengthMin": 1,
                   "name": "path",
                   "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
                   "required": true,
@@ -1683,6 +1801,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
@@ -1791,11 +1917,27 @@
         "description": "Configuration for timelapse videos. Timelapse videos are created by combining images or video segments over time to show changes in a compressed time format.",
         "optional": true,
         "default": null
+      },
+      {
+        "type": "map",
+        "value": [
+          {
+            "type": "string",
+            "name": {
+              "type": "string"
+            },
+            "description": "Absolute storage root protected by the marker."
+          }
+        ],
+        "name": "tier_markers",
+        "description": "Map protected storage directory paths to marker filenames that must exist on the mounted share before storage operations are allowed.",
+        "optional": true,
+        "default": {}
       }
     ],
     "name": "storage",
     "description": "Storage configuration.",
-    "required": true,
+    "optional": true,
     "default": {}
   }
 ]

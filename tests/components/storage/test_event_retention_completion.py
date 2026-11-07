@@ -13,6 +13,7 @@ from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import delete, func, select, update
 from watchdog.events import FileDeletedEvent
 
+from viseron.components.storage.config import Tier
 from viseron.components.storage.check_tier import Worker
 from viseron.components.storage.check_tier import delete_file as delete_segment
 from viseron.components.storage.models import Files, Recordings
@@ -81,6 +82,7 @@ def _case(tmp_path, get_session, count=1):
     storage.camera_requested_files_count = {"test": SimpleNamespace(filenames=set())}
     thumbnail, clip, segments = Mock(), Mock(), Mock()
     segments._check_tier_lock = threading.Lock()
+    segments.tier = Tier.model_construct(path=str(tmp_path))
     storage.camera_tier_handlers = {
         "test": {
             "recorder": [
@@ -102,7 +104,7 @@ def _case(tmp_path, get_session, count=1):
     handler._tier_id = 0
     handler._category = "recorder"
     handler._subcategory = "segments"
-    handler._tier = {"path": str(tmp_path)}
+    handler._tier = Tier.model_construct(path=str(tmp_path))
     handler._events_enabled = True
     handler._continuous_configured = False
     handler._logger = logging.getLogger(__name__)
@@ -217,6 +219,13 @@ def test_move_acknowledgement_follows_database_handover(tmp_path, get_db_session
     destination = tmp_path / "next" / source.name
     destination.parent.mkdir()
     destination.write_bytes(source.read_bytes())
+    case.storage.camera_tier_handlers["test"]["recorder"].append(
+        {
+            "segments": SimpleNamespace(
+                tier=Tier.model_construct(path=str(destination.parent))
+            )
+        }
+    )
     committed = Mock()
     move_file(
         case.handler._vis,

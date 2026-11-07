@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import tornado.web
 from tornado.testing import AsyncHTTPTestCase
 
+from viseron.components.storage.config import Tier
 from viseron.components.storage.tier_handler import EventClipTierHandler
 from viseron.components.webserver.tiered_file_handler import TieredFileHandler
 
@@ -16,15 +17,18 @@ class TestEventClipRoute(AsyncHTTPTestCase):
     """A normal event clip can be fetched from its configured tier."""
 
     def get_app(self):
+        """Register the real event-clip handler against a temporary tier."""
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name) / "tier.v1+test"
-        self.clip = self.root / "event_clips" / "camera1" / "2026-11-01" / "recording-7.mp4"
+        self.clip = (
+            self.root / "event_clips" / "camera1" / "2026-11-01" / "recording-7.mp4"
+        )
         self.clip.parent.mkdir(parents=True)
         self.clip.write_bytes(b"clip bytes")
         app = tornado.web.Application()
         tier = object.__new__(EventClipTierHandler)
-        tier._tier = {"path": str(self.root)}
+        tier._tier = Tier(path=str(self.root))
         tier._camera = SimpleNamespace(identifier="camera1", extension="mp4")
         tier._vis = Mock()
         tier._webserver = SimpleNamespace(application=app)
@@ -35,6 +39,7 @@ class TestEventClipRoute(AsyncHTTPTestCase):
 
     def test_normal_clip_url_is_registered(self):
         """The actual route serves a date-nested .mp4, not a camera suffix."""
+
         def initialize(handler, path, **_kwargs):
             tornado.web.StaticFileHandler.initialize(handler, path)
             handler._failed = True
@@ -43,8 +48,9 @@ class TestEventClipRoute(AsyncHTTPTestCase):
         async def prepare(_handler):
             return None
 
-        with patch.object(TieredFileHandler, "initialize", initialize), patch.object(
-            TieredFileHandler, "prepare", prepare
+        with (
+            patch.object(TieredFileHandler, "initialize", initialize),
+            patch.object(TieredFileHandler, "prepare", prepare),
         ):
             response = self.fetch(f"/files{self.clip}")
         assert response.code == 200

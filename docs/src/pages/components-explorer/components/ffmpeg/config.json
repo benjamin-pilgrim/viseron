@@ -216,6 +216,53 @@
                         "values": [
                           [
                             {
+                              "type": "map",
+                              "value": [
+                                {
+                                  "type": "integer",
+                                  "name": "max_age",
+                                  "description": "Maximum recording age, in seconds after normalization.",
+                                  "optional": true,
+                                  "default": null
+                                },
+                                {
+                                  "type": "select",
+                                  "options": [
+                                    {
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "string"
+                                    }
+                                  ],
+                                  "name": "max_size",
+                                  "description": "Shared tier size budget, in bytes or a percentage of total filesystem capacity.",
+                                  "optional": true,
+                                  "default": null
+                                }
+                              ],
+                              "name": "retention",
+                              "description": "Maximum age (e.g. 30d) and aggregate tier size (e.g. 3TB); either limit may be omitted.",
+                              "optional": true,
+                              "default": null
+                            },
+                            {
+                              "type": "map",
+                              "value": [
+                                {
+                                  "type": "string",
+                                  "name": "policy",
+                                  "description": "oldest_first, ordinary_first or preserve_events.",
+                                  "required": true,
+                                  "default": null
+                                }
+                              ],
+                              "name": "on_full",
+                              "description": "Full-tier policy: oldest_first, ordinary_first or preserve_events.",
+                              "optional": true,
+                              "default": null
+                            },
+                            {
                               "type": "string",
                               "name": "path",
                               "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
@@ -228,6 +275,14 @@
                               "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                               "optional": true,
                               "default": false
+                            },
+                            {
+                              "type": "integer",
+                              "valueMin": 1,
+                              "name": "poll_interval",
+                              "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                              "optional": true,
+                              "default": 1
                             },
                             {
                               "type": "boolean",
@@ -667,6 +722,14 @@
                               "default": false
                             },
                             {
+                              "type": "integer",
+                              "valueMin": 1,
+                              "name": "poll_interval",
+                              "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                              "optional": true,
+                              "default": 1
+                            },
+                            {
                               "type": "boolean",
                               "name": "move_on_shutdown",
                               "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -857,6 +920,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "integer",
+                                  "valueMin": 1,
+                                  "name": "poll_interval",
+                                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1057,6 +1128,14 @@
                                   "default": false
                                 },
                                 {
+                                  "type": "integer",
+                                  "valueMin": 1,
+                                  "name": "poll_interval",
+                                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                                  "optional": true,
+                                  "default": 1
+                                },
+                                {
                                   "type": "boolean",
                                   "name": "move_on_shutdown",
                                   "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1253,6 +1332,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "integer",
+                                  "valueMin": 1,
+                                  "name": "poll_interval",
+                                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1453,6 +1540,14 @@
                                   "default": false
                                 },
                                 {
+                                  "type": "integer",
+                                  "valueMin": 1,
+                                  "name": "poll_interval",
+                                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                                  "optional": true,
+                                  "default": 1
+                                },
+                                {
                                   "type": "boolean",
                                   "name": "move_on_shutdown",
                                   "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1649,6 +1744,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "integer",
+                                  "valueMin": 1,
+                                  "name": "poll_interval",
+                                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1853,6 +1956,14 @@
                               "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                               "optional": true,
                               "default": false
+                            },
+                            {
+                              "type": "integer",
+                              "valueMin": 1,
+                              "name": "poll_interval",
+                              "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                              "optional": true,
+                              "default": 1
                             },
                             {
                               "type": "boolean",
@@ -2925,6 +3036,23 @@
                     "description": "FFmpeg encoder output arguments.",
                     "optional": true,
                     "default": []
+                  },
+                  {
+                    "type": "select",
+                    "options": [
+                      {
+                        "type": "constant",
+                        "value": "source"
+                      },
+                      {
+                        "type": "constant",
+                        "value": "wallclock"
+                      }
+                    ],
+                    "name": "timestamp_mode",
+                    "description": "FFmpeg input timestamp source: wallclock (default) or source. Ignored when input_args or raw_command is set. When recording and detection share an input, this also affects detection.",
+                    "optional": true,
+                    "default": "wallclock"
                   },
                   {
                     "type": "string",

@@ -88,6 +88,7 @@ from .const import (
     DEFAULT_PASSWORD,
     DEFAULT_PROTOCOL,
     DEFAULT_RAW_PIPELINE,
+    DEFAULT_RESTART_DELAY,
     DEFAULT_RTSP_TRANSPORT,
     DEFAULT_STREAM_FORMAT,
     DEFAULT_USERNAME,
@@ -116,6 +117,7 @@ from .const import (
     DESC_USERNAME,
     DESC_WIDTH,
     MAX_EMPTY_FRAMES,
+    MAX_RESTART_DELAY,
     STREAM_FORMAT_MAP,
 )
 from .recorder import Recorder
@@ -357,6 +359,7 @@ class Camera(AbstractCamera):
     def read_frames(self, stop_event: Event) -> None:
         """Read frames using a stop event unique to this reader."""
         self.decode_error.clear()
+        restart_delay = DEFAULT_RESTART_DELAY
         self._poll_timer = utcnow().timestamp()
         empty_frames = 0
         self._thread_stuck = False
@@ -371,7 +374,11 @@ class Camera(AbstractCamera):
                     self._poll_timer = utcnow().timestamp()
                     self.connected = False
                     self.still_image_available = self.still_image_configured
-                    if stop_event.wait(5):
+                    self._logger.warning(
+                        "Camera failed to produce frames, restarting in %s seconds",
+                        restart_delay,
+                    )
+                    if stop_event.wait(restart_delay):
                         break
                     self._logger.error("Restarting frame pipe")
                     self.stream.close_pipe()
@@ -383,9 +390,11 @@ class Camera(AbstractCamera):
                     self.stream.start_pipe()
                     self.decode_error.clear()
                     empty_frames = 0
+                    restart_delay = min(restart_delay * 2, MAX_RESTART_DELAY)
 
                 self.current_frame = self.stream.read()
                 if self.current_frame:
+                    restart_delay = DEFAULT_RESTART_DELAY
                     self.connected = True
                     self.still_image_available = True
                     empty_frames = 0
@@ -457,7 +466,11 @@ class Camera(AbstractCamera):
         """Start a reader once the previous owner has released the pipe."""
         self._logger.debug("Starting capture thread")
         with self._capture_lock:
-            if self._capture_frames and self._frame_reader and self._frame_reader.is_alive():
+            if (
+                self._capture_frames
+                and self._frame_reader
+                and self._frame_reader.is_alive()
+            ):
                 return
             if self._frame_reader and not self._frame_reader.is_alive():
                 self._frame_reader.stop()

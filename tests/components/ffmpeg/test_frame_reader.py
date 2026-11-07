@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import pickle
 import queue
@@ -10,7 +11,11 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from viseron.components.ffmpeg import stream
-from viseron.components.ffmpeg.const import MAX_EMPTY_FRAMES
+from viseron.components.ffmpeg.const import (
+    DEFAULT_RESTART_DELAY,
+    MAX_EMPTY_FRAMES,
+    MAX_RESTART_DELAY,
+)
 from viseron.components.ffmpeg.frame_reader import (
     FrameReaderConfig,
     frame_reader_logger_name,
@@ -147,3 +152,61 @@ def test_decode_error_restarts_the_same_pipe() -> None:
     assert ffmpeg_pipe.return_value.start.call_count == 2
     assert ffmpeg_pipe.return_value.close.call_count == 2
     assert frame_queue.get_nowait() == b"1234"
+
+
+def _restart_waits(reads, failures):
+    """Measure retry intervals without depending on the interruptible wait's slices."""
+    capture = threading.Event()
+    capture.set()
+    decode_error = MagicMock()
+    decode_error.is_set.side_effect = failures
+    elapsed = 0.0
+    starts = []
+    frames = iter(reads)
+    remaining = len(reads)
+
+    def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def read(_size):
+        nonlocal remaining
+        remaining -= 1
+        if not remaining:
+            capture.clear()
+        return next(frames)
+
+    with ExitStack() as stack:
+        pipe, _ = _enter_patches(stack)
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.sleep", side_effect=sleep
+            )
+        )
+        pipe.return_value.start.side_effect = lambda: starts.append(elapsed)
+        pipe.return_value.read.side_effect = read
+        run_frame_reader(_config(), _FakeQueue(maxsize=2), capture, decode_error)
+    return [round(later - earlier, 6) for earlier, later in itertools.pairwise(starts)]
+
+
+def test_restart_delay_backs_off_exponentially() -> None:
+    """A dead camera retries exponentially, capped at the maximum delay."""
+    assert _restart_waits([None] * 8, [True] * 8) == [
+        DEFAULT_RESTART_DELAY,
+        10,
+        20,
+        40,
+        MAX_RESTART_DELAY,
+        MAX_RESTART_DELAY,
+        MAX_RESTART_DELAY,
+        MAX_RESTART_DELAY,
+    ]
+
+
+def test_restart_delay_resets_after_a_frame() -> None:
+    """A successful frame resets the next retry to the base delay."""
+    assert _restart_waits([None, None, b"1234", None], [True, True, False, True]) == [
+        DEFAULT_RESTART_DELAY,
+        10,
+        DEFAULT_RESTART_DELAY,
+    ]

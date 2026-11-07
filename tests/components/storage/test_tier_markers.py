@@ -8,16 +8,17 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-import voluptuous as vol
+from pydantic import ValidationError
+from pydantic_core import PydanticCustomError
 from watchdog.events import FileDeletedEvent
 
 from viseron.components.storage import Storage
 from viseron.components.storage.check_tier import delete_file, move_file
 from viseron.components.storage.config import (
-    STORAGE_SCHEMA,
+    StorageConfig,
+    Tier,
+    _check_configured_paths,
     _check_path_exists,
-    _validate_recorder_tiers,
-    validate_tier_markers,
     validate_tiers,
 )
 from viseron.components.storage.jobs import OrphanedFilesCleanup
@@ -49,7 +50,7 @@ def test_marker_must_be_a_regular_file_on_the_tier(tmp_path: Path) -> None:
 
 def test_marker_configuration_is_accepted(tmp_path: Path) -> None:
     """The component schema accepts normalized opt-in marker roots."""
-    config = STORAGE_SCHEMA({"tier_markers": {f"{tmp_path}/": ".ready"}})
+    config = StorageConfig.model_validate({"tier_markers": {f"{tmp_path}/": ".ready"}})
     assert config["tier_markers"] == {str(tmp_path): ".ready"}
 
 
@@ -58,9 +59,11 @@ def test_offline_later_tier_is_allowed_at_startup(tmp_path: Path) -> None:
     root = tmp_path / "offline"
     tier = {"path": str(root / "recordings")}
     markers = {str(root): ".ready"}
-    _check_path_exists(tier, "recorder", markers, allow_unavailable=True)
-    with pytest.raises(vol.Invalid):
-        _check_path_exists(tier, "recorder", markers)
+    _check_configured_paths(
+        [Tier(path=str(tmp_path)), Tier(**tier)], "recorder", markers
+    )
+    with pytest.raises(PydanticCustomError):
+        _check_path_exists(tier["path"], "recorder")
 
 
 def test_recorder_validation_allows_offline_guarded_destination(tmp_path: Path) -> None:
@@ -68,7 +71,7 @@ def test_recorder_validation_allows_offline_guarded_destination(tmp_path: Path) 
     local = tmp_path / "local"
     local.mkdir()
     remote = tmp_path / "remote"
-    config = STORAGE_SCHEMA(
+    config = StorageConfig.model_validate(
         {
             "tier_markers": {str(remote): ".ready"},
             "recorder": {
@@ -82,8 +85,9 @@ def test_recorder_validation_allows_offline_guarded_destination(tmp_path: Path) 
             },
         }
     )
-    _validate_recorder_tiers(config)
-    camera_config = {"storage": {"recorder": config["recorder"]}}
+    camera_config = {
+        "storage": {"recorder": config.recorder.model_dump(exclude_none=True)}
+    }
     assert validate_tiers(camera_config, tier_markers=config["tier_markers"])
     assert "tier_markers" not in camera_config["storage"]
 
@@ -193,8 +197,8 @@ def test_recovery_retries_failed_watcher_before_moving(tmp_path: Path) -> None:
 @pytest.mark.parametrize("root,marker", [("relative", ".ready"), ("/mnt", "../x")])
 def test_invalid_tier_marker_configuration(root: str, marker: str) -> None:
     """Avoid relative roots and marker names that escape their root."""
-    with pytest.raises(vol.Invalid):
-        validate_tier_markers({root: marker})
+    with pytest.raises(ValidationError):
+        StorageConfig.model_validate({"tier_markers": {root: marker}})
 
 
 def test_failed_marker_check_preserves_source(tmp_path: Path) -> None:
