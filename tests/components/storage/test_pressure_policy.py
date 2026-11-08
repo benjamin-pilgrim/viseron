@@ -208,7 +208,6 @@ def test_size_budget_is_shared_across_cameras(get_db_session, tmp_path):
     assert str(newest) in {item["path"] for item in result["promote"]}
 
 
-
 def test_pressure_deletion_is_logged_when_budget_returns_to_normal(
     get_db_session, tmp_path, caplog
 ):
@@ -627,3 +626,62 @@ def test_full_destination_preserves_source_until_pressure_recovers(
     promote()
     storage.tier_check_worker_send_command.assert_called_once()
     assert source.exists()
+
+
+@pytest.mark.parametrize(
+    "continuous_mib,event_mib,ordinary_expired,events_expired",
+    [(2.5, 2.5, 2, 2), (2.5, 5, 2, 0), (5, 2.5, 0, 2)],
+)
+def test_separate_percentage_rules_select_their_own_expired_footage(
+    get_db_session, continuous_mib, event_mib, ordinary_expired, events_expired
+):
+    """Real capacity and PostgreSQL selection keep each class's newer footage."""
+    with _pressure_directory() as root:
+        now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        paths = [
+            _record(
+                get_db_session,
+                root,
+                "camera",
+                now + datetime.timedelta(seconds=i * 20),
+                1024**2,
+                event=i < 4,
+            )
+            for i in range(8)
+        ]
+        with get_db_session() as session:
+            for recording in session.query(Recordings).all():
+                recording.created_at = recording.start_time
+            session.commit()
+        filesystem = os.statvfs(root)
+        percent_per_mib = 100 * 1024**2 / (filesystem.f_blocks * filesystem.f_frsize)
+        item = DataItem(
+            cmd="check_tier",
+            camera_identifier="camera",
+            tier_id=0,
+            category="recorder",
+            subcategories=["segments"],
+            throttle_period=datetime.timedelta(0),
+            max_bytes=0,
+            min_age=datetime.timedelta(0),
+            max_age=datetime.timedelta(0),
+            min_bytes=0,
+            drain=False,
+            files_enabled=True,
+            events_enabled=True,
+            events_max_bytes=0,
+            events_min_age=datetime.timedelta(0),
+            events_max_age=datetime.timedelta(0),
+            events_min_bytes=0,
+            size_percentages={
+                "max_bytes": continuous_mib * percent_per_mib,
+                "events_max_bytes": event_mib * percent_per_mib,
+            },
+            size_path=str(root),
+        )
+        worker = Worker()
+        worker._get_session = get_db_session
+        worker.check_tier(item)
+        expected = paths[:events_expired] + paths[4 : 4 + ordinary_expired]
+        assert set(item.data["path"]) == {str(path) for path in expected}
+        assert all(path.exists() for path in paths), "Selection must not delete files"

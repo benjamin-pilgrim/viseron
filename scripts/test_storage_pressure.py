@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -40,6 +41,84 @@ def wait_for(description, predicate, timeout=120):
     raise RuntimeError(f"Timed out: {description}; last error: {last_error}")
 
 
+def retention_rules(separate, max_size):
+    """Select the new per-class rules or the original legacy acceptance config."""
+    ram_rules = (
+        """        continuous:
+          max_size:
+            percent: 40
+          max_age:
+            minutes: 1
+        events:
+          max_size:
+            percent: 20
+          max_age:
+            minutes: 1"""
+        if separate
+        else "        retention:\n          max_size: " + json.dumps(max_size)
+    )
+    nas_rules = (
+        """        continuous:
+          max_size:
+            percent: 40
+        events:
+          max_size:
+            percent: 20"""
+        if separate
+        else "        retention:\n          max_age: 1d"
+    )
+    return ram_rules, nas_rules
+
+
+def fill_ram(app):
+    """Exhaust only the disposable RAM filesystem, requiring native ENOSPC."""
+    command(
+        "podman",
+        "exec",
+        app,
+        "python3",
+        "-c",
+        "from pathlib import Path; p=Path('/buffer/pressure-filler'); "
+        "f=p.open('wb',buffering=0); block=b'x'*65536\n"
+        "while True:\n try: f.write(block)\n except OSError as e:\n"
+        "  assert e.errno==28; break\nf.close()",
+    )
+    print("Filled dedicated 16 MiB RAM filesystem to native ENOSPC.", flush=True)
+    return True
+
+
+def prepare_runtime_paths(root, repo, packaged):
+    """Keep writable development paths out of inherited image layers."""
+    if not packaged:
+        (root / "bin").mkdir(mode=0o777)
+        (root / "bin").chmod(0o777)
+        for binary in ("ffmpeg", "ffprobe"):
+            shutil.copyfile(
+                repo / "docker" / (binary + "_wrapper"), root / "bin" / binary
+            )
+            (root / "bin" / binary).chmod(0o755)
+    (root / "nginx-logs/error.log").touch()
+    (root / "nginx-logs/error.log").chmod(0o666)
+
+
+def verify_copy_access(app):
+    """Fail early if the fixture's CIFS owner cannot support durable copies."""
+    command(
+        "podman",
+        "exec",
+        "--user",
+        "abc",
+        app,
+        "python3",
+        "-c",
+        "import os,tempfile; fd,p=tempfile.mkstemp(dir='/cifs'); "
+        "print('runtime_uid='+str(os.getuid()),flush=True)\n"
+        "try:\n os.fchmod(fd,0o644); os.write(fd,b'copy probe'); os.fsync(fd)\n"
+        "finally:\n os.close(fd); os.unlink(p)",
+    )
+    print("PASS: recording user can create, chmod and sync CIFS copies", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path)
@@ -62,6 +141,11 @@ def main():
     parser.add_argument(
         "--max-size", default="2MiB", help="Shared RAM budget, e.g. 2MiB or 12.5%%"
     )
+    parser.add_argument(
+        "--separate-retention",
+        action="store_true",
+        help="Exercise per-class percentage rules and native RAM exhaustion",
+    )
     parser.add_argument("--http-port", type=int, default=29775)
     parser.add_argument("--rtsp-port", type=int, default=29774)
     parser.add_argument(
@@ -83,14 +167,16 @@ def main():
     name = root.name
     remote = args.cifs_mount / name
     remote.mkdir()
-    remote.chmod(0o777)
+    assert os.access(remote, os.W_OK), "CIFS test namespace must be writable"
     (remote / ".viseron-test-tier").touch()
     for path in [
         root,
-        *[root / part for part in ("config", "snapshots", "recordings")],
+        *[root / part for part in ("config", "snapshots", "recordings", "nginx-logs")],
     ]:
         path.mkdir(exist_ok=True)
         path.chmod(0o777)
+    prepare_runtime_paths(root, args.repo, args.packaged)
+    ram_rules, nas_rules = retention_rules(args.separate_retention, args.max_size)
     (root / "config/config.yaml").write_text(f"""logger:
   default_level: info
 storage:
@@ -101,14 +187,12 @@ storage:
       - path: /buffer
         check_interval:
           seconds: 3
-        retention:
-          max_size: {json.dumps(args.max_size)}
+{ram_rules}
         on_full:
           policy: {args.policy}
       - path: /cifs
         poll: true
-        retention:
-          max_age: 1d
+{nas_rules}
         on_full:
           policy: preserve_events
 ffmpeg:
@@ -132,7 +216,8 @@ ffmpeg:
         ),
         "packaged": args.packaged,
         "policy": args.policy,
-        "max_size": args.max_size,
+        "max_size": None if args.separate_retention else args.max_size,
+        "separate_retention": args.separate_retention,
         "root": str(root),
         "remote": str(remote),
     }
@@ -336,6 +421,22 @@ print(json.dumps(result))
                 "zerolatency",
                 "-g",
                 "30",
+                *(
+                    [
+                        "-b:v",
+                        "2M",
+                        "-minrate",
+                        "2M",
+                        "-maxrate",
+                        "2M",
+                        "-bufsize",
+                        "4M",
+                        "-x264-params",
+                        "nal-hrd=cbr",
+                    ]
+                    if args.separate_retention
+                    else []
+                ),
                 "-pix_fmt",
                 "yuv420p",
                 "-f",
@@ -360,6 +461,8 @@ print(json.dumps(result))
                 ),
                 "-v",
                 f"{args.frontend}:/src/viseron/frontend:ro",
+                "-v",
+                f"{root}/bin:/home/abc/bin",
             ]
         )
         command(
@@ -374,6 +477,14 @@ print(json.dumps(result))
             "S6_KILL_GRACETIME=3000",
             "--tmpfs",
             "/buffer:size=16m,mode=1777",
+            "--tmpfs",
+            "/var/run/postgresql:mode=1777",
+            "--tmpfs",
+            "/var/lib/nginx:mode=1777",
+            "-v",
+            f"{root}/nginx-logs:/var/log/nginx",
+            "--tmpfs",
+            "/tmp:mode=1777",
             *application_mounts,
             "-v",
             f"{remote}:/cifs",
@@ -418,8 +529,9 @@ print(json.dumps(result))
             )
         wait_for(
             "synthetic camera produces indexed RAM fragments",
-            lambda: len(local_rows()) >= 3,
+            lambda: len(local_rows()) >= (5 if args.separate_retention else 3),
         )
+        verify_copy_access(app)
         if args.policy == "preserve_events":
             print("Manual event start:", api("start"), flush=True)
             wait_for(
@@ -434,45 +546,48 @@ print(json.dumps(result))
         tracked = next(iter(before))
         tracked_hash = before[tracked]
         evidence.update(tracked=tracked, tracked_hash=tracked_hash)
+
+        if args.separate_retention and args.policy == "ordinary_first":
+            evidence["native_enospc"] = fill_ram(app)
         if args.policy == "ordinary_first":
             wait_for(
                 "old RAM footage reclaimed while new footage continues "
                 "during CIFS outage",
-                lambda: tracked not in local_rows() and len(local_rows()) >= 2,
+                lambda: (
+                    tracked not in local_rows()
+                    and any(path > max(before) for path in local_rows())
+                ),
                 timeout=150,
             )
+            if args.separate_retention:
+                command("podman", "exec", app, "rm", "/buffer/pressure-filler")
             wait_for(
                 "public run-init returns exact MP4 init bytes",
                 lambda: public_init(local_rows()[-1]),
             )
             browser("outage")
         else:
+            preserved = {}
+            if args.separate_retention:
+                wait_for(
+                    "active event has complete fragments before RAM exhaustion",
+                    lambda: len(local_rows(event_only=True)) >= 3,
+                )
+                preserved = snapshot_hashes(event_only=True)
+                evidence["native_enospc"] = fill_ram(app)
             wait_for(
-                "event preservation blocks first-tier admission "
-                "at its shared size limit",
+                "event preservation blocks first-tier admission",
                 lambda: "Recording storage /buffer/: blocked" in logs(),
                 timeout=150,
             )
             # The buffer also contains ordinary footage from before pre-roll.
             # That footage may legitimately expire; freeze the event-owned set
             # before filling RAM, then require every one of those bytes to survive.
-            preserved = snapshot_hashes(event_only=True)
+            preserved = preserved or snapshot_hashes(event_only=True)
             evidence["protected_hashes"] = preserved
             assert preserved, "No retained event footage"
-            command(
-                "podman",
-                "exec",
-                app,
-                "python3",
-                "-c",
-                "from pathlib import Path; p=Path('/buffer/pressure-filler'); "
-                "f=p.open('wb',buffering=0); block=b'x'*65536\n"
-                "while True:\n try: f.write(block)\n except OSError as e:\n"
-                "  assert e.errno==28; break\nf.close()",
-            )
-            print(
-                "Filled dedicated 16 MiB RAM filesystem to native ENOSPC.", flush=True
-            )
+            if not args.separate_retention:
+                evidence["native_enospc"] = fill_ram(app)
             deadline = time.monotonic() + 16
             while time.monotonic() < deadline:
                 assert all(
