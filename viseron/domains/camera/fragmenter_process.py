@@ -164,6 +164,59 @@ def _get_orig_ctime(
     return datetime.datetime.fromtimestamp(int(epoch), tz=datetime.timezone.utc)
 
 
+def _validate_fragment(path: str, expected_identity: list[int]) -> None:
+    """Require finite, complete moof/mdat boxes in a finalized recorder fragment.
+
+    ENOSPC can leave an empty or partial file despite finalized HLS timing.
+    Read only box headers and seek over payloads; this checks container
+    completeness, not codec correctness. Publication checks the identity again.
+    """
+    with open(path, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns] != (
+            expected_identity
+        ):
+            raise ValueError("fragment changed before completeness check")
+        offset = 0
+        pending_moof = False
+        has_media = False
+        while offset < before.st_size:
+            stream.seek(offset)
+            header_size = 8
+            header = stream.read(header_size)
+            if len(header) != header_size:
+                raise ValueError("truncated MP4 box header")
+            size = int.from_bytes(header[:4], "big")
+            kind = header[4:]
+            if size == 1:
+                extended_size = stream.read(header_size)
+                if len(extended_size) != header_size:
+                    raise ValueError("truncated extended MP4 box header")
+                size = int.from_bytes(extended_size, "big")
+                header_size *= 2
+            # Our finite FFmpeg/MP4Box fragments have explicit box sizes.
+            # A zero-sized box extends to EOF and cannot prove completeness.
+            if size < header_size or offset + size > before.st_size:
+                raise ValueError("incomplete or unfinalized MP4 box")
+            if kind == b"moof":
+                if pending_moof or size == header_size:
+                    raise ValueError("fragment has no complete movie fragment")
+                pending_moof = True
+            elif kind == b"mdat":
+                if not pending_moof or size == header_size:
+                    raise ValueError("fragment has no complete media payload")
+                has_media = True
+                pending_moof = False
+            offset += size
+        if not has_media or pending_moof:
+            raise ValueError("fragment lacks a complete moof/mdat pair")
+        after = os.fstat(stream.fileno())
+        if [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns] != (
+            expected_identity
+        ):
+            raise ValueError("fragment changed during completeness check")
+
+
 def fragmenter_logger_names(camera_identifier: str) -> tuple[str, str]:
     """Return the names of the loggers the fragmenter child process creates.
 
@@ -206,6 +259,7 @@ class FragmenterWork(ChildProcessWork):
         self._metadata_retry: dict[str, tuple[float, float]] = {}
         self._last_missing_duration_warning: float | None = None
         self._last_reaped_run: str | None = None
+        self._last_invalid_fragment_warning: float | None = None
         self._storage_blocked = False
         self._blocked_sequences: dict[str, int] = {}
 
@@ -881,6 +935,28 @@ class FragmenterWork(ChildProcessWork):
             if extinf is None:
                 extinf = _filename_duration(name)
             if extinf:
+                if match and expected_identity is not None:
+                    try:
+                        _validate_fragment(
+                            os.path.join(self.temp_segments_folder, file),
+                            expected_identity,
+                        )
+                    except ValueError as error:
+                        now = time.monotonic()
+                        self._defer_metadata_retry(file, now)
+                        if (
+                            self._last_invalid_fragment_warning is None
+                            or now - self._last_invalid_fragment_warning
+                            >= METADATA_WARNING_INTERVAL_SECONDS
+                        ):
+                            self._logger.warning(
+                                "Incomplete staged fragment %s: %s; leaving it "
+                                "unindexed in staging. Recording has a gap.",
+                                file,
+                                error,
+                            )
+                            self._last_invalid_fragment_warning = now
+                        return
                 self._metadata_retry.pop(file, None)
                 orig_ctime = _get_orig_ctime(file, program_date_time)
                 self._send_files_metadata(

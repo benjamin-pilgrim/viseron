@@ -88,7 +88,7 @@ def test_missing_timestamp_warning_is_coalesced_and_repeats(tmp_path, caplog, mo
 def test_timing_arriving_within_grace_is_processed_without_warning(tmp_path, caplog, monkeypatch):
     stage=tmp_path/'stage'; run=stage/RUN; run.mkdir(parents=True)
     name='000000000-1760000000-0000001000000.m4s'
-    (run/name).write_bytes(b'fragment')
+    (run/name).write_bytes(b'\x00\x00\x00\x0cmoofdata\x00\x00\x00\x0cmdatdata')
     playlist=run/'index.m3u8'; playlist.write_text('#EXTM3U\n')
     worker=FragmenterWork('cam',str(stage),str(tmp_path/'segments'/'cam'),None,None,None)
     worker._send_files_metadata=Mock()

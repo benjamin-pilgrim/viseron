@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import struct
 import tempfile
 import threading
 import time
@@ -251,7 +252,12 @@ def _staged(root, timestamp, sequence=1):
     run.mkdir(parents=True, exist_ok=True)
     name = f"{sequence:09d}-{int(timestamp.timestamp())}-0000002000000.m4s"
     source = run / name
-    source.write_bytes(b"s" * 1024)
+    source.write_bytes(
+        struct.pack(">I4s", 12, b"moof")
+        + b"data"
+        + struct.pack(">I4s", 1012, b"mdat")
+        + b"s" * 1004
+    )
     (run / "init.mp4").write_bytes(b"init")
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT)
     with open(run / "index.m3u8", "a", encoding="utf-8") as playlist:
