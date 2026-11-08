@@ -844,8 +844,7 @@ class Storage:
         callback: Callable[[Any], None] | None = None,
     ) -> None:
         """Send command to tier check worker."""
-        if isinstance(item, (DataItemMoveFile, DataItemDeleteFile)):
-            item.tier_markers = dict(self._config.get(CONFIG_TIER_MARKERS, {}))
+        item.tier_markers = dict(self._config.get(CONFIG_TIER_MARKERS, {}))
         self.tier_check_worker.send_command(item, callback)
 
     def _shutdown(self) -> None:

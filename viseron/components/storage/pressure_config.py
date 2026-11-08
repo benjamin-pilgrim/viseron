@@ -3,7 +3,8 @@
 import copy
 import math
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 import voluptuous as vol
 
@@ -66,6 +67,19 @@ def resolve_size_limit(value: int | str, capacity: int) -> int:
     return value
 
 
+def validate_retention_size(value: Any) -> Any:
+    """Validate one retention size before schema coercion can obscure its units."""
+    if not isinstance(value, dict) or "percent" not in value:
+        return value
+    if any(value.get(unit) is not None for unit in ("gb", "mb")):
+        raise vol.Invalid("Use percent or gb/mb for a size limit, not both")
+    try:
+        percent = format(Decimal(str(value["percent"])), "f")
+    except InvalidOperation as error:
+        raise vol.Invalid("Percentage size limits need a finite number") from error
+    return {**value, "percent": float(_size_limit(f"{percent}%")[:-1])}
+
+
 def normalize_tier(value):
     """Keep old configs unchanged; simple limits enable both recording classes."""
     tier = copy.deepcopy(value)
@@ -73,6 +87,13 @@ def normalize_tier(value):
         tier["on_full"] = vol.Schema({vol.Required("policy"): vol.In(POLICIES)})(
             tier["on_full"]
         )
+    for kind in ("continuous", "events"):
+        rules = tier.get(kind)
+        if not isinstance(rules, dict):
+            continue
+        for limit in ("max_size", "min_size"):
+            if limit in rules:
+                rules[limit] = validate_retention_size(rules[limit])
     if "retention" not in tier:
         return tier
     retention = vol.Schema(
@@ -111,6 +132,8 @@ def normalize_tier(value):
                 or calculate_bytes(old["max_size"])
                 or calculate_age(old["min_age"]).total_seconds()
                 or calculate_bytes(old["min_size"])
+                or old["max_size"].get("percent")
+                or old["min_size"].get("percent")
             ):
                 raise vol.Invalid(
                     "Use retention or continuous/events settings, not both"

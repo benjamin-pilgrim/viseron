@@ -6,7 +6,7 @@ from viseron.components.storage.config import (
     RECORDER_SCHEMA as STORAGE_RECORDER_SCHEMA,
 )
 from viseron.components.storage.config import (
-    TIER_SCHEMA_BASE,
+    RECORDER_RETENTION_SCHEMA,
     get_snapshots_schema,
     get_timelapse_schema,
 )
@@ -305,12 +305,12 @@ RECORDER_SCHEMA = vol.Schema(
             CONFIG_CONTINUOUS,
             default=UNDEFINED,
             description=DESC_CONTINUOUS,
-        ): Maybe(TIER_SCHEMA_BASE),
+        ): Maybe(RECORDER_RETENTION_SCHEMA),
         vol.Optional(
             CONFIG_EVENTS,
             default=UNDEFINED,
             description=DESC_EVENTS,
-        ): Maybe(TIER_SCHEMA_BASE),
+        ): Maybe(RECORDER_RETENTION_SCHEMA),
         vol.Optional(
             CONFIG_CREATE_EVENT_CLIP,
             default=DEFAULT_CREATE_EVENT_CLIP,

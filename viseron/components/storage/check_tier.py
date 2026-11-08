@@ -45,6 +45,7 @@ from viseron.components.storage.source_move_intent import (
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.pressure import event_fence
+from viseron.components.storage.pressure_config import resolve_size_limit
 from viseron.components.storage.util import (
     TIER_MOVE_TEMP_PREFIX,
     is_tier_marker,
@@ -350,6 +351,16 @@ class Worker:
             self._checks_in_progress[item.camera_identifier] = True
 
         try:
+            if item.size_percentages:
+                if item.size_path is None:
+                    raise ValueError(
+                        "Percentage retention needs a tier filesystem path"
+                    )
+                require_tier_markers(item.size_path, item.tier_markers)
+                filesystem = os.statvfs(item.size_path)
+                capacity = filesystem.f_blocks * filesystem.f_frsize
+                for name, percent in item.size_percentages.items():
+                    setattr(item, name, resolve_size_limit(f"{percent}%", capacity))
             self._check_tier(item)
         finally:
             LOGGER.debug(

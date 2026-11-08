@@ -72,6 +72,9 @@ class DataItem:
     retention_recording_ids: tuple[int, ...] | None = None
     error: str | None = None
     deferred: bool = False
+    size_percentages: dict[str, float] = field(default_factory=dict)
+    size_path: str | None = None
+    tier_markers: dict[str, str] = field(default_factory=dict)
 
     @property
     def throttle_key(self) -> str:

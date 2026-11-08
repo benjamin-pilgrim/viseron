@@ -133,7 +133,10 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     TIER_SUBCATEGORY_THUMBNAILS,
 )
-from viseron.components.storage.pressure_config import normalize_tier
+from viseron.components.storage.pressure_config import (
+    normalize_tier,
+    validate_retention_size,
+)
 from viseron.components.storage.util import (
     calculate_age,
     calculate_bytes,
@@ -170,9 +173,11 @@ class CoerceEndsWithSlash:
 
 def get_size_schema(
     age_type: Literal["min"] | Literal["max"],
-) -> dict[vol.Optional, Maybe]:
+    *,
+    include_percent: bool = False,
+) -> dict[vol.Optional, Any]:
     """Get size schema."""
-    return {
+    schema: dict[vol.Optional, Any] = {
         vol.Optional(
             CONFIG_GB,
             default=DEFAULT_GB,
@@ -184,6 +189,15 @@ def get_size_schema(
             description=DESC_MIN_MB if age_type == "min" else DESC_MAX_MB,
         ): Maybe(vol.Coerce(float)),
     }
+
+    if include_percent:
+        schema[
+            vol.Optional(
+                "percent",
+                description="Percentage of total tier filesystem capacity, per camera.",
+            )
+        ] = vol.All(vol.Coerce(float), vol.Range(min=0, max=100, min_included=False))
+    return schema
 
 
 def get_age_schema(
@@ -292,6 +306,21 @@ TIER_SCHEMA_SNAPSHOTS = TIER_SCHEMA_BASE.extend(
     }
 )
 
+RECORDER_RETENTION_SCHEMA = TIER_SCHEMA_BASE.extend(
+    {
+        vol.Optional(
+            CONFIG_MAX_SIZE, default=DEFAULT_MAX_SIZE, description=DESC_MAX_SIZE
+        ): vol.All(
+            validate_retention_size, get_size_schema("max", include_percent=True)
+        ),
+        vol.Optional(
+            CONFIG_MIN_SIZE, default=DEFAULT_MIN_SIZE, description=DESC_MIN_SIZE
+        ): vol.All(
+            validate_retention_size, get_size_schema("min", include_percent=True)
+        ),
+    }
+)
+
 _TIER_SCHEMA_RECORDER = vol.Schema(
     {
         vol.Optional(
@@ -301,15 +330,26 @@ _TIER_SCHEMA_RECORDER = vol.Schema(
                 "either limit may be omitted."
             ),
         ): {
-            vol.Optional("max_age"): int,
-            vol.Optional("max_size"): vol.Any(int, str),
+            vol.Optional(
+                "max_age", description="Combined age limit, normalized to seconds."
+            ): int,
+            vol.Optional(
+                "max_size",
+                description=(
+                    "Legacy shared size limit, in bytes or a filesystem percentage."
+                ),
+            ): vol.Any(int, str),
         },
         vol.Optional(
             "on_full",
             description=(
                 "Full-tier policy: oldest_first, ordinary_first or preserve_events."
             ),
-        ): {"policy": str},
+        ): {
+            vol.Required(
+                "policy", description="oldest_first, ordinary_first or preserve_events."
+            ): str
+        },
         vol.Required(
             CONFIG_PATH,
             description=DESC_PATH,
@@ -367,12 +407,12 @@ _TIER_SCHEMA_RECORDER = vol.Schema(
             CONFIG_CONTINUOUS,
             default=DEFAULT_CONTINUOUS,
             description=DESC_CONTINUOUS,
-        ): vol.All(CoerceNoneToDict(), TIER_SCHEMA_BASE),
+        ): vol.All(CoerceNoneToDict(), RECORDER_RETENTION_SCHEMA),
         vol.Optional(
             CONFIG_EVENTS,
             default=DEFAULT_EVENTS,
             description=DESC_EVENTS,
-        ): vol.All(CoerceNoneToDict(), TIER_SCHEMA_BASE),
+        ): vol.All(CoerceNoneToDict(), RECORDER_RETENTION_SCHEMA),
     }
 )
 
@@ -530,7 +570,14 @@ STORAGE_SCHEMA = vol.Schema(
     {
         vol.Optional(
             CONFIG_TIER_MARKERS, default={}, description=DESC_TIER_MARKERS
-        ): vol.All({str: str}, validate_tier_markers),
+        ): vol.All(
+            {
+                vol.Optional(
+                    str, description="Absolute root protected by the marker."
+                ): str
+            },
+            validate_tier_markers,
+        ),
         vol.Optional(
             CONFIG_TIER_CHECK_CPU_LIMIT,
             default=DEFAULT_TIER_CHECK_CPU_LIMIT,
@@ -672,6 +719,8 @@ def _storage_type_enabled(config: dict[str, Any]) -> bool:
         min_age,
         min_bytes,
         max_age,
+        config[CONFIG_MAX_SIZE].get("percent"),
+        config[CONFIG_MIN_SIZE].get("percent"),
     ]
     return any(params)
 

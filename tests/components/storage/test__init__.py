@@ -41,6 +41,7 @@ from viseron.components.storage.const import (
     CONFIG_OBJECT_DETECTOR,
     CONFIG_PATH,
     CONFIG_POLL,
+    CONFIG_POLL_INTERVAL,
     CONFIG_RECORDER,
     CONFIG_SECONDS,
     CONFIG_SNAPSHOTS,
@@ -137,6 +138,7 @@ TIER_CONFIG = {
                             CONFIG_DRAIN: False,
                             CONFIG_PATH: "/",
                             CONFIG_POLL: False,
+                            CONFIG_POLL_INTERVAL: 1,
                         }
                     ]
                 },
@@ -208,6 +210,7 @@ TIER_CONFIG = {
                             CONFIG_DRAIN: False,
                             CONFIG_PATH: "/test/",
                             CONFIG_POLL: False,
+                            CONFIG_POLL_INTERVAL: 1,
                         }
                     ]
                 },
@@ -262,6 +265,7 @@ TIER_CONFIG = {
                             CONFIG_DRAIN: False,
                             CONFIG_PATH: "/test/",
                             CONFIG_POLL: False,
+                            CONFIG_POLL_INTERVAL: 1,
                         }
                     ]
                 },
@@ -325,6 +329,7 @@ TIER_CONFIG = {
                             CONFIG_DRAIN: False,
                             CONFIG_PATH: "/test/",
                             CONFIG_POLL: False,
+                            CONFIG_POLL_INTERVAL: 1,
                         }
                     ],
                     CONFIG_FACE_RECOGNITION: {
@@ -352,6 +357,7 @@ TIER_CONFIG = {
                                 CONFIG_MOVE_ON_SHUTDOWN: False,
                                 CONFIG_DRAIN: False,
                                 CONFIG_POLL: False,
+                                CONFIG_POLL_INTERVAL: 1,
                             }
                         ]
                     },

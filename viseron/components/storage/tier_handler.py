@@ -1829,15 +1829,34 @@ class SegmentsTierHandler(TierHandler):
             self._events_min_age,
         ]
 
-        self._events_enabled = "retention" in self._tier or any(self._events_params)
+        self._size_percentages = {
+            name: rules[limit]["percent"]
+            for rules, limit, name in (
+                (self._tier[CONFIG_CONTINUOUS], CONFIG_MAX_SIZE, "max_bytes"),
+                (self._tier[CONFIG_CONTINUOUS], CONFIG_MIN_SIZE, "min_bytes"),
+                (self._tier[CONFIG_EVENTS], CONFIG_MAX_SIZE, "events_max_bytes"),
+                (self._tier[CONFIG_EVENTS], CONFIG_MIN_SIZE, "events_min_bytes"),
+            )
+            if "percent" in rules[limit]
+        }
+        self._events_enabled = (
+            "retention" in self._tier
+            or any(self._events_params)
+            or any(name.startswith("events_") for name in self._size_percentages)
+        )
         self._continuous_configured = (
-            "retention" in self._tier or any(self._continuous_params)
+            "retention" in self._tier
+            or any(self._continuous_params)
+            or any(
+                name in self._size_percentages for name in ("max_bytes", "min_bytes")
+            )
         ) and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
 
         if (
             self._next_tier is None
             and not any(self._events_params)
             and not any(self._continuous_params)
+            and not self._size_percentages
             and not self._tier.get("retention", {}).get("max_size")
         ):
             self._logger.warning(
@@ -1905,6 +1924,8 @@ class SegmentsTierHandler(TierHandler):
             continuous_schedule=self._continuous_schedule_entries(),
             continuous_schedule_timezone=self._continuous_schedule_timezone(),
             continuous_lookback_seconds=self._camera.recorder.lookback,
+            size_percentages=dict(self._size_percentages),
+            size_path=self._path,
         )
 
     @property

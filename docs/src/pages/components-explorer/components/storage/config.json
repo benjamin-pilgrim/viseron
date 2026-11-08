@@ -3,11 +3,29 @@
     "type": "map",
     "value": [
       {
+        "type": "map",
+        "value": [
+          {
+            "type": "string",
+            "name": {
+              "type": "string"
+            },
+            "description": "Absolute root protected by the marker.",
+            "optional": true,
+            "default": null
+          }
+        ],
+        "name": "tier_markers",
+        "description": "Map protected storage directory paths to marker filenames that must exist on the mounted share before storage operations are allowed.",
+        "optional": true,
+        "default": {}
+      },
+      {
         "type": "integer",
         "name": "tier_check_cpu_limit",
-        "description": "CPU limit for the tier check process. This is used to limit the CPU usage of the process that checks for files to move or delete. This is useful to not overload the system with the tier check process. The value is an integer between 1 and 100, where 100 is 100% CPU usage. ",
+        "description": "Optional signal-based CPU limit for the storage process. Disabled by default. Leave disabled for network storage: stop/resume signals can interrupt writes. This is used to limit the CPU usage of the process that checks for files to move or delete. This is useful to not overload the system with the tier check process. The value is an integer between 1 and 100, where 100 is 100% CPU usage. ",
         "optional": true,
-        "default": 10
+        "default": null
       },
       {
         "type": "integer",
@@ -39,6 +57,53 @@
             "values": [
               [
                 {
+                  "type": "map",
+                  "value": [
+                    {
+                      "type": "integer",
+                      "name": "max_age",
+                      "description": "Combined age limit, normalized to seconds.",
+                      "optional": true,
+                      "default": null
+                    },
+                    {
+                      "type": "select",
+                      "options": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "string"
+                        }
+                      ],
+                      "name": "max_size",
+                      "description": "Legacy shared size limit, in bytes or a filesystem percentage.",
+                      "optional": true,
+                      "default": null
+                    }
+                  ],
+                  "name": "retention",
+                  "description": "Maximum age (e.g. 30d) and aggregate tier size (e.g. 3TB); either limit may be omitted.",
+                  "optional": true,
+                  "default": null
+                },
+                {
+                  "type": "map",
+                  "value": [
+                    {
+                      "type": "string",
+                      "name": "policy",
+                      "description": "oldest_first, ordinary_first or preserve_events.",
+                      "required": true,
+                      "default": null
+                    }
+                  ],
+                  "name": "on_full",
+                  "description": "Full-tier policy: oldest_first, ordinary_first or preserve_events.",
+                  "optional": true,
+                  "default": null
+                },
+                {
                   "type": "string",
                   "name": "path",
                   "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
@@ -51,6 +116,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
@@ -116,52 +189,6 @@
                       "type": "map",
                       "value": [
                         {
-                          "type": "float",
-                          "name": "gb",
-                          "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                          "optional": true,
-                          "default": null
-                        },
-                        {
-                          "type": "float",
-                          "name": "mb",
-                          "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                          "optional": true,
-                          "default": null
-                        }
-                      ],
-                      "name": "min_size",
-                      "description": "Minimum size of files to keep in this tier.",
-                      "optional": true,
-                      "default": {}
-                    },
-                    {
-                      "type": "map",
-                      "value": [
-                        {
-                          "type": "float",
-                          "name": "gb",
-                          "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                          "optional": true,
-                          "default": null
-                        },
-                        {
-                          "type": "float",
-                          "name": "mb",
-                          "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                          "optional": true,
-                          "default": null
-                        }
-                      ],
-                      "name": "max_size",
-                      "description": "Maximum size of files to keep in this tier.",
-                      "optional": true,
-                      "default": {}
-                    },
-                    {
-                      "type": "map",
-                      "value": [
-                        {
                           "type": "integer",
                           "name": "days",
                           "description": "Max age in days.",
@@ -215,6 +242,70 @@
                       ],
                       "name": "min_age",
                       "description": "Minimum age of files to keep in this tier.",
+                      "optional": true,
+                      "default": {}
+                    },
+                    {
+                      "type": "map",
+                      "value": [
+                        {
+                          "type": "float",
+                          "name": "gb",
+                          "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "name": "mb",
+                          "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "valueMin": 0,
+                          "valueMax": 100,
+                          "name": "percent",
+                          "description": "Percentage of total tier filesystem capacity, per camera.",
+                          "optional": true,
+                          "default": null
+                        }
+                      ],
+                      "name": "max_size",
+                      "description": "Maximum size of files to keep in this tier.",
+                      "optional": true,
+                      "default": {}
+                    },
+                    {
+                      "type": "map",
+                      "value": [
+                        {
+                          "type": "float",
+                          "name": "gb",
+                          "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "name": "mb",
+                          "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "valueMin": 0,
+                          "valueMax": 100,
+                          "name": "percent",
+                          "description": "Percentage of total tier filesystem capacity, per camera.",
+                          "optional": true,
+                          "default": null
+                        }
+                      ],
+                      "name": "min_size",
+                      "description": "Minimum size of files to keep in this tier.",
                       "optional": true,
                       "default": {}
                     }
@@ -231,52 +322,6 @@
                       "type": "map",
                       "value": [
                         {
-                          "type": "float",
-                          "name": "gb",
-                          "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                          "optional": true,
-                          "default": null
-                        },
-                        {
-                          "type": "float",
-                          "name": "mb",
-                          "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                          "optional": true,
-                          "default": null
-                        }
-                      ],
-                      "name": "min_size",
-                      "description": "Minimum size of files to keep in this tier.",
-                      "optional": true,
-                      "default": {}
-                    },
-                    {
-                      "type": "map",
-                      "value": [
-                        {
-                          "type": "float",
-                          "name": "gb",
-                          "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                          "optional": true,
-                          "default": null
-                        },
-                        {
-                          "type": "float",
-                          "name": "mb",
-                          "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                          "optional": true,
-                          "default": null
-                        }
-                      ],
-                      "name": "max_size",
-                      "description": "Maximum size of files to keep in this tier.",
-                      "optional": true,
-                      "default": {}
-                    },
-                    {
-                      "type": "map",
-                      "value": [
-                        {
                           "type": "integer",
                           "name": "days",
                           "description": "Max age in days.",
@@ -330,6 +375,70 @@
                       ],
                       "name": "min_age",
                       "description": "Minimum age of files to keep in this tier.",
+                      "optional": true,
+                      "default": {}
+                    },
+                    {
+                      "type": "map",
+                      "value": [
+                        {
+                          "type": "float",
+                          "name": "gb",
+                          "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "name": "mb",
+                          "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "valueMin": 0,
+                          "valueMax": 100,
+                          "name": "percent",
+                          "description": "Percentage of total tier filesystem capacity, per camera.",
+                          "optional": true,
+                          "default": null
+                        }
+                      ],
+                      "name": "max_size",
+                      "description": "Maximum size of files to keep in this tier.",
+                      "optional": true,
+                      "default": {}
+                    },
+                    {
+                      "type": "map",
+                      "value": [
+                        {
+                          "type": "float",
+                          "name": "gb",
+                          "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "name": "mb",
+                          "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                          "optional": true,
+                          "default": null
+                        },
+                        {
+                          "type": "float",
+                          "valueMin": 0,
+                          "valueMax": 100,
+                          "name": "percent",
+                          "description": "Percentage of total tier filesystem capacity, per camera.",
+                          "optional": true,
+                          "default": null
+                        }
+                      ],
+                      "name": "min_size",
+                      "description": "Minimum size of files to keep in this tier.",
                       "optional": true,
                       "default": {}
                     }
@@ -488,6 +597,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
@@ -689,6 +806,14 @@
                       "default": false
                     },
                     {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
+                    },
+                    {
                       "type": "boolean",
                       "name": "move_on_shutdown",
                       "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -885,6 +1010,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1085,6 +1218,14 @@
                       "default": false
                     },
                     {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
+                    },
+                    {
                       "type": "boolean",
                       "name": "move_on_shutdown",
                       "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1283,6 +1424,14 @@
                       "default": false
                     },
                     {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
+                    },
+                    {
                       "type": "boolean",
                       "name": "move_on_shutdown",
                       "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1479,6 +1628,14 @@
                       "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                       "optional": true,
                       "default": false
+                    },
+                    {
+                      "type": "integer",
+                      "valueMin": 1,
+                      "name": "poll_interval",
+                      "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                      "optional": true,
+                      "default": 1
                     },
                     {
                       "type": "boolean",
@@ -1683,6 +1840,14 @@
                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                   "optional": true,
                   "default": false
+                },
+                {
+                  "type": "integer",
+                  "valueMin": 1,
+                  "name": "poll_interval",
+                  "description": "Seconds between recursive file-system scans when poll is enabled. A longer interval reduces archive scanning on network storage but delays detection of file changes. Must be at least 1.",
+                  "optional": true,
+                  "default": 1
                 },
                 {
                   "type": "boolean",
