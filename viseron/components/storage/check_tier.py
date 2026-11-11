@@ -42,6 +42,11 @@ from viseron.components.storage.source_move_intent import (
     set_source_digest,
     source_move_pending,
 )
+from viseron.components.storage.io_retry import (
+    FilesystemRetry,
+    StorageAttempt,
+    StorageRetryLater,
+)
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.pressure import event_fence
@@ -119,6 +124,7 @@ class Worker:
         self._last_call: dict[str, float] = {}
         self._check_locks: dict[str, threading.Lock] = {}
         self._checks_in_progress: dict[str, bool] = {}
+        self._io_retry = FilesystemRetry(LOGGER)
 
     @staticmethod
     def _tier_files_filter(item: DataItem) -> tuple[ColumnElement[bool], ...]:
@@ -404,18 +410,33 @@ class Worker:
                 if not token_permits_start(item.dispatch_token):
                     item.error = "retry cancelled after handler shutdown"
                     return
-            if item.cmd == "check_tier":
-                self.check_tier(item)
-            if item.cmd == "move_file":
-                # Durable holds are resumed by indexed move replay. A
-                # normal tier scan must not independently copy the same file.
-                if item.dispatch_token is None and source_move_pending(item.src):
-                    item.deferred = True
-                    item.deferred_by_hold = True
-                    return
-                self.move_file(item)
-            if item.cmd == "delete_file":
-                self.delete_file(item)
+            retry: contextlib.AbstractContextManager[StorageAttempt | None] = (
+                contextlib.nullcontext()
+            )
+            if item.cmd in ("move_file", "delete_file"):
+                if not hasattr(self, "_io_retry"):
+                    self._io_retry = FilesystemRetry(LOGGER)
+                paths = (item.src, item.dst) if item.cmd == "move_file" else (item.src,)
+                retry = self._io_retry.attempt(item.cmd, *paths)
+            with retry as attempt:
+                if item.cmd == "check_tier":
+                    self.check_tier(item)
+                if item.cmd == "move_file":
+                    # Durable holds are resumed by indexed move replay. A
+                    # normal tier scan must not independently copy the same file.
+                    if item.dispatch_token is None and source_move_pending(item.src):
+                        item.deferred = True
+                        item.deferred_by_hold = True
+                        raise StorageRetryLater(0.0)  # noqa: TRY301
+                    self.move_file(item)
+                if item.cmd == "delete_file":
+                    self.delete_file(item)
+                if attempt is not None and not item.deferred and item.error is None:
+                    attempt.completed = True
+        except StorageRetryLater as error:
+            item.deferred = True
+            if item.cmd != "check_tier":
+                item.retry_after = error.delay
         except CameraLockBusy as e:
             if item.cmd in ("move_file", "delete_file"):
                 item.deferred = True

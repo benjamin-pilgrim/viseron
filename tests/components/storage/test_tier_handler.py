@@ -2040,3 +2040,58 @@ def test_last_tier_warning_honors_shared_size_budget(vis, tmp_path, caplog, maxi
     assert any("accumulate indefinitely" in message for message in warnings) == (
         maximum is None
     )
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_outage_deferred_move_preserves_pressure_signal(vis, tmp_path, held):
+    """Only failed promotion, not a durable hold, permits pressure fallback."""
+    src, dst = str(tmp_path / "source"), str(tmp_path / "destination")
+    row = Mock(
+        orig_ctime=utcnow(),
+        duration=1.0,
+        file_key=123,
+        id=5,
+        tier_id=0,
+        tier_path="/ram",
+    )
+    session = MagicMock()
+    session.__enter__.return_value.execute.return_value.scalar_one.return_value = row
+    storage = Mock(spec=Storage)
+    storage.temporary_files_meta = {}
+    storage.pending_moves = {}
+    storage.pending_moves_lock = threading.Lock()
+    storage.pressure_manager = Mock(promotion_failed=set())
+    handler = Mock()
+    handler._check_tier_lock = threading.Lock()
+    storage.camera_tier_handlers = {"test": {"recorder": [{"segments": handler}]}}
+    move_file(
+        vis,
+        storage,
+        lambda: session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        src,
+        dst,
+        str(tmp_path),
+        logging.getLogger(__name__),
+    )
+    callback = storage.tier_check_worker_send_command.call_args.kwargs["callback"]
+    callback(
+        DataItemMoveFile(
+            cmd="move_file",
+            src=src,
+            dst=dst,
+            deferred=True,
+            deferred_by_hold=held,
+            retry_after=60,
+        )
+    )
+    assert storage.pressure_manager.promotion_failed == (set() if held else {"/ram"})
+    assert src not in storage.pending_moves and dst not in storage.temporary_files_meta
+    if held:
+        handler._schedule_forced_tier_retry_locked.assert_not_called()
+    else:
+        handler._schedule_forced_tier_retry_locked.assert_called_once_with(60)
+    vis.dispatch_event.assert_not_called()

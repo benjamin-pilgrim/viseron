@@ -97,6 +97,7 @@ class DataItemMoveFile:
     publication_meta: dict | None = None
     dispatch_token: str | None = None
     deferred: bool = False
+    retry_after: float = 0.0
     deferred_by_hold: bool = False
     callback_id: str | None = None
     error: str | None = None
@@ -110,6 +111,7 @@ class DataItemDeleteFile:
     cmd: Literal["delete_file"]
     src: str
     deferred: bool = False
+    retry_after: float = 0.0
     callback_id: str | None = None
     error: str | None = None
     tier_markers: dict[str, str] = field(default_factory=dict)

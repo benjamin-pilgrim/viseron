@@ -110,6 +110,7 @@ from viseron.components.storage.run_lifecycle import (
     is_run_directory,
     recording_camera_paths,
 )
+from viseron.components.storage.io_retry import FilesystemRetry, StorageRetryLater
 from viseron.components.storage.source_move_intent import (
     is_source_move_marker,
     marker_for_source,
@@ -246,6 +247,7 @@ class TierHandler(FileSystemEventHandler):
         self._tier_check_stopping = False
         self._deletion_retry_stop = threading.Event()
 
+        self._publication_io_retry = FilesystemRetry(self._logger)
         self._journal_retry_lock = threading.Lock()
         self._journal_retry_timer: threading.Timer | None = None
         self._journal_retry_paths: set[str] = set()
@@ -705,7 +707,9 @@ class TierHandler(FileSystemEventHandler):
             self._logger.exception("Could not retry held move %s", marker)
             return False
 
-    def _schedule_journal_retry(self, path: str | None = None) -> None:
+    def _schedule_journal_retry(
+        self, path: str | None = None, *, delay: float = 1.0
+    ) -> None:
         """Keep one timer and a bounded set of pending paths per handler."""
         with self._journal_retry_lock:
             if self._journal_retry_stopping:
@@ -716,7 +720,7 @@ class TierHandler(FileSystemEventHandler):
                 self._journal_retry_paths.add(path)
             if self._journal_retry_timer is not None:
                 return
-            timer = threading.Timer(1, self._retry_journal_publications)
+            timer = threading.Timer(delay, self._retry_journal_publications)
             timer.daemon = True
             self._journal_retry_timer = timer
             timer.start()
@@ -1038,12 +1042,12 @@ class TierHandler(FileSystemEventHandler):
                     self._schedule_forced_tier_retry_locked()
             raise
 
-    def _schedule_forced_tier_retry_locked(self) -> None:
+    def _schedule_forced_tier_retry_locked(self, delay: float = 1.0) -> None:
         """Retry failed submissions without flooding the worker."""
         self._tier_check_force_pending = True
         if self._tier_check_stopping or self._tier_check_retry_timer is not None:
             return
-        timer = threading.Timer(1.0, self._retry_forced_tier_check)
+        timer = threading.Timer(delay, self._retry_forced_tier_check)
         timer.daemon = True
         self._tier_check_retry_timer = timer
         timer.start()
@@ -1201,14 +1205,29 @@ class TierHandler(FileSystemEventHandler):
         self._event_queue.put(event)
 
     def _on_created(self, event: FileCreatedEvent) -> None:
+        """Back off failed indexing without discarding pending publications."""
+        src_path = _src_path(event)
+        if not hasattr(self, "_publication_io_retry"):
+            self._publication_io_retry = FilesystemRetry(self._logger)
+        try:
+            with self._publication_io_retry.attempt("publication", src_path) as attempt:
+                if self._on_created_publication(event):
+                    attempt.completed = True
+        except StorageRetryLater as error:
+            self._schedule_journal_retry(src_path, delay=error.delay)
+        except OSError:
+            self._logger.exception("Pending publication failed: %s", src_path)
+            self._schedule_journal_retry(src_path)
+
+    def _on_created_publication(self, event: FileCreatedEvent) -> bool:
         """Index a publication, acknowledging its journal only after commit."""
         src_path = _src_path(event)
         if is_source_move_marker(src_path):
-            return
+            return False
         directory = os.path.dirname(src_path)
         if not is_run_directory(os.path.basename(directory)):
             self._on_created_impl(event)
-            return
+            return True
         try:
             with camera_lock(
                 "/tmp/viseron-run-locks", os.path.abspath(os.path.dirname(directory))
@@ -1272,7 +1291,7 @@ class TierHandler(FileSystemEventHandler):
                                             "docs/testing/tier-journal-recovery.md",
                                         )
 
-                                return
+                                return False
                             destination_id = session.execute(
                                 select(
                                     func.nextval(
@@ -1421,23 +1440,27 @@ class TierHandler(FileSystemEventHandler):
                                 src_path, record, file_meta
                             )
                         self._schedule_journal_retry(src_path)
-                    else:
-                        with self._storage.get_session() as session:
-                            acknowledge_segment_move(
-                                session,
-                                record["source_snapshot"]["source"],
-                                src_path,
-                                record["meta"],
-                            )
-                        self._complete_pending_move(
-                            pending, pending_moves, record, src_path
+                        return False
+                    with self._storage.get_session() as session:
+                        acknowledge_segment_move(
+                            session,
+                            record["source_snapshot"]["source"],
+                            src_path,
+                            record["meta"],
                         )
+                    self._complete_pending_move(
+                        pending, pending_moves, record, src_path
+                    )
+            return True
         except BlockingIOError:
             self._logger.debug("Publication busy; retrying %s", src_path)
             self._schedule_journal_retry(src_path)
+        except OSError:
+            raise
         except Exception:
             self._logger.exception("Pending publication failed: %s", src_path)
             self._schedule_journal_retry(src_path)
+        return False
 
     def _complete_pending_move(self, pending, pending_moves, record, src_path):
         """Deliver an in-memory completion only after the durable handoff."""
@@ -2644,6 +2667,7 @@ def handle_file(
                     curr_tier_subcategory,
                     path,
                     logger,
+                    retry_after=item.retry_after,
                 )
             elif item.error is None and on_complete is not None:
                 on_complete()
@@ -2774,6 +2798,8 @@ def _schedule_source_retry(
     subcategory: str,
     path: str,
     logger: logging.Logger,
+    *,
+    retry_after: float = 0.0,
 ) -> None:
     """Coalesce contention retries through the original tier check."""
     try:
@@ -2781,9 +2807,19 @@ def _schedule_source_retry(
             subcategory
         ]
         with handler._check_tier_lock:  # pylint: disable=protected-access
-            handler._schedule_forced_tier_retry_locked()  # pylint: disable=protected-access
+            if retry_after > 0:
+                handler._schedule_forced_tier_retry_locked(retry_after)  # pylint: disable=protected-access
+            else:
+                handler._schedule_forced_tier_retry_locked()  # pylint: disable=protected-access
     except (KeyError, IndexError):
         logger.warning("Cannot schedule deferred operation retry for %s", path)
+
+
+def _mark_promotion_failed(storage: Storage, source_db: dict[str, Any] | None) -> None:
+    """Keep capacity policy informed when an unavailable tier defers promotion."""
+    manager = getattr(storage, "pressure_manager", None)
+    if manager is not None and source_db is not None:
+        manager.promotion_failed.add(source_db["tier_path"])
 
 
 def move_file(
@@ -2921,6 +2957,8 @@ def move_file(
         item: DataItemMoveFile,
     ) -> None:
         if item.deferred:
+            if item.retry_after > 0 and not item.deferred_by_hold:
+                _mark_promotion_failed(storage, source_db)
             with storage.pending_moves_lock:
                 if storage.pending_moves.get(src) is pending_move:
                     storage.pending_moves.pop(src, None)
@@ -2935,6 +2973,7 @@ def move_file(
                     curr_tier_subcategory,
                     src,
                     logger,
+                    retry_after=item.retry_after,
                 )
             return
         if (
@@ -2956,9 +2995,7 @@ def move_file(
                 on_complete()
             return
         if item.error:
-            manager = getattr(storage, "pressure_manager", None)
-            if manager is not None and source_db is not None:
-                manager.promotion_failed.add(source_db["tier_path"])
+            _mark_promotion_failed(storage, source_db)
             logger.error(f"Error moving file {src} to {dst}: {item.error}")
             with storage.pending_moves_lock:
                 if storage.pending_moves.get(src) is pending_move:
