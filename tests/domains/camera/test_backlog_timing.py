@@ -19,6 +19,21 @@ from viseron.helpers.recording_timing_contract import (
 )
 
 
+def _fragment_bytes(payload=b"fragment"):
+    """Supply complete box framing for timing and publication race tests.
+
+    Codec decoding is covered separately using FFmpeg-generated fragments.
+    """
+    return (
+        (9).to_bytes(4, "big")
+        + b"moof"
+        + b"x"
+        + (8 + len(payload)).to_bytes(4, "big")
+        + b"mdat"
+        + payload
+    )
+
+
 def test_unmatched_playlist_filename_does_not_publish_staged_fragment(tmp_path, caplog):
     """A similar playlist name must not supply another fragment's timestamp."""
     stage = tmp_path / "stage"
@@ -27,7 +42,7 @@ def test_unmatched_playlist_filename_does_not_publish_staged_fragment(tmp_path, 
     run.mkdir(parents=True)
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "init.mp4").write_bytes(b"init")
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
@@ -58,7 +73,7 @@ def test_captured_playlist_timing_survives_rollover_and_worker_restart(tmp_path)
     run.mkdir(parents=True)
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -90,7 +105,7 @@ def test_changed_staged_fragment_is_not_replayed_with_old_timing(tmp_path, caplo
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"old fragment")
+    fragment.write_bytes(_fragment_bytes(b"old fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -101,7 +116,7 @@ def test_changed_staged_fragment_is_not_replayed_with_old_timing(tmp_path, caplo
     )
     capture_playlist_times(stage)
     fragment.unlink()
-    fragment.write_bytes(b"replacement")
+    fragment.write_bytes(_fragment_bytes(b"replacement"))
     playlist.write_text("#EXTM3U\n", encoding="utf-8")
     destination = tmp_path / "segments" / "cam"
     work = FragmenterWork(
@@ -127,7 +142,7 @@ def test_replacement_after_replay_decision_is_not_published(tmp_path):
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"old fragment")
+    fragment.write_bytes(_fragment_bytes(b"old fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -146,7 +161,7 @@ def test_replacement_after_replay_decision_is_not_published(tmp_path):
     worker.start()
     work.output_queue.get(timeout=3)
     fragment.unlink()
-    fragment.write_bytes(b"replacement")
+    fragment.write_bytes(_fragment_bytes(b"replacement"))
     ready.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
@@ -183,7 +198,7 @@ def test_captured_timing_is_pruned_after_source_is_acknowledged(tmp_path):
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"fragment")
+    fragment.write_bytes(_fragment_bytes(b"fragment"))
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
         "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
@@ -211,7 +226,7 @@ def test_killed_timing_capture_leaves_no_partial_record(tmp_path):
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"fragment")
+    fragment.write_bytes(_fragment_bytes(b"fragment"))
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
         "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
@@ -243,7 +258,7 @@ playlist_timing.capture_playlist_times(Path(sys.argv[1]))
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
-    assert fragment.read_bytes() == b"fragment"
+    assert fragment.read_bytes() == _fragment_bytes(b"fragment")
     assert not (run / f".viseron-timing-{name}.json").exists()
     assert list(run.glob(".viseron-timing-tmp-*"))
     capture_playlist_times(stage)
@@ -259,7 +274,7 @@ def test_replacement_after_live_playlist_decision_is_not_published(tmp_path):
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"old fragment")
+    fragment.write_bytes(_fragment_bytes(b"old fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -276,7 +291,7 @@ def test_replacement_after_live_playlist_decision_is_not_published(tmp_path):
     worker.start()
     work.output_queue.get(timeout=3)
     fragment.unlink()
-    fragment.write_bytes(b"replacement")
+    fragment.write_bytes(_fragment_bytes(b"replacement"))
     ready.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
@@ -290,7 +305,7 @@ def test_unmarked_run_does_not_capture_or_replay_timing(tmp_path):
     run = stage / "20261031T143215.482000Z-a7c93e12ab34"
     run.mkdir(parents=True)
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
         "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
@@ -459,7 +474,7 @@ def test_timing_sidecar_without_contract_is_not_replayed(tmp_path, caplog):
     marker.write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"fragment")
+    fragment.write_bytes(_fragment_bytes(b"fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -495,7 +510,7 @@ def test_replay_after_filesystem_identity_changes(tmp_path):
     run.mkdir(parents=True)
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -531,7 +546,7 @@ def test_changed_content_after_remount_recheck_is_not_published(tmp_path):
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
     fragment = run / name
-    fragment.write_bytes(b"old fragment")
+    fragment.write_bytes(_fragment_bytes(b"old fragment"))
     (run / "init.mp4").write_bytes(b"init")
     playlist = run / "index.m3u8"
     playlist.write_text(
@@ -554,7 +569,7 @@ def test_changed_content_after_remount_recheck_is_not_published(tmp_path):
     worker.start()
     work.output_queue.get(timeout=3)
     snapshot = fragment.stat()
-    fragment.write_bytes(b"new fragment")
+    fragment.write_bytes(_fragment_bytes(b"new fragment"))
     os.utime(fragment, ns=(snapshot.st_atime_ns, snapshot.st_mtime_ns))
     ready.set()
     worker.join(timeout=5)
@@ -570,7 +585,7 @@ def test_slow_timelapse_does_not_hold_publication_lock(tmp_path, monkeypatch):
     run.mkdir(parents=True)
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "init.mp4").write_bytes(b"init")
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
@@ -620,7 +635,7 @@ def test_slow_source_hash_does_not_hold_camera_lock(tmp_path, monkeypatch):
     run.mkdir(parents=True)
     (run / TIMING_CONTRACT_FILE).write_text(TIMING_CONTRACT_CONTENT, encoding="utf-8")
     name = "000000001-1760000000-0000001000000.m4s"
-    (run / name).write_bytes(b"fragment")
+    (run / name).write_bytes(_fragment_bytes(b"fragment"))
     (run / "index.m3u8").write_text(
         "#EXTM3U\n#EXTINF:1.000000,\n"
         "#EXT-X-PROGRAM-DATE-TIME:2026-10-31T14:32:15+0000\n"
