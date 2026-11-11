@@ -82,7 +82,7 @@ jobs:
         timeout-minutes: 10
         run: |
           docker run --rm --user postgres --entrypoint /bin/sh \
-            --tmpfs /tmp:rw,mode=1777 \
+            --tmpfs /tmp:rw,exec,mode=1777 \
             --tmpfs /segments:rw,mode=1777 --tmpfs /thumbnails:rw,mode=1777 \
             --tmpfs /event_clips:rw,mode=1777 --tmpfs /snapshots:rw,mode=1777 \
             -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
