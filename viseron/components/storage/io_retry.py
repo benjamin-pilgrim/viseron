@@ -27,6 +27,8 @@ RETRY_ERRNOS = frozenset(
 INITIAL_DELAY = 5.0
 MAX_DELAY = 60.0
 LOG_INTERVAL = 60.0
+PUBLICATION_MAX_DELAY = 300.0
+PUBLICATION_CACHE_SIZE = 1024
 
 
 class StorageRetryLater(Exception):
@@ -42,6 +44,7 @@ class StorageAttempt:
     """An admitted operation confirms completion separately from deferral."""
 
     completed: bool = False
+    recovering: bool = False
 
 
 @dataclass
@@ -98,7 +101,7 @@ class FilesystemRetry:
                 if remaining > 0:
                     raise StorageRetryLater(remaining)
                 failure.probing = True
-        attempt = StorageAttempt()
+        attempt = StorageAttempt(recovering=failure is not None)
         try:
             yield attempt
         except OSError as error:
@@ -141,3 +144,47 @@ class FilesystemRetry:
                     self._logger.info(
                         "Storage %s recovered on filesystems %s", operation, key[1:]
                     )
+
+
+class PublicationRetry:
+    """Back off unchanged held paths without blocking fresh publications.
+
+    Timer events, polling events and recovery discovery share this admission
+    gate. Keep bounded in-memory state; durable journals retain recovery proof.
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._failures: dict[str, tuple[float, float]] = {}
+        self._warned_at: float | None = None
+
+    def remaining(self, path: str) -> float:
+        """Return a held path's remaining cooldown, or admit a new attempt."""
+        return max(0.0, self._failures.get(path, (0.0, 0.0))[1] - time.monotonic())
+
+    def defer(self, path: str, *, notify: bool = True) -> float:
+        """Retain work and retry from five seconds up to five minutes apart."""
+        delay = min(
+            PUBLICATION_MAX_DELAY,
+            self._failures.get(path, (0.0, 0.0))[0] * 2 or INITIAL_DELAY,
+        )
+        if path not in self._failures and len(self._failures) >= PUBLICATION_CACHE_SIZE:
+            self._failures.pop(next(iter(self._failures)))
+        now = time.monotonic()
+        self._failures[path] = (delay, now + delay)
+        if notify and (
+            self._warned_at is None or now - self._warned_at >= LOG_INTERVAL
+        ):
+            self._warned_at = now
+            self._logger.warning(
+                "Publication recovery incomplete for %s; files and recovery records "
+                "retained, retrying in %.0fs "
+                "(further holds logged at most once per minute)",
+                path,
+                delay,
+            )
+        return delay
+
+    def complete(self, path: str) -> None:
+        """Forget a completed path so later work is immediately admissible."""
+        self._failures.pop(path, None)

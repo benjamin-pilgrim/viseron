@@ -249,6 +249,20 @@ def verify_file_contents(path, expected_digest, expected_identity=None):
         )
 
 
+def source_run_available(record):
+    """Check a necessary recovery prerequisite before expensive CIFS readback.
+
+    This is only an early deferral. Release still rechecks source ownership and
+    destination bytes under the existing locks before removing anything.
+    """
+    if not record.get("source_intent"):
+        return True
+    source = Path(record["source_snapshot"]["source"])
+    if not source.is_absolute():
+        raise ValueError("source path must be absolute")
+    return source.parent.is_dir()
+
+
 def release_indexed_source(
     marker,
     allowed_source_roots,
@@ -269,6 +283,9 @@ def release_indexed_source(
 
     marker = Path(marker)
     try:
+        record = json.loads(marker.read_text())
+        if not source_run_available(record):
+            return "source-unavailable"
         record = publish_or_verify(marker)
         snapshot = record["source_snapshot"]
         source = Path(snapshot["source"])

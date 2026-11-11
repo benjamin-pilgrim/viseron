@@ -1,10 +1,12 @@
 """Independent, bounded pressure checks for configured recorder storage roots."""
 
 import logging
+import os
 import threading
 import time
 
 from viseron.components.storage.pressure import run_pressure
+from viseron.components.storage.startup_reconciliation import volatile_roots
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.helpers.child_process_context import get_child_process_context
 
@@ -29,6 +31,7 @@ class PressureManager:
     def configurations(self):
         """Resolve camera tier paths without touching remote filesystems."""
         roots = {}
+        volatile = volatile_roots()
         for identifier, categories in list(self.storage.camera_tier_handlers.items()):
             tiers = categories.get("recorder", ())
             for index, group in enumerate(tiers):
@@ -50,6 +53,7 @@ class PressureManager:
                     path,
                     {
                         "path": path,
+                        "volatile": os.path.abspath(path) in volatile,
                         "probe": handler._path,
                         "policy": policy,
                         "max_size": maximum,

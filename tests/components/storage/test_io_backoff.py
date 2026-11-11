@@ -220,6 +220,7 @@ def test_incomplete_publication_does_not_reset_outage(monkeypatch, caplog):
     handler._on_created(event)
     now[0] += 5
     handler._on_created(event)
+    now[0] += 5  # An incomplete attempt also has a per-path cooldown.
     handler._on_created(event)
     assert handler._schedule_journal_retry.call_args.kwargs["delay"] == 10
     assert len(caplog.records) == 1
@@ -280,6 +281,7 @@ def test_real_publication_lock_contention_keeps_outage(monkeypatch, caplog, tmp_
         handler._on_created(event)
         now[0] += 5
         handler._on_created(event)
+        now[0] += 5  # Lock contention must not trigger an immediate disk probe.
         handler._on_created(event)
     assert handler._on_created_impl.call_count == 2
     assert handler._schedule_journal_retry.call_args.kwargs["delay"] == 10

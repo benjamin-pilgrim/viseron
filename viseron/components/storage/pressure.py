@@ -74,12 +74,15 @@ def _usage(config, session):
         read_playlist_time,
     )
 
-    size = session.execute(
-        select(func.coalesce(func.sum(Files.size), 0)).where(
-            Files.category == "recorder",
-            Files.tier_path == config["path"],
-        )
-    ).scalar_one()
+    volatile = config.get("volatile", False)
+    size = 0
+    if not volatile:
+        size = session.execute(
+            select(func.coalesce(func.sum(Files.size), 0)).where(
+                Files.category == "recorder",
+                Files.tier_path == config["path"],
+            )
+        ).scalar_one()
     staged = []
     for camera in config["cameras"]:
         spool = camera.get("spool")
@@ -92,7 +95,8 @@ def _usage(config, session):
                 for fragment in run.iterdir():
                     if fragment.is_symlink() or not fragment.is_file():
                         continue
-                    size += fragment.stat().st_size
+                    if not volatile:
+                        size += fragment.stat().st_size
                     if fragment.suffix != ".m4s":
                         continue
                     timing = read_playlist_time(fragment) or read_live_playlist_time(
@@ -115,6 +119,9 @@ def _usage(config, session):
                         )
         except FileNotFoundError:
             continue
+    if volatile:
+        info = os.statvfs(config["probe"])
+        size = (info.f_blocks - info.f_bfree) * info.f_frsize
     return int(size), staged
 
 
@@ -349,7 +356,11 @@ def reclaim(config, get_session, *, free_space=None):
                 session.commit()
                 deleted += 1
                 removed.add(path)
-                used -= candidate["identity"][2]
+                if config.get("volatile"):
+                    info = os.statvfs(probe)
+                    used = (info.f_blocks - info.f_bfree) * info.f_frsize
+                else:
+                    used -= candidate["identity"][2]
         except OSError:
             continue
     healthy = (

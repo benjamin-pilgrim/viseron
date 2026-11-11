@@ -69,6 +69,7 @@ from viseron.components.storage.models import (
     Recordings,
 )
 from viseron.components.storage.pressure_manager import PressureManager
+from viseron.components.storage.startup_reconciliation import reconcile_volatile_files
 from viseron.components.storage.storage_subprocess import (
     DataItemDeleteFile,
     DataItemMoveFile,
@@ -235,8 +236,9 @@ def setup(vis: Viseron, config: dict[str, Any]) -> bool:
     return True
 
 
-def startup_chores(get_session: Callable[[], Session]) -> None:
+def startup_chores(get_session: Callable[[], Session], tier_markers=None) -> None:
     """Various database startup chores."""
+    reconcile_volatile_files(get_session, tier_markers)
     # Set Recordings.end_time and Motion.end_time on startup in case of crashes
     with get_session() as session:
         stmt = (
@@ -489,7 +491,9 @@ class Storage:
                 self._get_session_expire = scoped_session(
                     sessionmaker(bind=self.engine, expire_on_commit=True)
                 )
-                startup_chores(self._get_session)
+                startup_chores(
+                    self._get_session, self._config.get(CONFIG_TIER_MARKERS, {})
+                )
                 break  # Success, exit retry loop
 
             except OperationalError as error:

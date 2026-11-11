@@ -35,6 +35,17 @@ from viseron.components.storage.run_lifecycle import camera_lock
 from viseron.components.storage.storage_subprocess import DataItemMoveFile
 
 
+
+def _replay_after_cooldown(handler, event):
+    """Advance recovery phases without bypassing the publication admission gate."""
+    now = max(time.monotonic(), getattr(handler, "_test_retry_time", 0)) + 301
+    handler._test_retry_time = now
+    with patch(
+        "viseron.components.storage.tier_handler.time.monotonic", return_value=now
+    ):
+        handler._on_created(event)
+
+
 def test_hold_retry_republishes_only_if_ownership_and_row_match(
     tmp_path, get_db_session
 ):
@@ -312,10 +323,12 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         session.commit()
         legacy_id = legacy.id
     with patch.object(destination._logger, "warning") as warning:
-        destination._on_created(FileCreatedEvent(str(dst)))
-        destination._on_created(FileCreatedEvent(str(dst)))
-    warning.assert_called_once()
-    assert "unbound destination" in warning.call_args.args[0]
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
+    unbound = [
+        call for call in warning.call_args_list if "unbound destination" in call.args[0]
+    ]
+    assert len(unbound) == 1
     assert "destination_id" not in json.loads(destination_marker.read_text())
     assert src.exists() and dst.exists() and marker.exists()
     with get_db_session() as session:
@@ -333,8 +346,10 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         row.tier_id = 7
         session.commit()
     with patch.object(destination, "_schedule_journal_retry") as retry:
-        destination._on_created(FileCreatedEvent(str(dst)))
-    retry.assert_called_once_with(str(dst))
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
+    retry.assert_called_once()
+    assert retry.call_args.args == (str(dst),)
+    assert 5 <= retry.call_args.kwargs["delay"] <= 300
     with get_db_session() as session:
         assert (
             session.execute(
@@ -354,7 +369,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         side_effect=SystemExit("crash"),
     ):
         with pytest.raises(SystemExit):
-            destination._on_created(FileCreatedEvent(str(dst)))
+            _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
     with get_db_session() as session:
         assert (
             session.execute(
@@ -394,7 +409,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         row.tier_id = 7
         session.commit()
     with patch.object(destination, "_schedule_journal_retry"):
-        destination._on_created(FileCreatedEvent(str(dst)))
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
     with get_db_session() as session:
         replacement = session.execute(
             select(Files).where(Files.path == str(dst))
@@ -405,7 +420,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         session.add(Files(id=indexed_id, **values))
         session.commit()
     with patch.object(destination, "_schedule_journal_retry"):
-        destination._on_created(FileCreatedEvent(str(dst)))
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
     with get_db_session() as session:
         assert (
             session.execute(
@@ -436,7 +451,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         ),
         patch.object(destination, "_schedule_journal_retry"),
     ):
-        destination._on_created(FileCreatedEvent(str(dst)))
+        _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
     assert src.exists() and dst.exists() and marker.exists()
     with get_db_session() as session:
         assert (
@@ -466,7 +481,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
 
     def index_destination():
         try:
-            destination._on_created(FileCreatedEvent(str(dst)))
+            _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
         except Exception as exc:
             errors.append(exc)
 
@@ -506,7 +521,7 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
             row.tier_id = 0
             session.commit()
         with patch.object(destination, "_schedule_journal_retry"):
-            destination._on_created(FileCreatedEvent(str(dst)))
+            _replay_after_cooldown(destination, FileCreatedEvent(str(dst)))
     assert not src.exists() and not marker.exists()
     with get_db_session() as session:
         assert (

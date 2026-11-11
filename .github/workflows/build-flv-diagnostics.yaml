@@ -82,6 +82,7 @@ jobs:
         timeout-minutes: 10
         run: |
           docker run --rm --user postgres --entrypoint /bin/sh \
+            --tmpfs /tmp:rw,mode=1777 \
             --tmpfs /segments:rw,mode=1777 --tmpfs /thumbnails:rw,mode=1777 \
             --tmpfs /event_clips:rw,mode=1777 --tmpfs /snapshots:rw,mode=1777 \
             -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
@@ -104,6 +105,9 @@ jobs:
               tests/components/storage/test_tier_handler.py \
               tests/components/storage/test_jobs.py \
               tests/components/storage/test_asset_move_recovery.py \
+              tests/components/storage/test_io_backoff.py \
+              tests/components/storage/test_recovery_retries.py \
+              tests/components/storage/test_startup_reconciliation.py \
               tests/domains/camera/test_fragmenter.py \
               tests/domains/camera/test_fragmenter_retry.py \
               tests/domains/camera/test_backlog_timing.py \

@@ -100,6 +100,7 @@ from viseron.components.storage.pending_journal import (
     marker_for_path,
     protected_by_pending,
     publish_or_verify,
+    source_run_available,
     release_indexed_source,
     sync_dir,
 )
@@ -110,7 +111,11 @@ from viseron.components.storage.run_lifecycle import (
     is_run_directory,
     recording_camera_paths,
 )
-from viseron.components.storage.io_retry import FilesystemRetry, StorageRetryLater
+from viseron.components.storage.io_retry import (
+    FilesystemRetry,
+    PublicationRetry,
+    StorageRetryLater,
+)
 from viseron.components.storage.source_move_intent import (
     is_source_move_marker,
     marker_for_source,
@@ -166,6 +171,7 @@ if TYPE_CHECKING:
 
 JOURNAL_BATCH_LIMIT = 1024
 JOURNAL_STALE_SECONDS = 300
+JOURNAL_TIMER_SLOP = 0.05
 
 
 class SourceJournalMismatch(ValueError):
@@ -718,15 +724,30 @@ class TierHandler(FileSystemEventHandler):
                 self._journal_retry_rescan = True
             else:
                 self._journal_retry_paths.add(path)
-            if self._journal_retry_timer is not None:
-                return
-            timer = threading.Timer(delay, self._retry_journal_publications)
-            timer.daemon = True
-            self._journal_retry_timer = timer
-            timer.start()
+            self._arm_journal_retry_locked(delay)
 
-    def _retry_journal_publications(self) -> None:
+    def _arm_journal_retry_locked(self, delay: float) -> None:
+        """Wake fresh work promptly; canceled callbacks cannot steal its timer."""
+        due = time.monotonic() + delay
+        if self._journal_retry_timer is not None:
+            # Shared cooldown calculations can differ by microseconds.
+            if getattr(self, "_journal_retry_due", due) <= due + JOURNAL_TIMER_SLOP:
+                return
+            self._journal_retry_timer.cancel()
+        generation = getattr(self, "_journal_retry_generation", 0) + 1
+        self._journal_retry_generation = generation
+        self._journal_retry_due = due
+        timer = threading.Timer(
+            delay, lambda: self._retry_journal_publications(generation)
+        )
+        timer.daemon = True
+        self._journal_retry_timer = timer
+        timer.start()
+
+    def _retry_journal_publications(self, generation=None) -> None:
         with self._journal_retry_lock:
+            if generation is not None and generation != self._journal_retry_generation:
+                return
             self._journal_retry_timer = None
             if self._journal_retry_stopping:
                 return
@@ -856,11 +877,7 @@ class TierHandler(FileSystemEventHandler):
     def _schedule_journal_retry_unlocked(self) -> None:
         """Request a rescan while the journal retry lock is already held."""
         self._journal_retry_rescan = True
-        if self._journal_retry_timer is None and not self._journal_retry_stopping:
-            timer = threading.Timer(1, self._retry_journal_publications)
-            timer.daemon = True
-            self._journal_retry_timer = timer
-            timer.start()
+        self._arm_journal_retry_locked(1.0)
 
     def _start_observer(self):
         """Create a fresh observer for the current directory mount."""
@@ -1205,19 +1222,31 @@ class TierHandler(FileSystemEventHandler):
         self._event_queue.put(event)
 
     def _on_created(self, event: FileCreatedEvent) -> None:
-        """Back off failed indexing without discarding pending publications."""
+        """Bound held-path retries as well as failures of a whole filesystem."""
         src_path = _src_path(event)
+        if is_source_move_marker(src_path):
+            return
         if not hasattr(self, "_publication_io_retry"):
             self._publication_io_retry = FilesystemRetry(self._logger)
+        if not hasattr(self, "_publication_retry"):
+            self._publication_retry = PublicationRetry(self._logger)
+        delay = self._publication_retry.remaining(src_path)
+        if delay:
+            self._schedule_journal_retry(src_path, delay=delay)
+            return
         try:
             with self._publication_io_retry.attempt("publication", src_path) as attempt:
                 if self._on_created_publication(event):
                     attempt.completed = True
+                    self._publication_retry.complete(src_path)
+                    return
         except StorageRetryLater as error:
             self._schedule_journal_retry(src_path, delay=error.delay)
+            return
         except OSError:
             self._logger.exception("Pending publication failed: %s", src_path)
-            self._schedule_journal_retry(src_path)
+        delay = self._publication_retry.defer(src_path, notify=not attempt.recovering)
+        self._schedule_journal_retry(src_path, delay=delay)
 
     def _on_created_publication(self, event: FileCreatedEvent) -> bool:
         """Index a publication, acknowledging its journal only after commit."""
@@ -1237,6 +1266,8 @@ class TierHandler(FileSystemEventHandler):
                 if os.path.exists(marker):
                     with open(marker, encoding="utf-8") as stream:
                         record = json.load(stream)
+                    if not source_run_available(record):
+                        return False
                     if record.get("version") == 2:  # noqa: PLR2004
                         record = publish_or_verify(marker)
                     if (
@@ -1439,7 +1470,6 @@ class TierHandler(FileSystemEventHandler):
                             self._withdraw_journal_destination(
                                 src_path, record, file_meta
                             )
-                        self._schedule_journal_retry(src_path)
                         return False
                     with self._storage.get_session() as session:
                         acknowledge_segment_move(
@@ -1454,12 +1484,10 @@ class TierHandler(FileSystemEventHandler):
             return True
         except BlockingIOError:
             self._logger.debug("Publication busy; retrying %s", src_path)
-            self._schedule_journal_retry(src_path)
         except OSError:
             raise
         except Exception:
             self._logger.exception("Pending publication failed: %s", src_path)
-            self._schedule_journal_retry(src_path)
         return False
 
     def _complete_pending_move(self, pending, pending_moves, record, src_path):

@@ -36,6 +36,16 @@ from viseron.components.storage.segment_moves import import_legacy
 from viseron.components.storage.tier_handler import TierHandler
 
 
+def _replay_after_cooldown(handler, event):
+    """Advance the retry clock while exercising the real publication handler."""
+    now = max(time.monotonic(), getattr(handler, "_test_retry_time", 0)) + 301
+    handler._test_retry_time = now
+    with patch(
+        "viseron.components.storage.tier_handler.time.monotonic", return_value=now
+    ):
+        handler._on_created(event)
+
+
 def test_watcher_indexes_journal_metadata_and_acknowledges(tmp_path, get_db_session):
     """Watcher indexes journal metadata and acknowledges."""
     run = tmp_path / "camera" / "20261031T143215.482000Z-a7c93e12ab34"
@@ -62,7 +72,9 @@ def test_watcher_indexes_journal_metadata_and_acknowledges(tmp_path, get_db_sess
     handler._journal_retry_rescan = False
     handler._journal_retry_stopping = False
     handler._storage = SimpleNamespace(
-        temporary_files_meta={}, pending_moves_lock=threading.Lock(), get_session=get_db_session
+        temporary_files_meta={},
+        pending_moves_lock=threading.Lock(),
+        get_session=get_db_session
     )
     handler._tier_id = 0
     handler._tier = {"path": str(tmp_path)}
@@ -87,7 +99,7 @@ def test_watcher_indexes_journal_metadata_and_acknowledges(tmp_path, get_db_sess
             .file_key
             == 42
         )
-    handler._on_created(FileCreatedEvent(str(segment)))
+    _replay_after_cooldown(handler, FileCreatedEvent(str(segment)))
     assert not marker.exists()
     with get_db_session() as session:
         row = session.execute(
@@ -255,8 +267,10 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
     ):
         handler._on_created(event)
         handler._on_created(event)
-    assert warning.call_count == 1
-    assert "source retained" in warning.call_args.args[0]
+    retained = [
+        call for call in warning.call_args_list if "source retained" in call.args[0]
+    ]
+    assert len(retained) == 1
     assert src.exists() and marker_path.exists()
     # Legacy indexing has no journal-bound row ID. Simulate an operator
     # removing that DB row before restoring identity and retrying the hold.
@@ -297,7 +311,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         session.commit()
         assert replacement.id != source_id
     with patch("viseron.components.storage.tier_handler.threading.Timer"):
-        handler._on_created(event)
+        _replay_after_cooldown(handler, event)
     assert src.exists()
     assert Path(marker_for_path(str(dest))).exists()
     with get_db_session() as session:
@@ -313,7 +327,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         row.tier_id = 12
         session.commit()
     with patch("viseron.components.storage.tier_handler.threading.Timer"):
-        handler._on_created(event)
+        _replay_after_cooldown(handler, event)
     assert src.exists()
     assert Path(marker_for_path(str(dest))).exists()
     with get_db_session() as session:
@@ -327,7 +341,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         original = damaged.read_bytes()
         damaged.write_bytes(b"x" * len(original))
         with patch("viseron.components.storage.tier_handler.threading.Timer"):
-            handler._on_created(event)
+            _replay_after_cooldown(handler, event)
         assert src.exists() and marker_path.exists() and marker_for_source(src).exists()
         completed.assert_not_called()
         with get_db_session() as session:
@@ -346,7 +360,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         ),
         patch("viseron.components.storage.tier_handler.threading.Timer"),
     ):
-        handler._on_created(event)
+        _replay_after_cooldown(handler, event)
     assert src.exists() and marker_path.exists() and marker_for_source(src).exists()
     completed.assert_not_called()
 
@@ -376,7 +390,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         ),
         patch("viseron.components.storage.tier_handler.threading.Timer"),
     ):
-        handler._on_created(event)
+        _replay_after_cooldown(handler, event)
     assert not src.exists()
     assert Path(marker_for_path(str(dest))).exists()
     assert marker_for_source(src).exists()
@@ -401,7 +415,7 @@ def test_move_process_exit_then_startup_replay_indexes_preserved_key(
         "viseron.components.storage.tier_handler.release_indexed_source",
         side_effect=replace_during_release,
     ):
-        handler._on_created(event)
+        _replay_after_cooldown(handler, event)
     if replace_pending:
         assert handler._storage.pending_moves[str(src)] is newer_pending
         completed.assert_not_called()
@@ -688,7 +702,7 @@ def test_source_handover_recovers_after_source_unlink(
     assert source.exists() and intent.exists() and marker.exists()
     with patch.object(handler, "_schedule_journal_retry") as retry:
         handler._on_created(FileCreatedEvent(str(dest)))
-    retry.assert_called_once_with(str(dest))
+    retry.assert_called_once_with(str(dest), delay=5.0)
     assert marker.exists() and source.exists() and intent.exists()
     # A cooperating source writer/cleanup owns this lock: defer release.
     with camera_lock("/tmp/viseron-run-locks", str(camera)):
@@ -785,14 +799,14 @@ def test_first_tier_journal_allocates_stable_key_and_keeps_staging(
             is None
         )
     with patch.object(handler, "_schedule_journal_retry") as retry:
-        handler._on_created(FileCreatedEvent(str(dest)))
+        _replay_after_cooldown(handler, FileCreatedEvent(str(dest)))
         assert json.loads(marker.read_text())["meta"]["file_key"] == key
         with get_db_session() as session:
             row = session.execute(
                 select(Files).where(Files.path == str(dest))
             ).scalar_one()
             assert row.file_key == key and row.duration == 1.5
-        handler._on_created(FileCreatedEvent(str(dest)))
+        _replay_after_cooldown(handler, FileCreatedEvent(str(dest)))
     assert retry.call_count == 2
     assert json.loads(marker.read_text())["meta"]["file_key"] == key
     with get_db_session() as session:
@@ -884,7 +898,7 @@ def test_first_tier_release_is_driven_by_real_handler(
         original = damaged.read_bytes()
         damaged.write_bytes(b"x" * len(original))
         with patch("viseron.components.storage.tier_handler.threading.Timer"):
-            handler._on_created(FileCreatedEvent(str(dest)))
+            _replay_after_cooldown(handler, FileCreatedEvent(str(dest)))
         assert source.exists(), "Unverified destination must not release its source"
         assert intent.exists() and os.path.exists(marker)
         damaged.write_bytes(original)
@@ -901,9 +915,9 @@ def test_first_tier_release_is_driven_by_real_handler(
         patch("viseron.components.storage.tier_handler.threading.Timer"),
     ):
         patcher.setattr(Path, "unlink", fail_source_intent_unlink)
-        handler._on_created(FileCreatedEvent(str(dest)))
+        _replay_after_cooldown(handler, FileCreatedEvent(str(dest)))
     assert not source.exists() and intent.exists() and os.path.exists(marker)
-    handler._on_created(FileCreatedEvent(str(dest)))
+    _replay_after_cooldown(handler, FileCreatedEvent(str(dest)))
     assert not source.exists() and not intent.exists() and not os.path.exists(marker)
     assert dest.read_bytes() == b"video"
     with get_db_session() as session:
