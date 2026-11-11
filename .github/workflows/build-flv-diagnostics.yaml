@@ -8,6 +8,7 @@ on:
       - docker/go2rtc-diagnostics/**
       - viseron/components/ffmpeg/stream.py
       - viseron/domains/camera/fragmenter_process.py
+      - viseron/domains/camera/config.py
       - tests/domains/camera/test_fragmenter_retry.py
       - tests/components/storage/test_jobs.py
       - tests/diagnostics/test_restart_snapshots.py
@@ -71,6 +72,7 @@ jobs:
         run: |
           cp viseron/components/ffmpeg/stream.py docker/go2rtc-diagnostics/stream.py
           cp viseron/domains/camera/fragmenter_process.py docker/go2rtc-diagnostics/fragmenter_process.py
+          cp viseron/domains/camera/config.py docker/go2rtc-diagnostics/camera_config.py
           cp -R viseron/components/storage docker/go2rtc-diagnostics/storage
           cp -R frontend/dist docker/go2rtc-diagnostics/frontend-dist
           docker build --build-arg DIAGNOSTIC_COMMIT="$GITHUB_SHA" \

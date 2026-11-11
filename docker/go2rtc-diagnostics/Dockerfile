@@ -5,6 +5,7 @@ ARG DIAGNOSTIC_COMMIT
 COPY --chmod=0755 go2rtc /usr/local/bin/go2rtc
 COPY --chmod=0644 stream.py /src/viseron/components/ffmpeg/stream.py
 COPY storage/ /src/viseron/components/storage/
+COPY --chmod=0644 camera_config.py /src/viseron/domains/camera/config.py
 COPY --chmod=0644 fragmenter_process.py /src/viseron/domains/camera/fragmenter_process.py
 COPY frontend-dist/ /src/viseron/frontend/
 ENV VISERON_FLV_TIMING_DIAGNOSTICS=1
