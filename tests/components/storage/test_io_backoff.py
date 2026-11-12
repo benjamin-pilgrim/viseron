@@ -6,6 +6,8 @@ import logging
 import threading
 from unittest.mock import Mock, patch
 
+import pytest
+
 from watchdog.events import FileCreatedEvent
 
 from viseron.components.storage import io_retry
@@ -19,10 +21,11 @@ from viseron.components.storage.storage_subprocess import (
 from viseron.components.storage.tier_handler import TierHandler, _schedule_source_retry
 
 
-def test_read_only_batch_does_not_retry_every_file(caplog):
+@pytest.mark.parametrize("failure", [errno.EROFS, errno.EHOSTDOWN, errno.EHOSTUNREACH])
+def test_read_only_batch_does_not_retry_every_file(caplog, failure):
     """One unavailable NAS must not cause a write attempt and log per fragment."""
     worker = Worker()
-    worker.move_file = Mock(side_effect=OSError(errno.EROFS, "Read-only file system"))
+    worker.move_file = Mock(side_effect=OSError(failure, "NAS unavailable"))
     items = [
         DataItemMoveFile(
             cmd="move_file",

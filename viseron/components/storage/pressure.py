@@ -217,8 +217,8 @@ def _candidates(config, session, staged):
         ):
             continue
         events = _events(session, candidate)
-        if any(end is None for (end,) in events):
-            continue
+        # Finalized fragments of active events may move to another tier.
+        # Active-event deletion remains forbidden by the guarded reclaim loop.
         candidate["event"] = bool(events)
         ranked.append(candidate)
     ranked.sort(

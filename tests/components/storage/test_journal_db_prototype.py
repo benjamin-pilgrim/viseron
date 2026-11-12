@@ -25,7 +25,7 @@ from viseron.components.storage.pending_journal import (
     publish_or_verify,
     release_indexed_source,
 )
-from viseron.components.storage.run_lifecycle import camera_lock
+from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
 from viseron.components.storage.source_move_intent import (
     marker_for_source,
     prepare_source_intent,
@@ -706,7 +706,8 @@ def test_source_handover_recovers_after_source_unlink(
     assert marker.exists() and source.exists() and intent.exists()
     # A cooperating source writer/cleanup owns this lock: defer release.
     with camera_lock("/tmp/viseron-run-locks", str(camera)):
-        assert release() == "retry"
+        with pytest.raises(CameraLockBusy):
+            release()
         assert source.exists() and marker.exists() and intent.exists()
     if os.environ.get("PUBLICATION_MTIME_DRIFT"):
         snapshot = json.loads(marker.read_text())["source_snapshot"]

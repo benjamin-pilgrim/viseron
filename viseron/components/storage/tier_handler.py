@@ -1240,6 +1240,11 @@ class TierHandler(FileSystemEventHandler):
                     attempt.completed = True
                     self._publication_retry.complete(src_path)
                     return
+        except BlockingIOError:
+            # A busy camera lock is short-lived contention, not an unchanged
+            # recovery failure. Keep fresh acknowledgements moving promptly.
+            self._schedule_journal_retry(src_path, delay=1.0)
+            return
         except StorageRetryLater as error:
             self._schedule_journal_retry(src_path, delay=error.delay)
             return
@@ -1483,7 +1488,7 @@ class TierHandler(FileSystemEventHandler):
                     )
             return True
         except BlockingIOError:
-            self._logger.debug("Publication busy; retrying %s", src_path)
+            raise
         except OSError:
             raise
         except Exception:
@@ -2984,6 +2989,20 @@ def move_file(
     def _move_file_callback(
         item: DataItemMoveFile,
     ) -> None:
+        metadata = item.publication_meta or {}
+        if (
+            not item.error
+            and metadata.get("pending_move_id") is not None
+            and (not item.deferred or metadata.get("publication_ready", False))
+        ):
+            # A completed copy needs indexing even if final source work was
+            # deferred. Preserve completion state until verified source release.
+            destination = storage.camera_tier_handlers[camera_identifier][
+                curr_tier_category
+            ][segment_tier_id][curr_tier_subcategory]
+            destination._schedule_journal_retry(dst)
+            if item.deferred:
+                return
         if item.deferred:
             if item.retry_after > 0 and not item.deferred_by_hold:
                 _mark_promotion_failed(storage, source_db)
@@ -3004,15 +3023,6 @@ def move_file(
                     retry_after=item.retry_after,
                 )
             return
-        if (
-            not item.error
-            and (item.publication_meta or {}).get("pending_move_id") is not None
-        ):
-            # Notify our own publication directly; retry discovery is database-backed.
-            destination = storage.camera_tier_handlers[camera_identifier][
-                curr_tier_category
-            ][segment_tier_id][curr_tier_subcategory]
-            destination._schedule_journal_retry(dst)
         if asset_target is not None and not item.error:
             with storage.pending_moves_lock:
                 if storage.pending_moves.get(src) is pending_move:

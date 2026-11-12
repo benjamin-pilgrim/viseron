@@ -278,7 +278,11 @@ def release_indexed_source(
     verify the full journal identity and committed database row. allowed roots
     must be trusted configured source-tier camera paths, not journal input.
     """
-    from viseron.components.storage.run_lifecycle import camera_lock, is_run_directory  # noqa: PLC0415
+    from viseron.components.storage.run_lifecycle import (  # noqa: PLC0415
+        CameraLockBusy,
+        camera_lock,
+        is_run_directory,
+    )
     from viseron.components.storage.source_move_intent import marker_for_source  # noqa: PLC0415
 
     marker = Path(marker)
@@ -286,7 +290,6 @@ def release_indexed_source(
         record = json.loads(marker.read_text())
         if not source_run_available(record):
             return "source-unavailable"
-        record = publish_or_verify(marker)
         snapshot = record["source_snapshot"]
         source = Path(snapshot["source"])
         intent = Path(record["source_intent"])
@@ -305,6 +308,13 @@ def release_indexed_source(
             )
         ):
             return "invalid"
+        # Probe the source lock before any expensive destination readback.
+        # Release it before destination I/O, then recheck ownership under the
+        # final source lock below before deleting anything.
+        camera = os.path.abspath(source.parent.parent)
+        with camera_lock(lock_root, camera):
+            pass
+        record = publish_or_verify(marker)
         if not tier_available(str(destination)) or not index_is_committed(record):
             return "uncommitted"
         init_digest = record.get("init_digest")
@@ -401,6 +411,8 @@ def release_indexed_source(
         marker.unlink()
         sync_dir(marker.parent)
         return "released"
+    except CameraLockBusy:
+        raise
     except (OSError, ValueError, KeyError, TypeError):
         return "retry"
 

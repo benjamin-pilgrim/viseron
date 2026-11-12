@@ -22,6 +22,8 @@ RETRY_ERRNOS = frozenset(
         errno.ETIMEDOUT,
         errno.ENOTCONN,
         errno.ECONNRESET,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
     )
 )
 INITIAL_DELAY = 5.0

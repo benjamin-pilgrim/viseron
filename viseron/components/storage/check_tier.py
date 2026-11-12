@@ -405,6 +405,8 @@ class Worker:
 
     def work_input(self, item: DataItem | DataItemMoveFile | DataItemDeleteFile):
         """Perform work on input item from child process."""
+        if item.cmd == "move_file" and item.publication_meta is not None:
+            item.publication_meta.pop("publication_ready", None)
         try:
             if item.cmd == "move_file" and item.dispatch_token is not None:
                 if not token_permits_start(item.dispatch_token):
@@ -1139,6 +1141,8 @@ def move_file(
     verify_readback: bool = False,
 ) -> None:
     """Move a file while serializing generation publications with cleanup."""
+    if publication_meta is not None:
+        publication_meta.pop("publication_ready", None)
     if publication_meta is not None and "asset_target" in publication_meta:
         move_asset(_get_session, src, dst, publication_meta, tier_markers or {})
         return
@@ -1257,6 +1261,9 @@ def _move_file_locked(
             protected_temp = True
             publish_or_verify(marker)
             temp_path = None
+            # The destination is now journal-backed. A later source-lock
+            # deferral must not hide this publication from its indexer.
+            publication_meta["publication_ready"] = True
         else:
             os.replace(temp_path, dst)
             sync_dir(os.path.dirname(dst))

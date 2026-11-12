@@ -17,6 +17,7 @@ on:
       - frontend/**
       - tests/components/storage/test_polling.py
       - tests/components/storage/test_segment_moves.py
+      - tests/components/storage/test_promotion_handoff.py
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
 
@@ -83,6 +84,7 @@ jobs:
         run: |
           docker run --rm --user postgres --entrypoint /bin/sh \
             --tmpfs /tmp:rw,exec,mode=1777 \
+            --tmpfs /pressure-test:rw,size=16m,mode=1777 \
             --tmpfs /segments:rw,mode=1777 --tmpfs /thumbnails:rw,mode=1777 \
             --tmpfs /event_clips:rw,mode=1777 --tmpfs /snapshots:rw,mode=1777 \
             -v "$GITHUB_WORKSPACE/tests:/src/tests:ro" \
@@ -99,6 +101,7 @@ jobs:
               tests/components/storage/test_tier_markers.py \
               tests/components/storage/test_hold_retry.py \
               tests/components/storage/test_segment_moves.py \
+              tests/components/storage/test_promotion_handoff.py \
               tests/components/storage/test_journal_db_prototype.py \
               tests/components/storage/test_pressure_policy.py \
               tests/components/storage/test_migrations.py \
