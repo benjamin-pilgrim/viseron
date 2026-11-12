@@ -268,11 +268,14 @@ def test_hold_retry_republishes_only_if_ownership_and_row_match(
         publication_meta=item.publication_meta,
     )
     callback(item)
-    source_record = json.loads(marker.read_text())
-    assert handler._retry_held_move_worker(str(marker), source_record) is False
     destination_handler = storage.camera_tier_handlers["test"]["recorder"][1][
         "segments"
     ]
+    # Completion nudges indexing immediately; discovery still recovers a lost nudge.
+    destination_handler._schedule_journal_retry.assert_called_once_with(str(dst))
+    destination_handler._schedule_journal_retry.reset_mock()
+    source_record = json.loads(marker.read_text())
+    assert handler._retry_held_move_worker(str(marker), source_record) is False
     destination_handler._schedule_journal_retry.assert_called_once_with(str(dst))
     assert (
         dst.read_bytes() == b"video"

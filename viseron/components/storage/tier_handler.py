@@ -690,6 +690,12 @@ class TierHandler(FileSystemEventHandler):
                     self._logger.warning(
                         "Held move retry failed for %s: %s", source, item.error
                     )
+                elif (item.publication_meta or {}).get("publication_ready"):
+                    # Recovery uses a different callback from initial promotion.
+                    # A durable copy still needs prompt destination indexing,
+                    # including when final source work was deferred.
+                    if not self._hold_retry_stopped():
+                        next_tier._schedule_journal_retry(destination)
 
             with self._hold_retry_lock:
                 if self._hold_retry_stopping:

@@ -25,6 +25,7 @@ from viseron.components.storage.pending_journal import (
 )
 from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
+from viseron.components.storage.source_move_intent import marker_for_source
 from viseron.components.storage.tier_handler import TierHandler, move_file as queue_move
 
 from tests.components.storage.test_pressure_policy import (
@@ -37,7 +38,6 @@ from tests.components.storage.test_segment_moves import (
     promotion as promotion_fixture,
     start_promotion,
 )
-
 
 # Share the real source/publication fixture, rather than bypassing worker IPC.
 promotion = promotion_fixture
@@ -321,34 +321,40 @@ def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
                     Path(control, "recovery-ready").touch()
                     _wait_control(Path(control, "recovered"))
                 assert not dst.exists()
-                item.deferred = False
-                item.error = None
-                item.retry_after = 0
-                worker = Worker()  # A fresh admitted recovery probe.
-                worker._get_session = get_db_session
-                # Reserve a failed in-flight source through its durable recovery path.
-                item.dispatch_token = create_token()
+                # Exercise the actual held-move recovery callback, not the
+                # original promotion callback that has already been completed.
+                replay = object.__new__(TierHandler)
+                replay._storage = storage
+                replay._camera = SimpleNamespace(identifier="camera")
+                replay._category = "recorder"
+                replay._subcategory = "segments"
+                replay._tier_id = 0
+                replay._path = source._path
+                replay._logger = logging.getLogger(__name__)
+                replay._hold_retry_lock = threading.Lock()
+                replay._hold_retry_active = {str(path)}
+                replay._hold_retry_stopping = False
+                replay._hold_retry_token = create_token()
+                record = dict(
+                    item.publication_meta,
+                    source=str(path),
+                    destination=str(dst),
+                    size=len(originals[path]),
+                )
                 try:
-                    worker.work_input(item)
+                    assert replay._retry_held_move_worker(
+                        str(marker_for_source(path)), record
+                    )
+                    call = storage.tier_check_worker_send_command.call_args
+                    item = call.args[0]
+                    worker = Worker()  # A fresh admitted recovery probe.
+                    worker._get_session = get_db_session
+                    _copy_with_source_contention(worker, item, source._path)
                 finally:
-                    os.unlink(item.dispatch_token)
+                    os.unlink(replay._hold_retry_token)
                 outage = False
             else:
-                real = check_tier.camera_lock
-                count = [0]
-
-                def busy_final_source(root, key, count=count, real=real):
-                    if key == source._path:
-                        count[0] += 1
-                        if count[0] == 2:
-                            raise CameraLockBusy("injected post-copy contention")
-                    return real(root, key)
-
-                with patch(
-                    "viseron.components.storage.check_tier.camera_lock",
-                    side_effect=busy_final_source,
-                ):
-                    worker.work_input(item)
+                _copy_with_source_contention(worker, item, source._path)
             assert item.error is None and item.publication_meta["publication_ready"]
             assert path.read_bytes() == originals[path]  # Before index acknowledgement.
             assert dst.read_bytes() == originals[path]
@@ -376,3 +382,24 @@ def _wait_control(flag):
         if time.monotonic() >= deadline:
             raise TimeoutError(str(flag))
         time.sleep(0.1)
+
+
+def _copy_with_source_contention(worker, item, source_path):
+    """Contend only the final source step, after a real durable copy."""
+    real = check_tier.camera_lock
+    count = 0
+
+    def busy_final_source(root, key):
+        nonlocal count
+        if key == source_path:
+            count += 1
+            if count == 2:
+                raise CameraLockBusy("injected post-copy contention")
+        return real(root, key)
+
+    with patch(
+        "viseron.components.storage.check_tier.camera_lock",
+        side_effect=busy_final_source,
+    ):
+        worker.work_input(item)
+    assert item.deferred and item.error is None
