@@ -25,6 +25,7 @@ from viseron.components.storage.source_move_intent import marker_for_source
 from viseron.components.storage.startup_reconciliation import (
     missing_volatile_path,
     recovery_destination_available,
+    recovery_destination_root,
 )
 from viseron.components.storage.util import tier_markers_available
 
@@ -41,13 +42,15 @@ def _absent(path):
     return False
 
 
-def _confirmed_namespace(path, markers):
+def _confirmed_namespace(path, markers, namespace_root):
     """A configured persistent marker identifies the expected storage namespace."""
     covered = {
         root: marker
         for root, marker in (markers or {}).items()
         if os.path.commonpath((os.path.abspath(root), os.path.abspath(path)))
         == os.path.abspath(root)
+        and os.path.commonpath((namespace_root, os.path.abspath(root)))
+        == namespace_root
     }
     return bool(covered) and tier_markers_available(path, covered)
 
@@ -215,7 +218,11 @@ def reconcile_segment(
         temporary = marker.parent / record["temp_name"] if record else None
         has_temporary = temporary is not None and not _absent(temporary)
         if not present and not has_temporary:
-            if not _confirmed_namespace(move.destination, markers):
+            if not _confirmed_namespace(
+                move.destination,
+                markers,
+                recovery_destination_root(destination_root, destination_tier),
+            ):
                 return "deferred"
             if not recovery_destination_available(
                 destination_root, destination_tier, available
@@ -411,7 +418,11 @@ def reconcile_asset(
             destination_root, destination_tier, available
         ):
             return "deferred"
-        if not _confirmed_namespace(target["path"], markers):
+        if not _confirmed_namespace(
+            target["path"],
+            markers,
+            recovery_destination_root(destination_root, destination_tier),
+        ):
             return "deferred"
         field = getattr(Recordings, ASSET_FIELDS[row.subcategory])
         session.execute(

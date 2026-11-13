@@ -173,16 +173,32 @@ def missing_volatile_path(path: str, tier_path: str) -> bool:
     return False
 
 
+def recovery_destination_root(camera_root: str, tier_path: str) -> str:
+    """Locate the configured namespace root, including root-tier category binds."""
+    root = os.path.abspath(tier_path)
+    return str(Path(camera_root).parent) if root == "/" else root
+
+
 def recovery_destination_available(camera_root: str, tier_path: str, available) -> bool:
     """An empty fallback directory cannot establish absence on a missing share.
 
     Require an explicit configured tier mount (or category mount for the root
     tier). Unknown mount layouts retain their work for manual investigation.
     """
-    root = os.path.abspath(tier_path)
-    anchor = str(Path(camera_root).parent) if root == "/" else root
-    if anchor not in _mount_filesystems() or not available(camera_root):
+    anchor = recovery_destination_root(camera_root, tier_path)
+    mounts = _mount_filesystems()
+    if anchor not in mounts or not available(camera_root):
         return False
-    return Path(anchor).is_dir() and os.path.realpath(camera_root) == os.path.abspath(
-        camera_root
-    )
+    camera_root = os.path.abspath(camera_root)
+    if any(
+        mount != anchor
+        and mount.startswith(anchor.rstrip("/") + "/")
+        and (
+            camera_root == mount
+            or camera_root.startswith(mount.rstrip("/") + "/")
+            or mount.startswith(camera_root.rstrip("/") + "/")
+        )
+        for mount in mounts
+    ):
+        return False
+    return Path(anchor).is_dir() and os.path.realpath(camera_root) == camera_root

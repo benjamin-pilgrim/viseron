@@ -583,12 +583,20 @@ def _wait_flag(path):
         time.sleep(0.1)
 
 
+@pytest.mark.parametrize("namespace", ["none", "outside_volume", "nested_mount"])
 def test_unmarked_empty_share_cannot_retire_a_transfer(
-    promotion, get_db_session, monkeypatch
+    promotion, get_db_session, monkeypatch, namespace
 ):
     """Mounted storage alone does not identify the expected NAS namespace."""
     source, _target = _segment_handlers(promotion)
     promotion.storage.config = {"tier_markers": {}}
+    if namespace == "outside_volume":
+        root = promotion.src.parents[3]
+        (root / ".wrong-volume").touch()
+        promotion.storage.config = {"tier_markers": {str(root): ".wrong-volume"}}
+    elif namespace == "nested_mount":
+        root = promotion.dst.parents[2]
+        promotion.storage.config = {"tier_markers": {str(root): ".test-volume"}}
     with get_db_session() as session:
         row = session.execute(select(Files)).scalar_one()
         reserve(session, row, str(promotion.dst), 1, str(promotion.dst.parents[2]))
@@ -599,6 +607,11 @@ def test_unmarked_empty_share_cannot_retire_a_transfer(
         lambda: {
             str(promotion.src.parents[2]): "tmpfs",
             str(promotion.dst.parents[2]): "cifs",
+            **(
+                {str(promotion.dst.parent): "cifs"}
+                if namespace == "nested_mount"
+                else {}
+            ),
         },
     )
     startup_chores(get_db_session)
