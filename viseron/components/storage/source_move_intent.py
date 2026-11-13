@@ -29,7 +29,9 @@ def source_move_pending(path):
         return False
 
 
-def prepare_source_intent(src, dst, stat_result, file_key, *, source_db=None):
+def prepare_source_intent(
+    src, dst, stat_result, file_key, *, source_db=None, source_timing=None
+):
     """Caller holds the local tier camera lock; no remote I/O is performed."""
     marker = marker_for_source(src)
     record = {
@@ -44,6 +46,8 @@ def prepare_source_intent(src, dst, stat_result, file_key, *, source_db=None):
     }
     if source_db is not None:
         record["source_db"] = source_db
+    if source_timing is not None:
+        record["source_timing"] = source_timing
     payload = json.dumps(record, sort_keys=True).encode()
 
     def existing_intent():
@@ -51,9 +55,26 @@ def prepare_source_intent(src, dst, stat_result, file_key, *, source_db=None):
             existing = json.loads(marker.read_text())
             existing.pop("sha256", None)
             existing.pop("init_sha256", None)
+            existing_timing = existing.pop("source_timing", None)
         except (ValueError, OSError):
             raise ValueError("incomplete source move intent") from None
-        if existing != json.loads(payload):
+        expected = json.loads(payload)
+        expected.pop("source_timing", None)
+        if existing != expected or (
+            existing_timing is not None
+            and source_timing is not None
+            and (
+                any(
+                    existing_timing.get(k) != source_timing.get(k)
+                    for k in ("program_date_time", "duration")
+                )
+                or (
+                    existing_timing.get("sha256") is not None
+                    and source_timing.get("sha256") is not None
+                    and existing_timing["sha256"] != source_timing["sha256"]
+                )
+            )
+        ):
             raise ValueError("conflicting source move intent")
         return marker
 

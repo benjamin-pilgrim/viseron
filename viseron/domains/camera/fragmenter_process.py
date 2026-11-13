@@ -41,7 +41,10 @@ from viseron.components.storage.source_move_intent import (
 )
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX, require_tier_markers
 from viseron.domains.camera.const import MP4BOX_PATH
-from viseron.domains.camera.playlist_timing import read_playlist_time
+from viseron.domains.camera.playlist_timing import (
+    read_playlist_time,
+    read_source_intent_time,
+)
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
 from viseron.helpers.logs import LogPipe
@@ -659,7 +662,15 @@ class FragmenterWork(ChildProcessWork):
                                 "staged fragment changed after timing capture"
                             )
                         source_intent = prepare_source_intent(
-                            source, destination, source_stat, None
+                            source,
+                            destination,
+                            source_stat,
+                            None,
+                            source_timing={
+                                "program_date_time": orig_ctime.isoformat(),
+                                "duration": duration,
+                                "sha256": expected_digest,
+                            },
                         )
                     temporary = os.path.join(
                         destination_dir, TIER_MOVE_TEMP_PREFIX + uuid.uuid4().hex
@@ -885,7 +896,10 @@ class FragmenterWork(ChildProcessWork):
             extinf = _extract_extinf_number(m3u8, name)
             program_date_time = _extract_program_date_time(m3u8, name)
             if _RUN_SEGMENT_NAME.fullmatch(name) and program_date_time is None:
-                timing = read_playlist_time(Path(self.temp_segments_folder) / file)
+                fragment = Path(self.temp_segments_folder) / file
+                timing = read_playlist_time(fragment) or read_source_intent_time(
+                    fragment, Path(self.segments_folder) / file
+                )
                 if timing is not None:
                     program_date_time, extinf, expected_identity, expected_digest = (
                         timing

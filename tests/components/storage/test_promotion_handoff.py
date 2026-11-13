@@ -2,6 +2,7 @@
 
 import contextlib
 import errno
+import json
 import logging
 import os
 import tempfile
@@ -10,7 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from sqlalchemy import select
@@ -27,18 +28,25 @@ from viseron.components.storage.pending_journal import (
 )
 from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
-from viseron.components.storage.source_move_intent import marker_for_source
+from viseron.components.storage.source_move_intent import (
+    marker_for_source,
+    prepare_source_intent,
+)
 from viseron.components.storage.tier_handler import (
     SegmentsTierHandler,
     TierHandler,
     move_file as queue_move,
 )
 
+from viseron.domains.camera.fragmenter_process import FragmenterWork
+from viseron.domains.camera.playlist_timing import read_source_intent_time
+
 from tests.components.storage.test_pressure_policy import (
     _configuration,
     _fill,
     _pressure_directory,
     _record,
+    _staged,
 )
 from tests.components.storage.test_segment_moves import (
     promotion as promotion_fixture,
@@ -526,3 +534,120 @@ def test_database_transfer_recovers_crash_after_source_unlink(
         assert [r.path for r in session.execute(select(Files)).scalars()] == [
             str(promotion.dst)
         ]
+
+
+@pytest.mark.parametrize("failure", ["copy", "receipt"])
+def test_failed_ingest_keeps_observed_timing_after_playlist_rotation(
+    tmp_path, promotion, get_db_session, failure
+):
+    """A failed copy must not strand a source once its live entry rotates out."""
+    timestamp = datetime.now(UTC) - timedelta(hours=1)
+    spool, source = _staged(tmp_path, timestamp)
+    relative = source.relative_to(spool)
+    canonical_spool = tmp_path / "segments" / ".viseron-spool" / "camera"
+    canonical_spool.parent.mkdir(parents=True)
+    spool.rename(canonical_spool)
+    spool, source = canonical_spool, canonical_spool / relative
+    # Model a full RAM tier which could not persist the optional timing sidecar.
+    for timing in source.parent.glob(".viseron-timing-*.json"):
+        timing.unlink()
+    target = tmp_path / "segments" / "camera"
+    worker = FragmenterWork("camera", str(spool), str(target), None, None, Mock())
+    worker.output_queue = Mock()
+    worker._send_files_metadata = Mock()
+    relative = str(source.relative_to(spool))
+    destination = target / relative
+
+    def full_copy(path, mode="r", *args, **kwargs):
+        stream = open(path, mode, *args, **kwargs)
+        if mode != "xb":
+            return stream
+        output = MagicMock(wraps=stream)
+        output.__enter__.return_value = output
+        output.__exit__.side_effect = lambda *_args: stream.close()
+        output.write.side_effect = OSError(errno.ENOSPC, "injected full RAM copy")
+        return output
+
+    fault = (
+        patch("viseron.domains.camera.fragmenter_process.open", side_effect=full_copy)
+        if failure == "copy"
+        else patch(
+            "viseron.domains.camera.fragmenter_process.prepare",
+            side_effect=OSError(errno.ENOSPC, "injected full RAM publication"),
+        )
+    )
+    with fault:
+        worker._handle_m4s(relative)
+    assert source.exists() and marker_for_source(source).exists()
+    assert not destination.exists()
+    assert not Path(marker_for_path(str(destination))).exists()
+
+    (source.parent / "index.m3u8").write_text("#EXTM3U\n")
+    # A new worker models a restart with all volatile metadata lost.
+    worker = FragmenterWork("camera", str(spool), str(target), None, None, Mock())
+    worker.output_queue = Mock()
+    worker._send_files_metadata = Mock()
+    worker._handle_m4s(relative)
+    assert destination.exists(), "failed publication lost its observed playlist time"
+    receipt = json.loads(Path(marker_for_path(str(destination))).read_text())
+    assert datetime.fromisoformat(receipt["meta"]["orig_ctime"]) == timestamp
+    assert receipt["meta"]["duration"] == 2.0
+    assert source.exists()  # Release still requires database acknowledgement.
+
+    handler = _destination_handler(promotion.storage, tmp_path)
+    handler._path = str(target)
+    handler._tier_id = 0
+    handler._on_created(FileCreatedEvent(str(destination)))
+    with get_db_session() as session:
+        row = session.execute(
+            select(Files).where(Files.path == str(destination))
+        ).scalar_one()
+        assert row.orig_ctime == timestamp
+    assert not source.exists()
+    assert not marker_for_source(source).exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "replaced_source",
+        "destination",
+        "source",
+        "legacy",
+        "naive",
+        "duration",
+        "digest",
+    ],
+)
+def test_held_timing_requires_original_source_and_valid_observation(tmp_path, mutation):
+    """Stale, legacy and malformed holds never invent playable timing."""
+    timestamp = datetime.now(UTC)
+    _spool, source = _staged(tmp_path, timestamp)
+    destination = tmp_path / "segments" / "camera" / source.parent.name / source.name
+    marker = prepare_source_intent(
+        source,
+        destination,
+        source.stat(),
+        None,
+        source_timing={"program_date_time": timestamp.isoformat(), "duration": 2.0},
+    )
+    assert read_source_intent_time(source, destination) is not None
+    record = json.loads(marker.read_text())
+    if mutation == "replaced_source":
+        replacement = source.with_suffix(".replacement")
+        replacement.write_bytes(source.read_bytes())
+        replacement.replace(source)
+    elif mutation in ("destination", "source"):
+        record[mutation] += "-different"
+    elif mutation == "legacy":
+        record.pop("source_timing")
+    elif mutation == "naive":
+        record["source_timing"]["program_date_time"] = timestamp.replace(
+            tzinfo=None
+        ).isoformat()
+    elif mutation == "duration":
+        record["source_timing"]["duration"] = float("nan")
+    elif mutation == "digest":
+        record["source_timing"]["sha256"] = "invalid"
+    marker.write_text(json.dumps(record))
+    assert read_source_intent_time(source, destination) is None

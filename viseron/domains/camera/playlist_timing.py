@@ -22,7 +22,10 @@ from viseron.components.storage.run_lifecycle import (
     camera_lock,
     is_run_directory,
 )
-from viseron.components.storage.source_move_intent import source_move_pending
+from viseron.components.storage.source_move_intent import (
+    marker_for_source,
+    source_move_pending,
+)
 from viseron.helpers.recording_timing_contract import (
     TIMING_CONTRACT_CONTENT,
     TIMING_CONTRACT_FILE,
@@ -227,6 +230,36 @@ def read_playlist_time(
             expected_digest,
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def read_source_intent_time(fragment: Path, destination: Path):
+    """Recover observed timing from an interrupted first publication's hold."""
+    try:
+        if (fragment.parent / TIMING_CONTRACT_FILE).read_text(
+            encoding="utf-8"
+        ) != TIMING_CONTRACT_CONTENT:
+            return None
+        record = json.loads(marker_for_source(fragment).read_text())
+        timing = record["source_timing"]
+        timestamp = datetime.datetime.fromisoformat(timing["program_date_time"])
+        duration = float(timing["duration"])
+        identity = _identity(fragment)
+        digest = timing.get("sha256")
+        if (
+            record["version"] != 1
+            or record["source"] != os.path.abspath(fragment)
+            or record["destination"] != os.path.abspath(destination)
+            or record.get("file_key") is not None
+            or record.get("source_db") is not None
+            or [record[k] for k in ("dev", "ino", "size", "mtime_ns")] != identity
+            or timestamp.utcoffset() is None
+            or not 0 < duration < _MAX_SEGMENT_DURATION
+            or (digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest))
+        ):
+            return None
+        return timestamp.astimezone(datetime.timezone.utc), duration, identity, digest
+    except (OSError, ValueError, TypeError, KeyError):
         return None
 
 
