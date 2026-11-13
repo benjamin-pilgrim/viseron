@@ -660,3 +660,28 @@ def test_startup_clears_confirmed_missing_asset_links_without_nas_io(
         assert session.execute(select(Files)).first() is None
         event = session.get(Recordings, event_id)
         assert event is not None and getattr(event, field) is None
+
+
+def test_historical_outage_cannot_hold_ordinary_source_replay(
+    promotion, get_db_session
+):
+    """A surviving source follows ordinary replay even during historical cooldown."""
+    source, target = _segment_handlers(promotion)
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=item.publication_meta,
+    )
+    source._lost_source_recovery = LostSourceRecovery(Mock())
+    failed = Mock(side_effect=OSError(5, "old recovery NAS failure"))
+    source._lost_source_recovery.attempt(
+        str(promotion.src.with_name("old.m4s")), str(promotion.dst), failed
+    )
+    source._replay_segment_moves()
+    target._schedule_journal_retry.assert_called_once_with(str(promotion.dst))
+    assert promotion.src.read_bytes() == b"video"

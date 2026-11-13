@@ -389,6 +389,7 @@ class TierHandler(FileSystemEventHandler):
                 partial(
                     self._recover_asset_source, file_id, source, destination, tier_path
                 ),
+                self._tier[CONFIG_PATH],
             ):
                 continue
             try:
@@ -460,11 +461,16 @@ class TierHandler(FileSystemEventHandler):
             markers=self._storage.config.get(CONFIG_TIER_MARKERS, {}),
         )
 
-    def _recover_lost_source(self, source, destination, operation):
+    def _recover_lost_source(self, source, destination, operation, volatile_tier):
         """Bound unavailable-filesystem probes and unchanged recovery failures."""
         if not hasattr(self, "_lost_source_recovery"):
             self._lost_source_recovery = LostSourceRecovery(self._logger)
-        return self._lost_source_recovery.attempt(source, destination, operation)
+        return self._lost_source_recovery.attempt(
+            source,
+            destination,
+            operation,
+            probe=partial(missing_volatile_path, source, volatile_tier),
+        )
 
     def _asset_destination_pending(self, path: str) -> bool:
         with self._storage.get_session() as session:
@@ -554,6 +560,7 @@ class TierHandler(FileSystemEventHandler):
                     move.source,
                     move.destination,
                     partial(self._recover_segment_source, move, destination),
+                    move.metadata_record["source_db"]["tier_path"],
                 ):
                     continue
                 try:

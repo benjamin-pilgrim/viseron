@@ -435,11 +435,15 @@ class LostSourceRecovery:
         self._io = FilesystemRetry(logger)
         self._paths = PublicationRetry(logger)
 
-    def attempt(self, source, destination, operation):
+    def attempt(self, source, destination, operation, probe=None):
         """Return whether this path was handled or retained for a later pass."""
-        if self._paths.remaining(source):
-            return True
         try:
+            # Historical NAS cooldown must not delay a surviving source's
+            # ordinary copy/replay. This probe only accesses proven local RAM.
+            if probe is not None and not probe():
+                return False
+            if self._paths.remaining(source):
+                return True
             with self._io.attempt("lost-source", source, destination) as attempt:
                 result = operation()
                 if result is None:
