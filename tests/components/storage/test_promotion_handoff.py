@@ -273,7 +273,10 @@ def test_publication_waits_for_recorder_before_index_and_source_release(
 @pytest.mark.parametrize(
     "outage", [False, True], ids=["nas-available", "nas-unavailable"]
 )
-def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
+@pytest.mark.parametrize("uncertain_staging", [False, True])
+def test_full_ram_handoff_and_nas_recovery(
+    get_db_session, tmp_path, outage, uncertain_staging
+):
     """Real ENOSPC, worker, indexing and release retain every promised fragment.
 
     Set VISERON_HANDOFF_CIFS to exercise a mounted disposable CIFS share. The
@@ -323,12 +326,24 @@ def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
         config["volatile"] = True
         config["reclaim"] = False
         config["cameras"][0]["has_next"] = True
+        held = None
+        if uncertain_staging:
+            spool = ram / "segments" / ".viseron-spool" / "camera"
+            run = spool / "20261101T000000.000000Z-012345abcdef"
+            run.mkdir(parents=True)
+            held = run / "000000001-1793491200-0000005000000.m4s"
+            held.write_bytes(b"uncertain" * (512 * 1024))
+            (run / "init.mp4").write_bytes(b"held init")
+            config["cameras"][0]["spool"] = str(spool)
         _fill(ram)
         assert os.statvfs(ram).f_bavail == 0
         # DB reservations and NAS receipts need no metadata headroom on RAM.
         plan = reclaim(config, get_db_session)
         assert {item["path"] for item in plan["promote"]} == {str(p) for p in paths}
         assert plan["deleted"] == 0
+        if held is not None:
+            assert held.exists()
+            assert str(held) not in {item["path"] for item in plan["promote"]}
         originals = {p: p.read_bytes() for p in paths}
         if control and outage:
             Path(control, "stop-ready").touch()
@@ -431,6 +446,9 @@ def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
             assert len(rows) == len(paths)
             assert all(row.tier_id == 1 for row in rows)
         (ram / "new-footage").write_bytes(b"n" * 1024**2)
+        if held is not None:
+            assert held.read_bytes() == b"uncertain" * (512 * 1024)
+            assert (held.parent / "init.mp4").read_bytes() == b"held init"
 
 
 def _wait_control(flag):
