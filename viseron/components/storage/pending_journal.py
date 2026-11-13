@@ -22,10 +22,20 @@ def sync_dir(path):
 
 
 PREFIX = ".viseron-tier-move-pending-"
+SOURCE_INTENT_VERSION = 2
+DATABASE_SOURCE_VERSION = 3
 
 
 def prepare(
-    run, filename, meta, *, temp_path=None, source_intent=None, copied_digest=None
+    run,
+    filename,
+    meta,
+    *,
+    temp_path=None,
+    source_intent=None,
+    copied_digest=None,
+    source_snapshot=None,
+    init_digest=None,
 ):
     """Persist before publishing media; caller must hold same camera lock as cleanup."""
     if Path(filename).name != filename or not filename.endswith(".m4s"):
@@ -71,6 +81,27 @@ def prepare(
                 if source.get("source_db") != meta["source_db"]:
                     raise ValueError("source database identity does not match intent")
                 record["source_snapshot"]["source_db"] = source["source_db"]
+    if source_snapshot is not None:
+        if (
+            source_intent is not None
+            or temp_path is None
+            or not isinstance(meta.get("pending_move_id"), int)
+            or meta["pending_move_id"] <= 0
+            or not isinstance(meta.get("source_db"), dict)
+            or source_snapshot.get("source_db") != meta["source_db"]
+            or source_snapshot.get("file_key") != meta.get("file_key")
+            or source_snapshot.get("destination") != str(run / filename)
+            or not re.fullmatch(r"[0-9a-f]{64}", copied_digest or "")
+            or not re.fullmatch(r"[0-9a-f]{64}", init_digest or "")
+        ):
+            raise ValueError("invalid database-backed source proof")
+        record.update(
+            version=DATABASE_SOURCE_VERSION,
+            source_tracking="database",
+            source_snapshot=source_snapshot,
+            copied_digest=copied_digest,
+            init_digest=init_digest,
+        )
     payload = json.dumps(record, sort_keys=True).encode()
     fd, tmp = tempfile.mkstemp(prefix=PREFIX, dir=run)
     try:
@@ -156,7 +187,11 @@ def publish_or_verify(marker):
     record = json.loads(marker.read_text())
     name, temp_name = record["filename"], record["temp_name"]
     if (
-        record["version"] != 2  # noqa: PLR2004
+        record["version"] not in (SOURCE_INTENT_VERSION, DATABASE_SOURCE_VERSION)
+        or (
+            record["version"] == DATABASE_SOURCE_VERSION
+            and record.get("source_tracking") != "database"
+        )
         or Path(name).name != name
         or Path(temp_name).name != temp_name
         or not temp_name.startswith(".viseron-tier-move-")
@@ -204,7 +239,7 @@ def _verified_publication_identity(path, record):
     if current == record["identity"]:
         return current
     if (
-        record.get("source_intent")
+        source_backed(record)
         and record.get("source_snapshot")
         and current[2] == record["identity"][2]
         and verify_file_contents(path, record.get("copied_digest"), current)
@@ -239,8 +274,11 @@ def verify_file_contents(path, expected_digest, expected_identity=None):
 
         def attrs(info):
             return (
-                info.st_dev, info.st_ino, info.st_size,
-                info.st_mtime_ns, info.st_ctime_ns,
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
             )
 
         return (
@@ -249,13 +287,20 @@ def verify_file_contents(path, expected_digest, expected_identity=None):
         )
 
 
+def source_backed(record):
+    """A legacy source intent or a database reservation owns this copy."""
+    return bool(
+        record.get("source_intent") or record.get("source_tracking") == "database"
+    )
+
+
 def source_run_available(record):
     """Check a necessary recovery prerequisite before expensive CIFS readback.
 
     This is only an early deferral. Release still rechecks source ownership and
     destination bytes under the existing locks before removing anything.
     """
-    if not record.get("source_intent"):
+    if not source_backed(record):
         return True
     source = Path(record["source_snapshot"]["source"])
     if not source.is_absolute():
@@ -292,11 +337,13 @@ def release_indexed_source(
             return "source-unavailable"
         snapshot = record["source_snapshot"]
         source = Path(snapshot["source"])
-        intent = Path(record["source_intent"])
+        database_source = record.get("source_tracking") == "database"
+        intent = None if database_source else Path(record["source_intent"])
         destination = marker.parent / record["filename"]
         if (
             str(destination) != snapshot["destination"]
-            or intent != marker_for_source(source)
+            or (not database_source and intent != marker_for_source(source))
+            or (database_source and source_index_guard is None)
             or not source.is_absolute()
             or not is_run_directory(source.parent.name)
             or source.name != destination.name
@@ -333,13 +380,18 @@ def release_indexed_source(
         with camera_lock(lock_root, camera):
             if not tier_available(str(source)):
                 return "source-unavailable"
-            try:
-                source_record = json.loads(intent.read_text())
-            except FileNotFoundError:
-                # Crash after source intent removal: never infer safety if source remains.  # noqa: E501
-                if source.exists() or not source.parent.is_dir():
-                    return "ambiguous"
+            if database_source:
+                source_record = snapshot
             else:
+                try:
+                    source_record = json.loads(intent.read_text())
+                except FileNotFoundError:
+                    # Legacy crash after intent removal is complete only if the
+                    # source is already gone. No source deletion is authorized.
+                    if source.exists() or not source.parent.is_dir():
+                        return "ambiguous"
+                    source_record = None
+            if source_record is not None:
                 if any(source_record.get(k) != v for k, v in snapshot.items()):
                     return "source-intent-mismatch"
                 source_present = os.path.lexists(source)
@@ -405,8 +457,9 @@ def release_indexed_source(
                         source.unlink()
                         sync_dir(source.parent)
                     finalize_index()
-                intent.unlink()
-                sync_dir(intent.parent)
+                if intent is not None:
+                    intent.unlink()
+                    sync_dir(intent.parent)
         # Destination lock is still held; only now remove its durable journal.
         marker.unlink()
         sync_dir(marker.parent)

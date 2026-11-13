@@ -14,6 +14,7 @@ from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, PendingSegmentMove
 from viseron.components.storage.pending_journal import PREFIX as DESTINATION_PREFIX
 from viseron.components.storage.pending_journal import (
+    DATABASE_SOURCE_VERSION,
     marker_for_path,
     protected_by_pending,
 )
@@ -114,6 +115,45 @@ def begin_copy(session: Session, source: str, destination: str, metadata: dict) 
     identity = pending.id
     session.commit()
     return identity
+
+
+def receipt_matches(session: Session, receipt: dict) -> bool:
+    """Lock and validate the reservation authorizing a marker-free source copy."""
+    if receipt.get("source_tracking") != "database":
+        return True  # Legacy transfers are authorized by their source intents.
+    meta, snapshot = receipt["meta"], receipt["source_snapshot"]
+    identity = meta.get("pending_move_id")
+    if not isinstance(identity, int) or identity <= 0:
+        return False
+    pending = session.execute(
+        select(PendingSegmentMove)
+        .where(PendingSegmentMove.id == identity)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if pending is None:
+        return False
+    destination = str(Path(snapshot["destination"]))
+    return (
+        receipt.get("version") == DATABASE_SOURCE_VERSION
+        and receipt.get("source_tracking") == "database"
+        and "source_intent" not in receipt
+        and pending.camera_identifier == Path(pending.source_root).name
+        and pending.camera_identifier == Path(pending.destination_root).name
+        and snapshot["source"] == pending.source
+        and destination == pending.destination
+        and receipt["filename"] == Path(destination).name
+        and pending.source_root == str(Path(snapshot["source"]).parent.parent)
+        and pending.destination_root == str(Path(destination).parent.parent)
+        and snapshot["size"] == receipt["identity"][2] == pending.size
+        and snapshot["file_key"] == pending.metadata_record["file_key"]
+        and snapshot["source_db"] == pending.metadata_record["source_db"]
+        and meta.get("destination_tier_id") == pending.destination_tier_id
+        and meta.get("destination_tier_path") == pending.destination_tier_path
+        and all(
+            meta.get(key) == pending.metadata_record[key]
+            for key in ("source_db", "file_key", "orig_ctime", "duration")
+        )
+    )
 
 
 def protects(session: Session, path: str) -> bool:

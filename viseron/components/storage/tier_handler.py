@@ -99,6 +99,8 @@ from viseron.components.storage.models import (
     Recordings,
 )
 from viseron.components.storage.pending_journal import (
+    DATABASE_SOURCE_VERSION,
+    source_backed,
     PREFIX,
     assign_destination_id,
     assign_file_key,
@@ -117,6 +119,7 @@ from viseron.components.storage.run_lifecycle import (
     recording_camera_paths,
 )
 from viseron.components.storage.segment_moves import (
+    receipt_matches,
     acknowledge as acknowledge_segment_move,
     finish_completed as finish_completed_segment_move,
     protects as segment_move_pending,
@@ -1364,10 +1367,10 @@ class TierHandler(FileSystemEventHandler):
                         record = json.load(stream)
                     if not source_run_available(record):
                         return False
-                    if record.get("version") == 2:  # noqa: PLR2004
+                    if record.get("version") in (2, DATABASE_SOURCE_VERSION):
                         record = publish_or_verify(marker)
                     if (
-                        record.get("version") != 2  # noqa: PLR2004
+                        record.get("version") not in (2, DATABASE_SOURCE_VERSION)
                         or record.get("filename") != os.path.basename(src_path)
                         or not os.path.isfile(os.path.join(directory, "init.mp4"))
                     ):
@@ -1389,7 +1392,7 @@ class TierHandler(FileSystemEventHandler):
                     )
                 if (
                     file_meta is not None
-                    and record.get("source_intent")
+                    and source_backed(record)
                     and record["meta"].get("source_db") is not None
                 ):
                     if record.get("destination_id") is None:
@@ -1434,10 +1437,10 @@ class TierHandler(FileSystemEventHandler):
                         raise
                 else:
                     self._on_created_impl(event, file_meta)
-                if file_meta is not None and not record.get("source_intent"):
+                if file_meta is not None and not source_backed(record):
                     os.unlink(marker)
                     sync_dir(directory)
-                elif file_meta is not None and record.get("source_intent"):
+                elif file_meta is not None and source_backed(record):
                     camera_root = os.path.abspath(os.path.dirname(directory))
                     parent, camera_name = os.path.split(camera_root)
                     spool_root = os.path.join(parent, ".viseron-spool", camera_name)
@@ -1502,43 +1505,9 @@ class TierHandler(FileSystemEventHandler):
                                     marker,
                                 )
 
-                    @contextlib.contextmanager
-                    def source_index_guard(saved, source_present):
-                        snapshot = saved["source_snapshot"]
-                        expected = saved["meta"].get("source_db")
-                        if not isinstance(expected, dict):
-                            yield None
-                            return
-                        with self._storage.get_session() as session:
-                            _lock_path(session, snapshot["source"])
-                            row = session.execute(
-                                select(Files)
-                                .where(Files.path == snapshot["source"])
-                                .with_for_update()
-                            ).scalar_one_or_none()
-                            if row is None:
-                                yield (None if source_present else lambda: None)
-                                return
-                            if (
-                                row.id != expected.get("id")
-                                or row.tier_id != expected.get("tier_id")
-                                or row.tier_path != expected.get("tier_path")
-                                or row.file_key != saved["meta"]["file_key"]
-                                or row.size != snapshot["size"]
-                                or row.camera_identifier != self._camera.identifier
-                                or row.category != self._category
-                                or row.subcategory != self._subcategory
-                                or row.orig_ctime != file_meta.orig_ctime
-                                or row.duration != file_meta.duration
-                            ):
-                                yield None
-                                return
-
-                            def finalize():
-                                session.delete(row)
-                                session.commit()
-
-                            yield finalize
+                    source_index_guard = partial(
+                        self._guard_source_index, file_meta=file_meta
+                    )
 
                     pending_moves = getattr(self._storage, "pending_moves", None)
                     pending = None
@@ -1585,6 +1554,48 @@ class TierHandler(FileSystemEventHandler):
         except Exception:
             self._logger.exception("Pending publication failed: %s", src_path)
         return False
+
+    @contextlib.contextmanager
+    def _guard_source_index(self, saved, source_present, *, file_meta):
+        """Keep transfer ownership and source identity fenced through deletion."""
+        snapshot = saved["source_snapshot"]
+        expected = saved["meta"].get("source_db")
+        if not isinstance(expected, dict):
+            yield None
+            return
+        with self._storage.get_session() as session:
+            if not receipt_matches(session, saved):
+                yield None
+                return
+            _lock_path(session, snapshot["source"])
+            row = session.execute(
+                select(Files)
+                .where(Files.path == snapshot["source"])
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                yield (None if source_present else lambda: None)
+                return
+            if (
+                row.id != expected.get("id")
+                or row.tier_id != expected.get("tier_id")
+                or row.tier_path != expected.get("tier_path")
+                or row.file_key != saved["meta"]["file_key"]
+                or row.size != snapshot["size"]
+                or row.camera_identifier != self._camera.identifier
+                or row.category != self._category
+                or row.subcategory != self._subcategory
+                or row.orig_ctime != file_meta.orig_ctime
+                or row.duration != file_meta.duration
+            ):
+                yield None
+                return
+
+            def finalize():
+                session.delete(row)
+                session.commit()
+
+            yield finalize
 
     def _complete_pending_move(self, pending, pending_moves, record, src_path):
         """Deliver an in-memory completion only after the durable handoff."""
@@ -1642,6 +1653,8 @@ class TierHandler(FileSystemEventHandler):
         with self._storage.get_session() as session:
             _lock_path(session, src_path)
             if journal_source is not None:
+                if not receipt_matches(session, journal_source):
+                    raise SourceJournalMismatch("source transfer reservation mismatch")
                 snapshot = journal_source["source_snapshot"]
                 expected = journal_source["meta"]["source_db"]
                 if snapshot.get("source_db") != expected:

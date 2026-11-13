@@ -1193,6 +1193,7 @@ def _move_file_locked(
     temp_path: str | None = None
     protected_temp = False
     source_intent = None
+    source_snapshot = None
     is_run_source = is_run_directory(os.path.basename(os.path.dirname(src)))
     if is_run_source:
         source_camera = os.path.abspath(os.path.dirname(os.path.dirname(src)))
@@ -1203,13 +1204,26 @@ def _move_file_locked(
                     publication_meta["pending_move_id"] = begin_copy(
                         session, src, dst, publication_meta
                     )
-            source_intent = prepare_source_intent(
-                src,
-                dst,
-                os.stat(src, follow_symlinks=False),
-                publication_meta.get("file_key"),
-                source_db=publication_meta.get("source_db"),
-            )
+            source_stat = os.stat(src, follow_symlinks=False)
+            if (
+                "destination_tier_id" in publication_meta
+                and not source_move_pending(src)
+            ):
+                source_snapshot = {
+                    "source": os.path.abspath(src),
+                    "destination": os.path.abspath(dst),
+                    "dev": source_stat.st_dev,
+                    "ino": source_stat.st_ino,
+                    "size": source_stat.st_size,
+                    "mtime_ns": source_stat.st_mtime_ns,
+                    "file_key": publication_meta["file_key"],
+                    "source_db": publication_meta["source_db"],
+                }
+            else:
+                source_intent = prepare_source_intent(
+                    src, dst, source_stat, publication_meta.get("file_key"),
+                    source_db=publication_meta.get("source_db"),
+                )
     try:
         publish_run_init(src, dst, tier_markers or {})
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1219,7 +1233,7 @@ def _move_file_locked(
             fd, temp_path = tempfile.mkstemp(
                 prefix=TIER_MOVE_TEMP_PREFIX, dir=os.path.dirname(dst)
             )
-            digest = hashlib.sha256() if source_intent is not None else None
+            digest = hashlib.sha256() if is_run_source else None
             with os.fdopen(fd, "wb") as target:
                 os.fchmod(target.fileno(), stat.S_IMODE(source_stat.st_mode))
                 if digest is None:
@@ -1235,7 +1249,7 @@ def _move_file_locked(
                     or os.fstat(source.fileno()).st_size != source_size
                 ):
                     raise OSError(f"Incomplete copy of {src}")  # noqa: TRY301
-        if source_intent is not None:
+        if is_run_source:
             with open(
                 os.path.join(os.path.dirname(src), "init.mp4"), "rb"
             ) as init_source:
@@ -1249,7 +1263,7 @@ def _move_file_locked(
                     raise OSError("Destination readback checksum mismatch")  # noqa: TRY301
         elif verify_readback:
             raise ValueError("Readback verification requires run-segment metadata")
-        if source_intent is not None:
+        if is_run_source:
             marker = prepare(
                 os.path.dirname(dst),
                 os.path.basename(dst),
@@ -1257,6 +1271,8 @@ def _move_file_locked(
                 temp_path=temp_path,
                 source_intent=source_intent,
                 copied_digest=digest.hexdigest(),
+                source_snapshot=source_snapshot,
+                init_digest=init_digest,
             )
             protected_temp = True
             publish_or_verify(marker)
@@ -1296,7 +1312,7 @@ def _move_file_locked(
                 # Experiment: protect source until a future reconciler proves the
                 # destination was indexed. Do not enable deletion without proof.
                 set_source_digest(source_intent, digest.hexdigest(), init_digest)
-            else:
+            elif not is_run_source:
                 os.remove(src)
     except OSError as error:
         logger.debug("Failed to move file %s to %s: %s", src, dst, error)

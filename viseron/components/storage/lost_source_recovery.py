@@ -30,7 +30,6 @@ from viseron.components.storage.startup_reconciliation import (
 from viseron.components.storage.util import tier_markers_available
 
 LOCK_ROOT = "/tmp/viseron-run-locks"
-RECEIPT_VERSION = 2
 MAX_RECEIPT_BYTES = 65536
 
 
@@ -109,11 +108,22 @@ def _destination_matches(row, move):
 def _trusted_receipt(record, move):
     meta, snapshot = record["meta"], record["source_snapshot"]
     return (
-        record["version"] == RECEIPT_VERSION
+        record["version"] in (2, 3)
         and record["filename"] == Path(move.destination).name
         and Path(record["temp_name"]).name == record["temp_name"]
         and record["temp_name"].startswith(".viseron-tier-move-")
-        and record["source_intent"] == str(marker_for_source(move.source))
+        and (
+            (
+                record["version"] == journal.SOURCE_INTENT_VERSION
+                and record.get("source_intent") == str(marker_for_source(move.source))
+            )
+            or (
+                record["version"] == journal.DATABASE_SOURCE_VERSION
+                and record.get("source_tracking") == "database"
+                and "source_intent" not in record
+                and meta.get("pending_move_id") == move.id
+            )
+        )
         and snapshot["source"] == move.source
         and snapshot["destination"] == move.destination
         and snapshot["size"] == record["identity"][2] == move.size

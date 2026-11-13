@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import importlib
+import json
 import logging
 import os
 import threading
@@ -21,6 +22,7 @@ from watchdog.events import FileCreatedEvent
 from viseron.components.storage.check_tier import delete_file
 from viseron.components.storage.check_tier import move_file as copy_file
 from viseron.components.storage.models import Files, PendingSegmentMove
+from viseron.components.storage.pending_journal import marker_for_path
 from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.segment_moves import (
     acknowledge,
@@ -29,7 +31,10 @@ from viseron.components.storage.segment_moves import (
     protects,
     reserve,
 )
-from viseron.components.storage.source_move_intent import marker_for_source
+from viseron.components.storage.source_move_intent import (
+    marker_for_source,
+    prepare_source_intent,
+)
 from viseron.components.storage.tier_handler import TierHandler, move_file
 
 
@@ -186,7 +191,7 @@ def interrupt_before_marker(promotion, get_session):
     start_promotion(promotion, get_session)
     item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
     with patch(
-        "viseron.components.storage.check_tier.prepare_source_intent",
+        "viseron.components.storage.check_tier.publish_run_init",
         side_effect=RuntimeError("crash before marker"),
     ):
         with pytest.raises(RuntimeError, match="crash before marker"):
@@ -319,8 +324,9 @@ def test_database_failure_prevents_copy_writes(promotion, get_db_session):
 
 
 @pytest.mark.parametrize("acknowledgement_crash", [False, True])
+@pytest.mark.parametrize("reservation_change", [None, "deleted", "changed"])
 def test_copy_then_lost_callback_replays_and_releases(
-    promotion, get_db_session, monkeypatch, acknowledgement_crash
+    promotion, get_db_session, monkeypatch, acknowledgement_crash, reservation_change
 ):
     """Real copy/proof/index/release succeeds without observer or IPC delivery."""
 
@@ -381,6 +387,24 @@ def test_copy_then_lost_callback_replays_and_releases(
     handler._replay_pending_publications()
     event = handler._event_queue.get_nowait()
     assert isinstance(event, FileCreatedEvent) and event.src_path == str(promotion.dst)
+    assert not marker_for_source(promotion.src).exists()
+    if reservation_change is not None:
+        with get_db_session() as session:
+            pending = session.execute(select(PendingSegmentMove)).scalar_one()
+            if reservation_change == "deleted":
+                session.delete(pending)
+            else:
+                pending.metadata_record = dict(pending.metadata_record, file_key=43)
+            session.commit()
+        handler._schedule_journal_retry = Mock()
+        handler._on_created(event)
+        assert promotion.src.read_bytes() == b"video"
+        with get_db_session() as session:
+            source = session.execute(
+                select(Files).where(Files.path == str(promotion.src))
+            ).scalar_one()
+            assert source.file_key == 42
+        return
     if acknowledgement_crash:
 
         def fail_ack(*_args, **_kwargs):
@@ -572,3 +596,57 @@ def test_legacy_import_refuses_unreadable_archive(
             )
         assert session.execute(select(PendingSegmentMove)).first() is None
     assert promotion.src.exists() and promotion.dst.exists()
+
+
+def test_database_transfer_never_writes_a_ram_source_marker(promotion, get_db_session):
+    """The committed reservation protects the source before any NAS publication."""
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    with patch(
+        "viseron.components.storage.check_tier.prepare_source_intent",
+        side_effect=AssertionError("RAM source marker must not be written"),
+    ):
+        copy_file(
+            get_db_session,
+            item.src,
+            item.dst,
+            promotion.logger,
+            camera_identifier="camera",
+            publication_meta=item.publication_meta,
+            verify_readback=True,
+        )
+    assert not marker_for_source(promotion.src).exists()
+    receipt = json.loads(Path(marker_for_path(str(promotion.dst))).read_text())
+    assert receipt["version"] == 3
+    assert receipt["source_tracking"] == "database"
+    assert "source_intent" not in receipt
+    assert receipt["source_snapshot"]["source_db"] == item.publication_meta["source_db"]
+    assert receipt["copied_digest"] and receipt["init_digest"]
+    with pytest.raises(BlockingIOError, match="publication hold"):
+        delete_file(get_db_session, str(promotion.src), promotion.logger)
+    assert reclaim(pressure_config(promotion), get_db_session)["deleted"] == 0
+    assert promotion.src.read_bytes() == b"video"
+
+
+def test_existing_legacy_source_marker_is_reused(promotion, get_db_session):
+    """An upgrade can finish reservations started by the marker-writing version."""
+    item = interrupt_before_marker(promotion, get_db_session)
+    marker = prepare_source_intent(
+        item.src,
+        item.dst,
+        promotion.src.stat(),
+        item.publication_meta["file_key"],
+        source_db=item.publication_meta["source_db"],
+    )
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=item.publication_meta,
+    )
+    receipt = json.loads(Path(marker_for_path(item.dst)).read_text())
+    assert receipt["source_intent"] == str(marker)
+    assert "source_tracking" not in receipt
+    assert promotion.src.read_bytes() == promotion.dst.read_bytes() == b"video"

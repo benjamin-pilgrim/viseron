@@ -530,8 +530,6 @@ def test_real_cifs_recovery_after_ram_exhaustion(get_db_session, outage):
         _fill(ram)
         assert os.statvfs(ram).f_bavail == 0
         filler = ram / "external-filler"
-        with filler.open("r+b") as stream:
-            stream.truncate(filler.stat().st_size - 65536)
         with get_db_session() as session:
             row = session.execute(select(Files)).scalar_one()
             job = reserve(session, row, str(dst), 1, mount)

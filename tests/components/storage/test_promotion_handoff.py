@@ -1,5 +1,6 @@
 """Prompt, verified promotion from a full RAM tier, including active events."""
 
+import contextlib
 import errno
 import logging
 import os
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from watchdog.events import FileCreatedEvent
 
 from viseron.components.storage import check_tier
@@ -186,6 +188,7 @@ def test_busy_source_defers_before_destination_readback(promotion, get_db_sessio
             lambda _: True,
             lambda _: True,
             "/tmp/viseron-run-locks",
+            source_index_guard=Mock(side_effect=AssertionError("guard must not run")),
         )
     assert promotion.src.read_bytes() == b"video"
 
@@ -264,11 +267,7 @@ def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
         config["cameras"][0]["has_next"] = True
         _fill(ram)
         assert os.statvfs(ram).f_bavail == 0
-        # Leave only metadata headroom after proving native ENOSPC. Promotion
-        # must write its durable source receipt before it can safely free media.
-        filler = ram / "external-filler"
-        with filler.open("r+b") as stream:
-            stream.truncate(filler.stat().st_size - 64 * 1024)
+        # DB reservations and NAS receipts need no metadata headroom on RAM.
         plan = reclaim(config, get_db_session)
         assert {item["path"] for item in plan["promote"]} == {str(p) for p in paths}
         assert plan["deleted"] == 0
@@ -295,6 +294,7 @@ def test_full_ram_handoff_and_nas_recovery(get_db_session, tmp_path, outage):
             item = call.args[0]
             worker = Worker()
             worker._get_session = get_db_session
+            assert not marker_for_source(path).exists()
             if outage:
                 if control:
                     worker.work_input(item)  # Actual stopped Samba / CIFS failure.
@@ -403,3 +403,50 @@ def _copy_with_source_contention(worker, item, source_path):
     ):
         worker.work_input(item)
     assert item.deferred and item.error is None
+
+
+def test_database_transfer_recovers_crash_after_source_unlink(
+    promotion, get_db_session
+):
+    """A failed DB finalize after unlink retries from the retained NAS receipt."""
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=item.publication_meta,
+    )
+    target = _destination_handler(promotion.storage, promotion.dst.parents[2])
+    original = target._guard_source_index
+
+    @contextlib.contextmanager
+    def interrupted(*args, **kwargs):
+        with original(*args, **kwargs):
+
+            def fail():
+                raise SQLAlchemyError("crash after source unlink")
+
+            yield fail
+
+    event = FileCreatedEvent(str(promotion.dst))
+    with patch.object(target, "_guard_source_index", side_effect=interrupted):
+        target._on_created(event)
+    assert not promotion.src.exists()
+    assert promotion.dst.read_bytes() == b"video"
+    assert not marker_for_source(promotion.src).exists()
+    with get_db_session() as session:
+        assert session.execute(select(PendingSegmentMove)).first()
+        assert session.execute(
+            select(Files).where(Files.path == str(promotion.src))
+        ).first()
+    # A fresh handler models process restart, without the old retry cooldown.
+    target = _destination_handler(promotion.storage, promotion.dst.parents[2])
+    target._on_created(event)
+    with get_db_session() as session:
+        assert session.execute(select(PendingSegmentMove)).first() is None
+        assert [r.path for r in session.execute(select(Files)).scalars()] == [
+            str(promotion.dst)
+        ]
