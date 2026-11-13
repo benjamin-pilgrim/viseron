@@ -1352,6 +1352,8 @@ class TierHandler(FileSystemEventHandler):
         src_path = _src_path(event)
         if is_source_move_marker(src_path):
             return False
+        if not self._publication_ready():
+            raise StorageRetryLater(1.0)
         directory = os.path.dirname(src_path)
         if not is_run_directory(os.path.basename(directory)):
             self._on_created_impl(event)
@@ -1554,6 +1556,10 @@ class TierHandler(FileSystemEventHandler):
         except Exception:
             self._logger.exception("Pending publication failed: %s", src_path)
         return False
+
+    def _publication_ready(self) -> bool:
+        """Report whether this handler can safely index a publication."""
+        return True
 
     @contextlib.contextmanager
     def _guard_source_index(self, saved, source_present, *, file_meta):
@@ -1932,6 +1938,16 @@ class TierHandler(FileSystemEventHandler):
 
 class SegmentsTierHandler(TierHandler):
     """Handle the recorder tiers."""
+
+    def _publication_ready(self) -> bool:
+        """Wait for camera construction before indexing or releasing footage."""
+        try:
+            self._camera.recorder
+        except AttributeError as error:
+            if error.obj is self._camera and error.name == "_recorder":
+                return False
+            raise
+        return True
 
     def initialize(self) -> None:
         """Initialize recorder tier."""

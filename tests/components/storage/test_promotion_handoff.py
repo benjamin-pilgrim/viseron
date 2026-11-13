@@ -28,7 +28,11 @@ from viseron.components.storage.pending_journal import (
 from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
 from viseron.components.storage.source_move_intent import marker_for_source
-from viseron.components.storage.tier_handler import TierHandler, move_file as queue_move
+from viseron.components.storage.tier_handler import (
+    SegmentsTierHandler,
+    TierHandler,
+    move_file as queue_move,
+)
 
 from tests.components.storage.test_pressure_policy import (
     _configuration,
@@ -193,9 +197,9 @@ def test_busy_source_defers_before_destination_readback(promotion, get_db_sessio
     assert promotion.src.read_bytes() == b"video"
 
 
-def _destination_handler(storage, root):
+def _destination_handler(storage, root, handler_type=TierHandler):
     """Use real index/release logic with only event scheduling captured."""
-    handler = object.__new__(TierHandler)
+    handler = object.__new__(handler_type)
     handler._storage = storage
     handler._camera = SimpleNamespace(identifier="camera")
     handler._tier_id = 1
@@ -210,6 +214,60 @@ def _destination_handler(storage, root):
     handler._journal_retry_lock = threading.Lock()
     handler._journal_reported_issues = set()
     return handler
+
+
+def test_publication_waits_for_recorder_before_index_and_source_release(
+    promotion, get_db_session, caplog
+):
+    """Startup replay retains both copies until the camera recorder is ready."""
+    start_promotion(promotion, get_db_session)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=item.publication_meta,
+    )
+    target = _destination_handler(
+        promotion.storage, promotion.dst.parents[2], SegmentsTierHandler
+    )
+
+    class StartingCamera:
+        identifier = "camera"
+
+        @property
+        def recorder(self):
+            return self._recorder
+
+    target._camera = StartingCamera()
+    target.check_tier = lambda: target._camera.recorder.lookback
+    event = FileCreatedEvent(str(promotion.dst))
+
+    with caplog.at_level(logging.ERROR):
+        target._on_created(event)
+    assert "Pending publication failed" not in caplog.text
+    with get_db_session() as session:
+        assert [row.path for row in session.execute(select(Files)).scalars()] == [
+            str(promotion.src)
+        ]
+        assert session.execute(select(PendingSegmentMove)).first()
+    assert promotion.src.exists() and promotion.dst.exists()
+    assert os.path.exists(marker_for_path(str(promotion.dst)))
+    target._schedule_journal_retry.assert_called_once_with(
+        str(promotion.dst), delay=1.0
+    )
+
+    target._camera._recorder = SimpleNamespace(lookback=5)
+    target._on_created(event)
+    with get_db_session() as session:
+        assert [row.path for row in session.execute(select(Files)).scalars()] == [
+            str(promotion.dst)
+        ]
+        assert session.execute(select(PendingSegmentMove)).first() is None
+    assert not promotion.src.exists()
+    assert not os.path.exists(marker_for_path(str(promotion.dst)))
 
 
 @pytest.mark.parametrize(
