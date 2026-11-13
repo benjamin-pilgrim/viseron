@@ -1,6 +1,7 @@
 """Database test for the experimental publication journal."""
 
 import contextlib
+import errno
 import datetime
 import shutil
 import json
@@ -26,6 +27,7 @@ from viseron.components.storage.pending_journal import (
     release_indexed_source,
 )
 from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
+import viseron.components.storage.source_move_intent as intents
 from viseron.components.storage.source_move_intent import (
     marker_for_source,
     prepare_source_intent,
@@ -1034,3 +1036,74 @@ def test_retry_rejects_replaced_source_database_identity(tmp_path):
             source_db={"id": 2, "tier_id": 0, "tier_path": "/tier0"},
         )
     assert src.read_bytes() == b"video"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(errno.ENOSPC, "No space left on device"),
+        SystemExit("worker interrupted"),
+    ],
+)
+def test_source_intent_write_failure_does_not_publish_empty_hold(tmp_path, failure):
+    """An interrupted initial write must remain retryable without manual repair."""
+
+    source = tmp_path / "1.m4s"
+    source.write_bytes(b"video")
+    target = tmp_path / "nas" / source.name
+    original = intents.os.fdopen
+
+    @contextlib.contextmanager
+    def failing_writer(*args, **kwargs):
+        with original(*args, **kwargs) as stream:
+            proxy = Mock(wraps=stream)
+            proxy.write.side_effect = failure
+            yield proxy
+
+    with patch.object(intents.os, "fdopen", side_effect=failing_writer):
+        with pytest.raises(type(failure)):
+            prepare_source_intent(source, target, source.stat(), 42)
+    assert not marker_for_source(source).exists()
+    marker = prepare_source_intent(source, target, source.stat(), 42)
+    assert json.loads(marker.read_text())["file_key"] == 42
+    assert source.read_bytes() == b"video"
+
+
+
+def test_source_intent_retries_after_real_ram_exhaustion():
+    """Actual ENOSPC must not leave the canonical marker empty or partial."""
+    from tests.components.storage.test_pressure_policy import (  # noqa: PLC0415
+        _fill,
+        _pressure_directory,
+    )
+
+    with _pressure_directory() as root:
+        source = root / "1.m4s"
+        source.write_bytes(b"video")
+        target = root / "nas" / source.name
+        _fill(root)
+        try:
+            with pytest.raises(OSError) as error:
+                prepare_source_intent(source, target, source.stat(), 42)
+            assert error.value.errno == errno.ENOSPC
+            assert not marker_for_source(source).exists()
+        finally:
+            (root / "external-filler").unlink()
+        marker = prepare_source_intent(source, target, source.stat(), 42)
+        assert json.loads(marker.read_text())["file_key"] == 42
+        assert source.read_bytes() == b"video"
+
+
+def test_source_intent_never_replaces_conflicting_intent(tmp_path):
+    """Atomic publication retains existing evidence and never adopts corruption."""
+    source = tmp_path / "1.m4s"
+    source.write_bytes(b"video")
+    marker = marker_for_source(source)
+    marker.write_bytes(b"")
+    with pytest.raises(ValueError, match="incomplete source move intent"):
+        prepare_source_intent(source, tmp_path / "nas" / source.name, source.stat(), 42)
+    assert marker.read_bytes() == b""
+    marker.write_text('{"different": true}')
+    with pytest.raises(ValueError, match="conflicting source move intent"):
+        prepare_source_intent(source, tmp_path / "nas" / source.name, source.stat(), 42)
+    assert json.loads(marker.read_text()) == {"different": True}

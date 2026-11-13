@@ -45,9 +45,8 @@ def prepare_source_intent(src, dst, stat_result, file_key, *, source_db=None):
     if source_db is not None:
         record["source_db"] = source_db
     payload = json.dumps(record, sort_keys=True).encode()
-    try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
+
+    def existing_intent():
         try:
             existing = json.loads(marker.read_text())
             existing.pop("sha256", None)
@@ -57,12 +56,27 @@ def prepare_source_intent(src, dst, stat_result, file_key, *, source_db=None):
         if existing != json.loads(payload):
             raise ValueError("conflicting source move intent")
         return marker
-    with os.fdopen(fd, "wb") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    sync_dir(marker.parent)
-    return marker
+
+    if os.path.lexists(marker):
+        return existing_intent()
+    # A full tier or process interruption must not publish an empty hold. The
+    # private file is durable before its complete inode becomes discoverable.
+    fd, tmp = tempfile.mkstemp(prefix=PREFIX + "preparing-", dir=marker.parent)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            os.link(tmp, marker)  # Atomic and never replaces another intent.
+        except FileExistsError:
+            return existing_intent()
+        os.unlink(tmp)
+        sync_dir(marker.parent)
+        return marker
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def set_source_digest(marker, digest, init_digest):
