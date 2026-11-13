@@ -1942,12 +1942,12 @@ class SegmentsTierHandler(TierHandler):
     def _publication_ready(self) -> bool:
         """Wait for camera construction before indexing or releasing footage."""
         try:
-            self._camera.recorder
+            recorder = self._camera.recorder
         except AttributeError as error:
             if error.obj is self._camera and error.name == "_recorder":
                 return False
             raise
-        return True
+        return recorder is not None
 
     def initialize(self) -> None:
         """Initialize recorder tier."""
