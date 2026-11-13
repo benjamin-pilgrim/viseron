@@ -75,12 +75,17 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_THUMBNAILS,
     CleanupJobNames,
 )
-from viseron.components.storage.segment_moves import (
-    acknowledge as acknowledge_segment_move,
-    finish_completed as finish_completed_segment_move,
-    protects as segment_move_pending,
-)
 from viseron.components.storage.dispatch_fence import create_token
+from viseron.components.storage.io_retry import (
+    FilesystemRetry,
+    PublicationRetry,
+    StorageRetryLater,
+)
+from viseron.components.storage.lost_source_recovery import (
+    LostSourceRecovery,
+    reconcile_asset as reconcile_lost_asset,
+    reconcile_segment as reconcile_lost_segment,
+)
 from viseron.components.storage.models import (
     FILE_KEY_SEQUENCE,
     Files,
@@ -100,8 +105,8 @@ from viseron.components.storage.pending_journal import (
     marker_for_path,
     protected_by_pending,
     publish_or_verify,
-    source_run_available,
     release_indexed_source,
+    source_run_available,
     sync_dir,
 )
 from viseron.components.storage.run_lifecycle import (
@@ -111,16 +116,17 @@ from viseron.components.storage.run_lifecycle import (
     is_run_directory,
     recording_camera_paths,
 )
-from viseron.components.storage.io_retry import (
-    FilesystemRetry,
-    PublicationRetry,
-    StorageRetryLater,
+from viseron.components.storage.segment_moves import (
+    acknowledge as acknowledge_segment_move,
+    finish_completed as finish_completed_segment_move,
+    protects as segment_move_pending,
 )
 from viseron.components.storage.source_move_intent import (
     is_source_move_marker,
     marker_for_source,
     source_move_pending,
 )
+from viseron.components.storage.startup_reconciliation import missing_volatile_path
 from viseron.components.storage.storage_subprocess import (
     DataItem,
     DataItemDeleteFile,
@@ -377,6 +383,14 @@ class TierHandler(FileSystemEventHandler):
                 and self._storage.tier_available(destination)
             ):
                 continue
+            if self._recover_lost_source(
+                source,
+                destination,
+                partial(
+                    self._recover_asset_source, file_id, source, destination, tier_path
+                ),
+            ):
+                continue
             try:
                 move_file(
                     self._vis,
@@ -393,6 +407,64 @@ class TierHandler(FileSystemEventHandler):
                 )
             except (OSError, SQLAlchemyError, StorageCallbackCapacityError):
                 self._logger.warning("Deferred asset move for %s", source)
+
+    def _recover_asset_source(self, file_id, source, destination, tier_path):
+        """Inspect lost assets only after ordinary replay's local source check."""
+        if not missing_volatile_path(source, self._tier[CONFIG_PATH]):
+            return None
+        tiers = self._storage.camera_tier_handlers[self._camera.identifier][
+            self._category
+        ]
+        target = next(
+            (
+                group[self._subcategory]
+                for group in tiers[self._tier_id + 1 :]
+                if self._subcategory in group
+                and group[self._subcategory].tier[CONFIG_PATH] == tier_path
+                and os.path.dirname(destination)
+                == os.path.abspath(group[self._subcategory]._path)
+            ),
+            None,
+        )
+        if target is None:
+            return "deferred"
+        return reconcile_lost_asset(
+            self._storage.get_session,
+            file_id,
+            source_tier=self._tier[CONFIG_PATH],
+            source_root=self._path,
+            destination_tier=target.tier[CONFIG_PATH],
+            destination_root=target._path,
+            destination_id=target._tier_id,
+            available=self._storage.tier_available,
+            markers=self._storage.config.get(CONFIG_TIER_MARKERS, {}),
+        )
+
+    def _recover_segment_source(self, move, destination):
+        """Keep mount probes and uncertain evidence inside shared retry gates."""
+        if move.metadata_record["source_db"]["tier_id"] != self._tier_id:
+            return "deferred"
+        if not missing_volatile_path(
+            move.source, move.metadata_record["source_db"]["tier_path"]
+        ):
+            return None
+        return reconcile_lost_segment(
+            self._storage.get_session,
+            move,
+            source_tier=self._tier[CONFIG_PATH],
+            source_root=self._path,
+            destination_tier=destination.tier[CONFIG_PATH],
+            destination_root=destination._path,
+            destination_id=destination._tier_id,
+            available=self._storage.tier_available,
+            markers=self._storage.config.get(CONFIG_TIER_MARKERS, {}),
+        )
+
+    def _recover_lost_source(self, source, destination, operation):
+        """Bound unavailable-filesystem probes and unchanged recovery failures."""
+        if not hasattr(self, "_lost_source_recovery"):
+            self._lost_source_recovery = LostSourceRecovery(self._logger)
+        return self._lost_source_recovery.attempt(source, destination, operation)
 
     def _asset_destination_pending(self, path: str) -> bool:
         with self._storage.get_session() as session:
@@ -477,6 +549,12 @@ class TierHandler(FileSystemEventHandler):
                         "Pending segment destination is not configured: %s",
                         move.destination,
                     )
+                    continue
+                if self._recover_lost_source(
+                    move.source,
+                    move.destination,
+                    partial(self._recover_segment_source, move, destination),
+                ):
                     continue
                 try:
                     with camera_lock("/tmp/viseron-run-locks", move.destination_root):

@@ -4,10 +4,10 @@ import logging
 import os
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
-from viseron.components.storage.asset_moves import asset_locks
-from viseron.components.storage.models import Files
+from viseron.components.storage.asset_moves import ASSET_FIELDS, asset_locks
+from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.run_lifecycle import camera_lock, is_run_directory
 from viseron.components.storage.util import tier_markers_available
 
@@ -110,16 +110,34 @@ def reconcile_volatile_files(get_session, tier_markers=None) -> int:
                             os.stat(path, follow_symlinks=False)
                         except FileNotFoundError:
                             with get_session() as session:
-                                result = session.execute(
-                                    delete(Files).where(
+                                retired = session.execute(
+                                    delete(Files)
+                                    .where(
                                         Files.id == file_id,
                                         Files.path == path,
                                         Files.tier_path == root,
                                         Files.move_target.is_(None),
                                     )
-                                )
+                                    .returning(
+                                        Files.camera_identifier,
+                                        Files.category,
+                                        Files.subcategory,
+                                    )
+                                ).one_or_none()
+                                if retired is not None:
+                                    camera, category, kind = retired
+                                    if category == "recorder" and kind in ASSET_FIELDS:
+                                        field = getattr(Recordings, ASSET_FIELDS[kind])
+                                        session.execute(
+                                            update(Recordings)
+                                            .where(
+                                                Recordings.camera_identifier == camera,
+                                                field == path,
+                                            )
+                                            .values({field: None})
+                                        )
+                                    removed += 1
                                 session.commit()
-                                removed += result.rowcount
                 except OSError:
                     LOGGER.warning("Deferred volatile file reconciliation for %s", path)
         if removed:
@@ -131,3 +149,40 @@ def reconcile_volatile_files(get_session, tier_markers=None) -> int:
             )
         deleted += removed
     return deleted
+
+
+def missing_volatile_path(path: str, tier_path: str) -> bool:
+    """Prove local absence only on the exact configured, still-mounted RAM tier."""
+    root, path = os.path.abspath(tier_path), os.path.abspath(path)
+    filesystems = _mount_filesystems()
+    if filesystems.get(root) != "tmpfs" or os.path.commonpath((root, path)) != root:
+        return False
+    if any(
+        mount != root
+        and mount.startswith(root.rstrip("/") + "/")
+        and (path == mount or path.startswith(mount.rstrip("/") + "/"))
+        for mount in filesystems
+    ):
+        return False
+    if os.path.realpath(path) != path or not Path(root).is_dir():
+        return False
+    try:
+        os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def recovery_destination_available(camera_root: str, tier_path: str, available) -> bool:
+    """An empty fallback directory cannot establish absence on a missing share.
+
+    Require an explicit configured tier mount (or category mount for the root
+    tier). Unknown mount layouts retain their work for manual investigation.
+    """
+    root = os.path.abspath(tier_path)
+    anchor = str(Path(camera_root).parent) if root == "/" else root
+    if anchor not in _mount_filesystems() or not available(camera_root):
+        return False
+    return Path(anchor).is_dir() and os.path.realpath(camera_root) == os.path.abspath(
+        camera_root
+    )

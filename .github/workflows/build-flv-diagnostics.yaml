@@ -18,6 +18,7 @@ on:
       - tests/components/storage/test_polling.py
       - tests/components/storage/test_segment_moves.py
       - tests/components/storage/test_promotion_handoff.py
+      - tests/components/storage/test_lost_source_recovery.py
       - .github/workflows/build-flv-diagnostics.yaml
   workflow_dispatch:
 
@@ -102,6 +103,7 @@ jobs:
               tests/components/storage/test_hold_retry.py \
               tests/components/storage/test_segment_moves.py \
               tests/components/storage/test_promotion_handoff.py \
+              tests/components/storage/test_lost_source_recovery.py \
               tests/components/storage/test_journal_db_prototype.py \
               tests/components/storage/test_pressure_policy.py \
               tests/components/storage/test_migrations.py \
