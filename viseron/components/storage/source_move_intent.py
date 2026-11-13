@@ -1,14 +1,22 @@
 """Experimental durable source-move intents; fail closed on ambiguity."""
 
+import datetime
 import json
+import re
+import stat
 import os
 import tempfile
 import time
 from pathlib import Path
 from viseron.components.storage.pending_journal import sync_dir
+from viseron.helpers.recording_timing_contract import (
+    TIMING_CONTRACT_CONTENT,
+    TIMING_CONTRACT_FILE,
+)
 
 PREFIX = ".viseron-source-move-"
 HOLD_WARNING_SECONDS = 300
+MAX_SOURCE_TIMING_DURATION = 86400
 
 
 def marker_for_source(path):  # noqa: D103
@@ -320,3 +328,36 @@ def cancel_abandoned_source_intent(
         return "busy"
     except (OSError, ValueError, KeyError, TypeError):
         return "retry"
+
+
+def read_source_intent_time(fragment: Path, destination: Path):
+    """Recover observed timing from an interrupted first publication's hold."""
+    try:
+        if (fragment.parent / TIMING_CONTRACT_FILE).read_text(
+            encoding="utf-8"
+        ) != TIMING_CONTRACT_CONTENT:
+            return None
+        record = json.loads(marker_for_source(fragment).read_text())
+        timing = record["source_timing"]
+        timestamp = datetime.datetime.fromisoformat(timing["program_date_time"])
+        duration = float(timing["duration"])
+        info = fragment.stat(follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+        digest = timing.get("sha256")
+        if (
+            record["version"] != 1
+            or record["source"] != os.path.abspath(fragment)
+            or record["destination"] != os.path.abspath(destination)
+            or record.get("file_key") is not None
+            or record.get("source_db") is not None
+            or [record[k] for k in ("dev", "ino", "size", "mtime_ns")] != identity
+            or timestamp.utcoffset() is None
+            or not 0 < duration < MAX_SOURCE_TIMING_DURATION
+            or (digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest))
+        ):
+            return None
+        return timestamp.astimezone(datetime.timezone.utc), duration, identity, digest
+    except (OSError, ValueError, TypeError, KeyError):
+        return None

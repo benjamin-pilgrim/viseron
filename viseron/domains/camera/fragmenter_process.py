@@ -37,14 +37,12 @@ from viseron.components.storage.run_lifecycle import (
 )
 from viseron.components.storage.source_move_intent import (
     prepare_source_intent,
+    read_source_intent_time,
     source_move_pending,
 )
 from viseron.components.storage.util import TIER_MOVE_TEMP_PREFIX, require_tier_markers
 from viseron.domains.camera.const import MP4BOX_PATH
-from viseron.domains.camera.playlist_timing import (
-    read_playlist_time,
-    read_source_intent_time,
-)
+from viseron.domains.camera.playlist_timing import read_playlist_time
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
 from viseron.helpers.logs import LogPipe

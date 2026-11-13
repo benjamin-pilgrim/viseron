@@ -31,6 +31,7 @@ from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
 from viseron.components.storage.source_move_intent import (
     marker_for_source,
     prepare_source_intent,
+    read_source_intent_time,
 )
 from viseron.components.storage.tier_handler import (
     SegmentsTierHandler,
@@ -39,7 +40,6 @@ from viseron.components.storage.tier_handler import (
 )
 
 from viseron.domains.camera.fragmenter_process import FragmenterWork
-from viseron.domains.camera.playlist_timing import read_source_intent_time
 
 from tests.components.storage.test_pressure_policy import (
     _configuration,
