@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 import voluptuous as vol
+from sqlalchemy import create_engine, select
 
 from viseron.components.storage import pressure
 from viseron.components.storage.check_tier import Worker
@@ -34,6 +35,103 @@ from viseron.helpers.recording_timing_contract import (
     TIMING_CONTRACT_CONTENT,
     TIMING_CONTRACT_FILE,
 )
+
+
+def _real_pressure_child(config, output):
+    """Run the production worker against this test's PostgreSQL database."""
+    pressure.ENGINE = create_engine(config["test_db_url"])
+    if config["test_sync_error"]:
+
+        def fail_sync(_path):
+            raise OSError(errno.EIO, "injected failure after unlink")
+
+        pressure.sync_dir = fail_sync
+    try:
+        pressure.run_pressure(config, output)
+    finally:
+        pressure.ENGINE.dispose()
+
+
+@pytest.mark.parametrize("sync_error", [False, True])
+def test_pressure_deletion_audit_crosses_worker_boundary(
+    get_db_session, tmp_path, monkeypatch, caplog, sync_error
+):
+    """An actual child unlink is observable even if later filesystem work fails."""
+    path = _record(
+        get_db_session,
+        tmp_path,
+        "camera",
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1),
+        1024,
+    )
+    config = _configuration(tmp_path, "preserve_events", maximum=1)
+    config["cameras"][0]["has_next"] = False
+    config["test_db_url"] = get_db_session.kw["bind"].url.render_as_string(
+        hide_password=False
+    )
+    config["test_sync_error"] = sync_error
+    monkeypatch.setattr(
+        "viseron.components.storage.pressure_manager.run_pressure", _real_pressure_child
+    )
+    storage = SimpleNamespace(
+        pending_moves={},
+        pending_moves_lock=threading.Lock(),
+        camera_tier_handlers={"camera": {"recorder": [{}]}},
+    )
+    manager = PressureManager(storage)
+    manager.configurations = lambda: {str(tmp_path): config}
+    with caplog.at_level(logging.INFO, logger=pressure.__name__):
+        try:
+            manager.poll()
+            deadline = time.monotonic() + 30
+            while str(tmp_path) not in manager.status and time.monotonic() < deadline:
+                time.sleep(0.02)
+                manager.poll()
+            assert str(tmp_path) in manager.status
+            assert not path.exists()
+            with get_db_session() as session:
+                rows = session.execute(select(Files)).scalars().all()
+                assert bool(rows) == sync_error
+            audits = [
+                record.getMessage()
+                for record in caplog.records
+                if "Pressure reclaimed" in record.getMessage()
+            ]
+            assert len(audits) == 1
+            assert str(path) in audits[0]
+            assert "policy=preserve_events" in audits[0]
+            assert "event=False" in audits[0]
+            assert "bytes=1024" in audits[0]
+            if not sync_error:
+                assert manager.status[str(tmp_path)]["state"] == "normal"
+        finally:
+            manager.stop()
+
+
+def test_dead_audit_channel_stops_further_pressure_deletions(
+    get_db_session, tmp_path, monkeypatch
+):
+    """An orphaned worker stops deleting when it cannot report to its parent."""
+    now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    paths = [
+        _record(get_db_session, tmp_path, "camera", now, 1024),
+        _record(
+            get_db_session,
+            tmp_path,
+            "camera",
+            now + datetime.timedelta(seconds=5),
+            1024,
+        ),
+    ]
+    monkeypatch.setattr(pressure, "ENGINE", get_db_session.kw["bind"])
+    output = Mock()
+    output.send.side_effect = BrokenPipeError(errno.EPIPE, "parent stopped")
+    with pytest.raises(BrokenPipeError):
+        pressure.run_pressure(
+            _configuration(tmp_path, "preserve_events", maximum=1), output
+        )
+    assert not paths[0].exists()
+    assert paths[1].exists()
 
 
 def test_simple_retention_and_full_disk_policy():

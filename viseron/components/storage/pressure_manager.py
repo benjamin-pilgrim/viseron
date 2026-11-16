@@ -5,7 +5,7 @@ import os
 import threading
 import time
 
-from viseron.components.storage.pressure import run_pressure
+from viseron.components.storage.pressure import log_reclaimed, run_pressure
 from viseron.components.storage.startup_reconciliation import volatile_roots
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.helpers.child_process_context import get_child_process_context
@@ -93,7 +93,13 @@ class PressureManager:
                 try:
                     # Drain before joining: a promotion result can exceed the
                     # pipe buffer while its child is still finishing send().
-                    self.results[path] = connection.recv()
+                    while connection.poll():
+                        message = connection.recv()
+                        if message.get("type") == "reclaimed":
+                            log_reclaimed(message)
+                            continue
+                        self.results[path] = message
+                        break
                 except EOFError:
                     self.results[path] = {
                         "state": "unavailable",

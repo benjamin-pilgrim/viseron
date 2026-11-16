@@ -231,7 +231,18 @@ def _candidates(config, session, staged):
     return ranked[:BATCH], len(rows)
 
 
-def reclaim(config, get_session, *, free_space=None):
+def log_reclaimed(record):
+    """Report an actual unlink through the caller's configured log handlers."""
+    LOGGER.info(
+        "Pressure reclaimed %s (policy=%s, event=%s, bytes=%s)",
+        record["path"],
+        record["policy"],
+        record["event"],
+        record["bytes"],
+    )
+
+
+def reclaim(config, get_session, *, free_space=None, on_reclaimed=None):
     """Inspect and reclaim one bounded batch; callers isolate remote filesystems."""
     probe = config["probe"]
     require_tier_markers(probe, config.get("markers", {}))
@@ -334,12 +345,14 @@ def reclaim(config, get_session, *, free_space=None):
                     ).first():
                         continue
                 os.unlink(path)
-                LOGGER.info(
-                    "Pressure reclaimed %s (policy=%s, event=%s, bytes=%s)",
-                    path,
-                    config["policy"],
-                    bool(events),
-                    candidate["identity"][2],
+                (on_reclaimed or log_reclaimed)(
+                    {
+                        "type": "reclaimed",
+                        "path": path,
+                        "policy": config["policy"],
+                        "event": bool(events),
+                        "bytes": candidate["identity"][2],
+                    }
                 )
                 sync_dir(os.path.dirname(path))
                 if row is not None:
@@ -384,8 +397,17 @@ def reclaim(config, get_session, *, free_space=None):
 
 def run_pressure(config, output):
     """One isolated root check: a stalled NAS cannot block local reclamation."""
+
+    def audit(record):
+        # Send before fsync/DB commit so a later failure cannot hide the unlink.
+        # A dead parent channel must stop this child from deleting more files.
+        try:
+            output.send(record)
+        except OSError as error:
+            raise RuntimeError("Pressure audit channel unavailable") from error
+
     try:
-        output.send(reclaim(config, sessionmaker(bind=ENGINE)))
+        output.send(reclaim(config, sessionmaker(bind=ENGINE), on_reclaimed=audit))
     except Exception as error:  # Child reports an unavailable root, never guesses.
         output.send(
             {"state": "unavailable", "deleted": 0, "error": str(error), "offset": 0}
