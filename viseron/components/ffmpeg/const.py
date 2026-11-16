@@ -220,6 +220,7 @@ CONFIG_FFPROBE_LOGLEVEL = "ffprobe_loglevel"
 CONFIG_RECORDER = "recorder"
 CONFIG_RAW_COMMAND = "raw_command"
 CONFIG_RECORD_ONLY = "record_only"
+CONFIG_FPS_BEFORE_FILTERS = "fps_before_filters"
 
 DEFAULT_USERNAME: Final = None
 DEFAULT_PASSWORD: Final = None
@@ -241,6 +242,7 @@ DEFAULT_FFMPEG_RECOVERABLE_ERRORS = [
 DEFAULT_FFPROBE_LOGLEVEL = "error"
 DEFAULT_RAW_COMMAND: Final = None
 DEFAULT_RECORD_ONLY = False
+DEFAULT_FPS_BEFORE_FILTERS = False
 
 DESC_CAMERA = "Camera domain config."
 DESC_HOST = "IP or hostname of camera."
@@ -278,4 +280,10 @@ DESC_RECORD_ONLY = (
     "like object detection.<br>"
     "Be aware that this will record the main stream, making substream redundant. "
     "Still images will not work either unless you have setup `still_image`."
+)
+
+DESC_FPS_BEFORE_FILTERS = (
+    "Reduce detection frame rate before applying video_filters to reduce CPU usage. "
+    "Keep disabled for filters that need every source frame. "
+    "Does not affect recorder video filters."
 )

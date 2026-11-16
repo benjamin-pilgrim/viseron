@@ -9,7 +9,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 import voluptuous as vol
 
-from viseron.components.ffmpeg.camera import RECORDER_SCHEMA
+from viseron.components.ffmpeg.camera import CAMERA_SCHEMA, RECORDER_SCHEMA
 from viseron.components.ffmpeg.const import (
     CONFIG_AUDIO_CODEC,
     CONFIG_CODEC,
@@ -528,3 +528,36 @@ def test_recorder_timestamp_mode_schema():
     assert RECORDER_SCHEMA({"timestamp_mode": "source"})["timestamp_mode"] == "source"
     with pytest.raises(vol.Invalid):
         RECORDER_SCHEMA({"timestamp_mode": "invalid"})
+
+
+@pytest.mark.parametrize(
+    "early, output_fps, expected",
+    [
+        (None, 1.0, "transpose=1,scale=1920:2560,format=yuv420p,fps=1.0"),
+        (False, 1.0, "transpose=1,scale=1920:2560,format=yuv420p,fps=1.0"),
+        (True, 1.0, "fps=1.0,transpose=1,scale=1920:2560,format=yuv420p"),
+        (True, 30, "transpose=1,scale=1920:2560,format=yuv420p"),
+    ],
+)
+def test_detection_frame_reduction_order(early, output_fps, expected):
+    """Opt-in early reduction uses one FPS stage; defaults preserve filter order."""
+    config = {
+        **CONFIG,
+        "name": "Test camera",
+        "video_filters": ["transpose=1", "scale=1920:2560", "format=yuv420p"],
+    }
+    if early is not None:
+        config["fps_before_filters"] = early
+    config = CAMERA_SCHEMA(config)
+    with (
+        patch.object(
+            FFprobe, "stream_information", return_value=(2560, 1440, 30, "h264", "aac")
+        ),
+        patch.object(Stream, "create_symlink"),
+    ):
+        stream = Stream(config, MockCamera(config=config), "test_camera_identifier")
+        stream.output_fps = output_fps
+        command = stream.build_command()
+    assert command.count("-vf") == 1
+    assert command[command.index("-vf") + 1] == expected
+    assert command[command.index("-c:v") + 1] == "copy"

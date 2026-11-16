@@ -3194,6 +3194,13 @@
                 "description": "Only record the camera stream, do not process it. This is useful if you only want to record the stream and not do any processing like object detection.<br>Be aware that this will record the main stream, making substream redundant. Still images will not work either unless you have setup `still_image`.",
                 "optional": true,
                 "default": false
+              },
+              {
+                "type": "boolean",
+                "name": "fps_before_filters",
+                "description": "Reduce detection frame rate before applying video_filters to reduce CPU usage. Keep disabled for filters that need every source frame. Does not affect recorder video filters.",
+                "optional": true,
+                "default": false
               }
             ],
             "name": {
