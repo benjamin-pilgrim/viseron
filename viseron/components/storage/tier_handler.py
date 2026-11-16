@@ -1575,9 +1575,7 @@ class TierHandler(FileSystemEventHandler):
                 return
             _lock_path(session, snapshot["source"])
             row = session.execute(
-                select(Files)
-                .where(Files.path == snapshot["source"])
-                .with_for_update()
+                select(Files).where(Files.path == snapshot["source"]).with_for_update()
             ).scalar_one_or_none()
             if row is None:
                 yield (None if source_present else lambda: None)
@@ -1604,7 +1602,19 @@ class TierHandler(FileSystemEventHandler):
             yield finalize
 
     def _complete_pending_move(self, pending, pending_moves, record, src_path):
-        """Deliver an in-memory completion only after the durable handoff."""
+        """Deliver completion only after the verified, durable handoff."""
+        source_db = record["meta"].get("source_db")
+        source_root = (
+            source_db.get("tier_path") if isinstance(source_db, dict) else None
+        )
+        manager = getattr(self._storage, "pressure_manager", None)
+        if (
+            self._category == TIER_CATEGORY_RECORDER
+            and manager is not None
+            and isinstance(source_root, str)
+            and source_root != self._tier[CONFIG_PATH]
+        ):
+            manager.promotion_completed(source_root)
         if pending is not None:
             completed_pending = None
             with self._storage.pending_moves_lock:

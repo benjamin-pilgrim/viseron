@@ -1,8 +1,10 @@
 """Test the query functions."""
 
 import datetime
+import errno
+import tracemalloc
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from croniter import croniter
@@ -18,8 +20,14 @@ from viseron.components.storage.check_tier import (
     load_recordings,
     load_tier,
 )
-from viseron.components.storage.models import Recordings
-from viseron.components.storage.storage_subprocess import DataItem
+from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.run_lifecycle import CameraLockBusy
+from viseron.components.storage.source_move_intent import marker_for_source
+from viseron.components.storage.storage_subprocess import (
+    DataItem,
+    DataItemMoveFile,
+    DataItemDeleteFile,
+)
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_active
 
@@ -468,7 +476,8 @@ class TestCheckTier(BaseTestWithRecordings):
             camera_identifier="test",
         )
         with patch(
-            "viseron.components.storage.check_tier.utcnow", return_value=self._simulated_now
+            "viseron.components.storage.check_tier.utcnow",
+            return_value=self._simulated_now,
         ):
             recordings_data = load_recordings(
                 get_session=self._get_db_session,
@@ -493,11 +502,15 @@ class TestCheckTier(BaseTestWithRecordings):
             for row in files_to_move
         )
 
-    def test_eligible_event_does_not_move_fragment_shared_with_retained_event(self) -> None:
+    def test_eligible_event_does_not_move_fragment_shared_with_retained_event(
+        self,
+    ) -> None:
         """Old-event retention leaves a shared segment for the newer event."""
         with self._get_db_session() as session:
             session.execute(
-                update(Recordings).where(Recordings.id == 3).values(
+                update(Recordings)
+                .where(Recordings.id == 3)
+                .values(
                     adjusted_start_time=self._now + datetime.timedelta(seconds=7),
                     start_time=self._now + datetime.timedelta(seconds=10),
                     end_time=self._now + datetime.timedelta(seconds=20),
@@ -1408,11 +1421,6 @@ class TestCheckTierIntegration(BaseTestWithRecordings):
 
 def test_move_lock_contention_is_deferred_but_io_errors_are_reported(caplog):
     """Only our known camera lock contention is retryable without an error."""
-    import errno
-    from unittest.mock import Mock
-
-    from viseron.components.storage.run_lifecycle import CameraLockBusy
-    from viseron.components.storage.storage_subprocess import DataItemMoveFile
 
     worker = Worker.__new__(Worker)
     worker.move_file = Mock(side_effect=CameraLockBusy(errno.EAGAIN, "busy"))
@@ -1430,9 +1438,6 @@ def test_move_lock_contention_is_deferred_but_io_errors_are_reported(caplog):
 
 def test_normal_scan_defers_durable_hold_to_recovery(tmp_path):
     """Ordinary scans cannot duplicate a move being replayed after restart."""
-    from unittest.mock import Mock
-    from viseron.components.storage.source_move_intent import marker_for_source
-    from viseron.components.storage.storage_subprocess import DataItemMoveFile
 
     src = str(tmp_path / "fragment.m4s")
     marker_for_source(src).write_text("incomplete")
@@ -1445,17 +1450,15 @@ def test_normal_scan_defers_durable_hold_to_recovery(tmp_path):
     retry = DataItemMoveFile(
         cmd="move_file", src=src, dst="destination", dispatch_token="live"
     )
-    with patch("viseron.components.storage.check_tier.token_permits_start", return_value=True):
+    with patch(
+        "viseron.components.storage.check_tier.token_permits_start", return_value=True
+    ):
         worker.work_input(retry)
     worker.move_file.assert_called_once_with(retry)
 
 
 def test_delete_camera_lock_contention_is_deferred(caplog):
     """Retry expected lock competition, while real I/O errors remain errors."""
-    import errno
-    from unittest.mock import Mock
-    from viseron.components.storage.run_lifecycle import CameraLockBusy
-    from viseron.components.storage.storage_subprocess import DataItemDeleteFile
 
     worker = Worker.__new__(Worker)
     worker.delete_file = Mock(side_effect=CameraLockBusy(errno.EAGAIN, "busy"))
@@ -1474,13 +1477,99 @@ def test_recording_retention_matches_recorder_run():
     run_a = "20260101T000000.000000Z-aaaaaaaaaaaa"
     run_b = "20260101T000001.000000Z-bbbbbbbbbbbb"
     files = np.array(
-        [(1, 10, 100, f"/segments/{run_a}/one.m4s", "/tier"),
-         (2, 10, 100, f"/segments/{run_b}/two.m4s", "/tier")],
+        [
+            (1, 10, 100, f"/segments/{run_a}/one.m4s", "/tier"),
+            (2, 10, 100, f"/segments/{run_b}/two.m4s", "/tier"),
+        ],
         dtype=FILES_DTYPE,
     )
     for run_id, expected in [(run_b, {1: -1, 2: 7}), ("", {1: 7, 2: 7})]:
-        recordings = np.array([(7, 100, 90, 110, 100, run_id, False)], dtype=RECORDINGS_DTYPE)
+        recordings = np.array(
+            [(7, 100, 90, 110, 100, run_id, False)], dtype=RECORDINGS_DTYPE
+        )
         result = get_recordings_to_move(
             recordings, files.copy(), 5, 1, 200, 0, 0, 200, False
         )
         assert {int(row["id"]): int(row["recording_id"]) for row in result} == expected
+
+
+def test_unlimited_combined_retention_check_has_bounded_memory(get_db_session):
+    """A no-op archive check must fit 2 MiB without materializing its history."""
+    timestamp = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    with get_db_session() as session:
+        session.add_all(
+            Files(
+                camera_identifier="archive",
+                tier_id=1,
+                tier_path="/nas",
+                category="recorder",
+                subcategory="segments",
+                size=1024,
+                orig_ctime=timestamp + datetime.timedelta(seconds=i * 5),
+                duration=5,
+                directory="/nas/archive/run",
+                filename=f"{i}.m4s",
+                path=f"/nas/archive/run/{i}.m4s",
+            )
+            for i in range(2000)
+        )
+        recording = Recordings(
+            camera_identifier="archive",
+            start_time=timestamp,
+            adjusted_start_time=timestamp,
+            end_time=timestamp + datetime.timedelta(seconds=30),
+            created_at=timestamp,
+        )
+        session.add(recording)
+        session.flush()
+        event_id = recording.id
+        session.commit()
+    worker = Worker()
+    worker._get_session = get_db_session
+
+    def item(events):
+        return DataItem(
+            cmd="check_tier",
+            camera_identifier="archive",
+            tier_id=1,
+            category="recorder",
+            subcategories=["segments"],
+            throttle_period=datetime.timedelta(0),
+            max_bytes=0,
+            min_age=datetime.timedelta(0),
+            max_age=datetime.timedelta(0),
+            min_bytes=0,
+            drain=False,
+            files_enabled=True,
+            events_enabled=events,
+            events_max_bytes=0,
+            events_min_bytes=0,
+            events_min_age=datetime.timedelta(0),
+            events_max_age=datetime.timedelta(0),
+        )
+
+    worker.work_input(item(False))  # Warm imports and the aggregate query cache.
+    request = item(True)
+    tracemalloc.start()
+    try:
+        worker.work_input(request)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert request.error is None
+    assert request.data is not None and len(request.data) == 0
+    assert request.retention_recording_ids == ()
+    assert peak < 2 * 1024**2, f"No-op retention check allocated {peak} bytes"
+
+    # Finite event limits must still authorize retirement even when continuous
+    # retention keeps all media. The memory shortcut must not skip that work.
+    for field, limit in (
+        ("events_max_age", datetime.timedelta(days=1)),
+        ("events_max_bytes", 1024),
+    ):
+        finite = item(True)
+        setattr(finite, field, limit)
+        worker.work_input(finite)
+        assert finite.error is None
+        assert finite.data is not None and len(finite.data) == 0
+        assert finite.retention_recording_ids == (event_id,)

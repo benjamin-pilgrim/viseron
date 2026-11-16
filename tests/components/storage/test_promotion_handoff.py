@@ -27,6 +27,7 @@ from viseron.components.storage.pending_journal import (
     release_indexed_source,
 )
 from viseron.components.storage.pressure import reclaim
+from viseron.components.storage.pressure_manager import PressureManager
 from viseron.components.storage.run_lifecycle import CameraLockBusy, camera_lock
 from viseron.components.storage.source_move_intent import (
     marker_for_source,
@@ -46,6 +47,7 @@ from tests.components.storage.test_pressure_policy import (
     _fill,
     _pressure_directory,
     _record,
+    _real_pressure_child,
     _staged,
 )
 from tests.components.storage.test_segment_moves import (
@@ -651,3 +653,136 @@ def test_held_timing_requires_original_source_and_valid_observation(tmp_path, mu
         record["source_timing"]["sha256"] = "invalid"
     marker.write_text(json.dumps(record))
     assert read_source_intent_time(source, destination) is None
+
+
+@pytest.mark.parametrize(
+    "admission_failure,acknowledge",
+    [(None, True), (16, True), (18, True), ("unavailable", True), (None, False)],
+)
+def test_recording_during_successful_promotion_does_not_trigger_eviction(
+    get_db_session, tmp_path, monkeypatch, admission_failure, acknowledge
+):
+    """Acknowledged NAS copies count as progress even if recording refills RAM."""
+    clock = [100.0]
+    monkeypatch.setattr(
+        "viseron.components.storage.pressure_manager.time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    monkeypatch.setattr(
+        "viseron.components.storage.pressure_manager.run_pressure", _real_pressure_child
+    )
+    with _pressure_directory() as ram:
+        nas = tmp_path / "nas"
+        nas.mkdir()
+        now = datetime.now(UTC) - timedelta(hours=1)
+        paths = [
+            _record(
+                get_db_session,
+                ram,
+                "camera",
+                now + timedelta(seconds=i * 5),
+                256 * 1024,
+                event=i == 19,
+            )
+            for i in range(20)
+        ]
+        source = SimpleNamespace(
+            _path=str(paths[0].parent.parent),
+            tier={"path": str(ram)},
+            _vis=Mock(),
+            _check_tier_lock=threading.Lock(),
+            _schedule_forced_tier_retry_locked=Mock(),
+        )
+        available = [True]
+        storage = SimpleNamespace(
+            get_session=get_db_session,
+            pending_moves={},
+            pending_moves_lock=threading.Lock(),
+            temporary_files_meta={},
+            tier_available=lambda _: available[0],
+            tier_check_worker_send_command=Mock(),
+            camera_requested_files_count={"camera": SimpleNamespace(filenames=[])},
+        )
+        if admission_failure:
+
+            def submit(*_args, **_kwargs):
+                if (
+                    admission_failure == "unavailable"
+                    and storage.tier_check_worker_send_command.call_count == 15
+                ):
+                    available[0] = False
+                if (
+                    storage.tier_check_worker_send_command.call_count
+                    == admission_failure
+                ):
+                    raise OSError(errno.EAGAIN, "injected transient queue failure")
+
+            storage.tier_check_worker_send_command.side_effect = submit
+        target = _destination_handler(storage, nas)
+        storage.camera_tier_handlers = {
+            "camera": {"recorder": [{"segments": source}, {"segments": target}]}
+        }
+        manager = PressureManager(storage)
+        storage.pressure_manager = manager
+        config = _configuration(ram, "preserve_events", maximum="80%")
+        config.update(
+            volatile=True,
+            test_db_url=get_db_session.kw["bind"].url.render_as_string(
+                hide_password=False
+            ),
+            test_sync_error=False,
+        )
+        config["cameras"][0]["has_next"] = True
+        manager.configurations = lambda: {str(ram): dict(config)}
+        _fill(ram)
+        assert os.statvfs(ram).f_bavail == 0
+
+        def wait_for(check):
+            deadline = time.monotonic() + 30
+            while not check() and time.monotonic() < deadline:
+                manager.poll()
+                time.sleep(0.02)
+            assert check()
+
+        try:
+            manager.poll()
+            submitted = 15 if admission_failure == "unavailable" else 16
+            wait_for(
+                lambda: storage.tier_check_worker_send_command.call_count == submitted
+            )
+            manager.promotions[str(ram)].join(timeout=5)
+            available[0] = True
+            clock[0] = 119
+            call = storage.tier_check_worker_send_command.call_args_list[0]
+            item = call.args[0]
+            worker = Worker()
+            worker._get_session = get_db_session
+            _copy_with_source_contention(worker, item, source._path)
+            assert paths[0].exists()  # No release before destination acknowledgement.
+            call.kwargs["callback"](item)
+            if acknowledge:
+                target._on_created(FileCreatedEvent(item.dst))
+                assert not paths[0].exists()
+                (ram / "incoming-recording").write_bytes(b"n" * (256 * 1024))
+            assert Path(item.dst).read_bytes() == b"x" * (256 * 1024)
+            assert os.statvfs(ram).f_bavail == 0
+            clock[0] = 120
+            manager.poll()
+            wait_for(lambda: str(ram) not in manager.pending)
+            manager.promotions[str(ram)].join(timeout=5)
+            clock[0] = 121
+            manager.poll()
+            wait_for(lambda: str(ram) not in manager.pending)
+            if not acknowledge:
+                assert paths[0].exists(), "Unacknowledged copy must retain its source"
+                assert paths[19].exists(), "Motion footage must remain preserved"
+                assert any(not p.exists() for p in paths[16:19])
+                return
+            for path in paths:
+                copies = [p for p in (path, nas / path.relative_to(ram)) if p.exists()]
+                assert copies, (
+                    f"Footage deleted despite successful NAS promotion: {path.name}"
+                )
+                assert all(p.read_bytes() == b"x" * (256 * 1024) for p in copies)
+        finally:
+            manager.stop()

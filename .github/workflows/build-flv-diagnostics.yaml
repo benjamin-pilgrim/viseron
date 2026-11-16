@@ -94,6 +94,7 @@ jobs:
               tests/components/ffmpeg/test_stream.py \
               tests/components/storage/test_polling.py \
               tests/components/storage/test_config.py \
+              tests/components/storage/test_check_tier.py \
               tests/components/storage/test_move_safety.py \
               tests/components/storage/test_tier_markers.py \
               tests/components/storage/test_hold_retry.py \

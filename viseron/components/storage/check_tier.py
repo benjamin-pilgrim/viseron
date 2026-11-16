@@ -47,6 +47,7 @@ from viseron.components.storage.io_retry import (
     StorageAttempt,
     StorageRetryLater,
 )
+from viseron.components.storage.run_init_prototype import ensure_init
 from viseron.components.storage.const import ENGINE
 from viseron.components.storage.models import Files, Recordings
 from viseron.components.storage.pressure import event_fence
@@ -282,6 +283,22 @@ class Worker:
             )
             files = self.check_tier_files(item)
 
+        if (
+            item.files_enabled
+            and item.events_enabled
+            and files.size == 0
+            and item.events_max_bytes == 0
+            and item.events_max_age == datetime.timedelta(0)
+            and item.events_min_bytes is not None
+            and item.events_min_age is not None
+        ):
+            # Combined checks intersect both selections. No file candidates and
+            # unlimited event retention authorize neither moves nor retirement.
+            # Do not materialize the entire archive for this empty result.
+            item.data = files
+            item.retention_recording_ids = ()
+            return
+
         recordings = np.empty(0, dtype=RECORDINGS_DTYPE)
         if item.cmd == "check_tier" and item.events_enabled:
             LOGGER.debug(
@@ -395,13 +412,16 @@ class Worker:
 
     def delete_file(self, item: DataItemDeleteFile) -> None:
         """Delete file."""
-        item.deferred = delete_file(
-            self._get_session,
-            item.src,
-            LOGGER,
-            tier_markers=item.tier_markers,
-            retention_recording_ids=item.retention_recording_ids,
-        ) is False
+        item.deferred = (
+            delete_file(
+                self._get_session,
+                item.src,
+                LOGGER,
+                tier_markers=item.tier_markers,
+                retention_recording_ids=item.retention_recording_ids,
+            )
+            is False
+        )
 
     def work_input(self, item: DataItem | DataItemMoveFile | DataItemDeleteFile):
         """Perform work on input item from child process."""
@@ -1122,8 +1142,6 @@ def publish_run_init(src: str, dst: str, tier_markers: dict[str, str]) -> None:
     # The marker ties the published init to this source and allows later
     # fragments to reuse it without a routine network readback. Existing
     # unmarked inits are adopted only after an exceptional content check.
-    from viseron.components.storage.run_init_prototype import ensure_init
-
     ensure_init(source_init, destination_dir, adopt_existing=True)
     require_tier_markers(source_init, tier_markers)
     require_tier_markers(destination_init, tier_markers)
@@ -1205,9 +1223,8 @@ def _move_file_locked(
                         session, src, dst, publication_meta
                     )
             source_stat = os.stat(src, follow_symlinks=False)
-            if (
-                "destination_tier_id" in publication_meta
-                and not source_move_pending(src)
+            if "destination_tier_id" in publication_meta and not source_move_pending(
+                src
             ):
                 source_snapshot = {
                     "source": os.path.abspath(src),
@@ -1221,7 +1238,10 @@ def _move_file_locked(
                 }
             else:
                 source_intent = prepare_source_intent(
-                    src, dst, source_stat, publication_meta.get("file_key"),
+                    src,
+                    dst,
+                    source_stat,
+                    publication_meta.get("file_key"),
                     source_db=publication_meta.get("source_db"),
                 )
     try:

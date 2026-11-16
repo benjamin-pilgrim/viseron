@@ -186,6 +186,11 @@ class PressureManager:
             send.close()
             self.pending[path] = (process, receive, now, config)
 
+    def promotion_completed(self, path):
+        """Count a verified handoff even when incoming recording refills its space."""
+        self.last_progress[path] = time.monotonic()
+        self.promotion_failed.discard(path)
+
     def _can_reclaim(self, path, config, now):
         """Prefer healthy promotion; fall back promptly on failure or no progress."""
         return (
@@ -231,8 +236,9 @@ class PressureManager:
                     config["path"],
                     LOGGER,
                 )
-            except Exception:  # Failed promotion leaves local reclamation available.
-                self.promotion_failed.add(config["path"])
+            except Exception:
+                # Queue/lock failures do not prove the destination is unavailable.
+                # Keep the last verified progress deadline while admission retries.
                 LOGGER.exception(
                     "Pressure promotion deferred for %s", candidate["path"]
                 )
