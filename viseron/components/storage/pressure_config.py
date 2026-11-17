@@ -83,6 +83,11 @@ def validate_retention_size(value: Any) -> Any:
 def normalize_tier(value):
     """Keep old configs unchanged; simple limits enable both recording classes."""
     tier = copy.deepcopy(value)
+    delay = tier.get("promote_after")
+    if delay is not None:
+        if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
+            raise vol.Invalid("promote_after must be non-negative integer seconds")
+        tier.setdefault("on_full", {"policy": "preserve_events"})
     if "on_full" in tier:
         tier["on_full"] = vol.Schema({vol.Required("policy"): vol.In(POLICIES)})(
             tier["on_full"]

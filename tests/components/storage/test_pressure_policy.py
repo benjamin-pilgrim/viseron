@@ -825,3 +825,62 @@ def test_budget_pressure_prefers_promotion_with_physical_headroom(
                 str(p) for p in paths
             }
             assert all(p.read_bytes() == b"x" * 1024**2 for p in paths)
+
+
+@pytest.mark.parametrize(
+    "delay,lookback,expected",
+    [(None, 10, []), (0, 10, [0]), (120, 10, []), (0, 90, [])],
+)
+def test_prompt_promotion_keeps_safety_window_and_active_event(
+    get_db_session, delay, lookback, expected
+):
+    """Forward old finalized segments below budget without retiring active events."""
+    with _pressure_directory() as ram:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        paths = [
+            _record(
+                get_db_session,
+                ram,
+                "camera",
+                now - datetime.timedelta(seconds=age),
+                1024,
+                event=i == 0,
+                active=i == 0,
+            )
+            for i, age in enumerate((60, 20, 5))
+        ]
+        other = _record(
+            get_db_session, ram, "other", now - datetime.timedelta(minutes=5), 1024
+        )
+        config = _configuration(
+            ram, "preserve_events", ("camera", "other"), maximum="80%"
+        )
+        config["volatile"] = True
+        config["cameras"][0].update(
+            has_next=True, promote_after=delay, lookback=lookback
+        )
+        config["cameras"][1]["has_next"] = True
+        result = reclaim(config, get_db_session)
+        assert result["deleted"] == 0
+        assert [item["path"] for item in result.get("promote", [])] == [
+            str(paths[i]) for i in expected
+        ]
+        assert all(path.read_bytes() == b"x" * 1024 for path in paths)
+        assert other.read_bytes() == b"x" * 1024
+        with get_db_session() as session:
+            assert session.query(Recordings).one().end_time is None
+
+
+def test_prompt_promotion_setting_survives_camera_override():
+    """Zero requests prompt promotion; the existing preservation default applies."""
+    tier = TIER_SCHEMA_RECORDER({"path": "/ram", "promote_after": 0})
+    assert tier["promote_after"] == 0
+    assert tier["on_full"] == {"policy": "preserve_events"}
+    assert TIER_SCHEMA_RECORDER(tier) == tier
+
+
+@pytest.mark.parametrize("value", [-1, 0.5, True, "now"])
+def test_invalid_prompt_promotion_setting_is_rejected(value):
+    """The forwarding delay is an explicit non-negative integer in seconds."""
+    with pytest.raises(vol.Invalid):
+        TIER_SCHEMA_RECORDER({"path": "/ram", "promote_after": value})

@@ -73,6 +73,7 @@ class PressureManager:
                         "segments": handler._path,
                         "spool": spool,
                         "has_next": index + 1 < len(tiers),
+                        "promote_after": handler.tier.get("promote_after"),
                         "lookback": camera.config.get("recorder", {}).get("lookback", 0)
                         + CAMERA_SEGMENT_DURATION,
                     }
@@ -218,9 +219,10 @@ class PressureManager:
                 self.promotion_failed.add(config["path"])
                 continue
             handler = tiers[index][candidate["kind"]]
-            destination = tiers[index + 1][candidate["kind"]].tier
+            destination_handler = tiers[index + 1][candidate["kind"]]
+            destination = destination_handler.tier
             try:
-                if not self.storage.tier_available(destination["path"]):
+                if not self.storage.tier_available(destination_handler._path):
                     self.promotion_failed.add(config["path"])
                     return
                 handle_file(

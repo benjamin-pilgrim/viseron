@@ -20,6 +20,7 @@ from viseron.components.storage.pressure_config import resolve_size_limit
 from viseron.components.storage.run_lifecycle import camera_lock, is_run_directory
 from viseron.components.storage.source_move_intent import source_move_pending
 from viseron.components.storage.util import require_tier_markers
+from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.helpers import utcnow
 
 LOGGER = logging.getLogger(__name__)
@@ -167,7 +168,11 @@ def _candidates(config, session, staged):
                 Files.tier_path == config["path"],
                 Files.camera_identifier.in_(cameras),
                 Files.move_target.is_(None),
-                Files.subcategory.in_(("segments", "thumbnails", "event_clips")),
+                Files.subcategory.in_(
+                    ("segments",)
+                    if config.get("segments_only")
+                    else ("segments", "thumbnails", "event_clips")
+                ),
             )
             .order_by(
                 *([priority] if config["policy"] == "ordinary_first" else []),
@@ -212,9 +217,12 @@ def _candidates(config, session, staged):
             candidate["camera"], ()
         ):
             continue
-        if candidate["end"] >= utcnow() - datetime.timedelta(
-            seconds=camera["lookback"]
-        ):
+        minimum_age = camera["lookback"]
+        if camera.get("promote_after") is not None:
+            minimum_age = max(
+                minimum_age, CAMERA_SEGMENT_DURATION * 5, camera["promote_after"]
+            )
+        if candidate["end"] >= utcnow() - datetime.timedelta(seconds=minimum_age):
             continue
         events = _events(session, candidate)
         # Finalized fragments of active events may move to another tier.
@@ -268,13 +276,25 @@ def reclaim(config, get_session, *, free_space=None, on_reclaimed=None):
             and free_inodes(0.15 if config.get("reclaim") else 0.10)
             and (not maximum or used < trigger_size)
         ):
-            return {
+            result = {
                 "state": "normal",
                 "deleted": 0,
                 "offset": 0,
                 "used": used,
                 "free": free_space(),
             }
+            forwarding = [
+                camera
+                for camera in config["cameras"]
+                if camera.get("has_next") and camera.get("promote_after") is not None
+            ]
+            if forwarding:
+                view = {**config, "cameras": forwarding, "segments_only": True}
+                candidates, scanned = _candidates(view, session, [])
+                result["promote"] = candidates[:16]
+                if not candidates and scanned == BATCH:
+                    result["offset"] = config.get("offset", 0) + BATCH
+            return result
         candidates, scanned = _candidates(config, session, staged)
     can_forward = any(camera.get("has_next", False) for camera in config["cameras"])
     promotion_has_headroom = (

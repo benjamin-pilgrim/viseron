@@ -21,7 +21,7 @@ from watchdog.events import FileCreatedEvent
 from viseron.components.storage import check_tier
 from viseron.components.storage.check_tier import Worker, move_file as copy_file
 from viseron.components.storage.dispatch_fence import create_token
-from viseron.components.storage.models import Files, PendingSegmentMove
+from viseron.components.storage.models import Files, PendingSegmentMove, Recordings
 from viseron.components.storage.pending_journal import (
     marker_for_path,
     release_indexed_source,
@@ -699,7 +699,11 @@ def test_recording_during_successful_promotion_does_not_trigger_eviction(
             pending_moves={},
             pending_moves_lock=threading.Lock(),
             temporary_files_meta={},
-            tier_available=lambda _: available[0],
+            # The abstract tier root can remain visible while its nested NAS
+            # category mount is unavailable (the server uses tier path "/").
+            tier_available=lambda path: (
+                available[0] or Path(path) == nas or not Path(path).is_relative_to(nas)
+            ),
             tier_check_worker_send_command=Mock(),
             camera_requested_files_count={"camera": SimpleNamespace(filenames=[])},
         )
@@ -837,3 +841,73 @@ def test_finished_transfer_replay_delivers_completion_and_progress(
     with get_db_session() as session:
         assert session.execute(select(PendingSegmentMove)).first() is None
     assert promotion.dst.read_bytes() == b"video"
+
+
+def test_prompt_forwarding_dispatches_active_event_without_budget_pressure(
+    promotion, get_db_session, monkeypatch
+):
+    """A healthy root forwards and acknowledges footage without ending its event."""
+    with get_db_session() as session:
+        row = session.execute(select(Files)).scalar_one()
+        session.add(
+            Recordings(
+                camera_identifier="camera",
+                start_time=row.orig_ctime,
+                adjusted_start_time=row.orig_ctime,
+                recorder_run_id=promotion.src.parent.name,
+            )
+        )
+        session.commit()
+    storage = promotion.storage
+    source = storage.camera_tier_handlers["camera"]["recorder"][0]["segments"]
+    source._vis = Mock()
+    source._check_tier_lock = threading.Lock()
+    source._schedule_forced_tier_retry_locked = Mock()
+    storage.camera_requested_files_count = {"camera": SimpleNamespace(filenames=[])}
+    target = _destination_handler(storage, promotion.dst.parents[2])
+    target._path = str(promotion.dst.parent.parent)
+    storage.camera_tier_handlers["camera"]["recorder"][1]["segments"] = target
+    manager = PressureManager(storage)
+    storage.pressure_manager = manager
+    config = _configuration(promotion.src.parents[2], "preserve_events", maximum="80%")
+    config["cameras"][0].update(has_next=True, promote_after=0, segments=source._path)
+    config.update(
+        test_db_url=get_db_session.kw["bind"].url.render_as_string(hide_password=False),
+        test_sync_error=False,
+    )
+    manager.configurations = lambda: {config["path"]: dict(config)}
+    monkeypatch.setattr(
+        "viseron.components.storage.pressure_manager.run_pressure", _real_pressure_child
+    )
+    try:
+        manager.poll()
+        deadline = time.monotonic() + 30
+        while (
+            not storage.tier_check_worker_send_command.called
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+            manager.poll()
+        call = storage.tier_check_worker_send_command.call_args
+        assert call is not None
+        item = call.args[0]
+        worker = Worker()
+        worker._get_session = get_db_session
+        _copy_with_source_contention(worker, item, source._path)
+        assert promotion.src.read_bytes() == b"video"
+        call.kwargs["callback"](item)
+        target._on_created(FileCreatedEvent(item.dst))
+        assert not promotion.src.exists()
+        assert promotion.dst.read_bytes() == b"video"
+        with get_db_session() as session:
+            row = session.execute(select(Files)).scalar_one()
+            assert (
+                row.path == str(promotion.dst)
+                and row.file_key == 42
+                and row.tier_id == 1
+            )
+            recording = session.execute(select(Recordings)).scalar_one()
+            assert recording.end_time is None
+            assert recording.recorder_run_id == promotion.src.parent.name
+    finally:
+        manager.stop()

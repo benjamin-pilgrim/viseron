@@ -387,3 +387,41 @@ def test_check_path_exists():
             vol.Invalid, match="The /custom/snapshots/ folder does not exist"
         ):
             _check_path_exists(tier, "snapshots")
+
+
+def test_prompt_promotion_requires_a_following_tier():
+    """A forwarding-only setting cannot silently apply to the final destination."""
+    with patch("viseron.components.storage.config._check_path_exists"):
+        with pytest.raises(vol.Invalid, match="following"):
+            CONFIG_SCHEMA(
+                {
+                    "storage": {
+                        "recorder": {
+                            "tiers": [
+                                {
+                                    "path": "/ram",
+                                    "promote_after": 0,
+                                    "retention": {"max_size": "80%"},
+                                }
+                            ]
+                        }
+                    }
+                }
+            )
+        config = CONFIG_SCHEMA(
+            {
+                "storage": {
+                    "recorder": {
+                        "tiers": [
+                            {
+                                "path": "/ram",
+                                "promote_after": 0,
+                                "retention": {"max_size": "80%"},
+                            },
+                            {"path": "/nas", "retention": {"max_size": "80%"}},
+                        ]
+                    }
+                }
+            }
+        )
+    assert config["storage"]["recorder"]["tiers"][0]["promote_after"] == 0

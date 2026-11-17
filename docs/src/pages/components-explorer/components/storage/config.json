@@ -57,6 +57,14 @@
             "values": [
               [
                 {
+                  "type": "integer",
+                  "valueMin": 0,
+                  "name": "promote_after",
+                  "description": "Minimum seconds after a finalized segment ends before forwarding to the following tier, independently of event retention. Zero forwards after the playback/pre-roll safety window; omit to use retention-based promotion.",
+                  "optional": true,
+                  "default": null
+                },
+                {
                   "type": "map",
                   "value": [
                     {

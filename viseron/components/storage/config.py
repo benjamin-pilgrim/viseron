@@ -324,6 +324,15 @@ RECORDER_RETENTION_SCHEMA = TIER_SCHEMA_BASE.extend(
 _TIER_SCHEMA_RECORDER = vol.Schema(
     {
         vol.Optional(
+            "promote_after",
+            description=(
+                "Minimum seconds after a finalized segment ends before forwarding "
+                "to the following tier, independently of event retention. "
+                "Zero forwards after the playback/pre-roll safety window; "
+                "omit to use retention-based promotion."
+            ),
+        ): Maybe(vol.All(int, vol.Range(min=0))),
+        vol.Optional(
             "retention",
             description=(
                 "Maximum age (e.g. 30d) and aggregate tier size (e.g. 3TB); "
@@ -730,6 +739,9 @@ def _storage_type_enabled(config: dict[str, Any]) -> bool:
 def _validate_recorder_tiers(
     component_config: dict[str, Any],
 ):
+    tiers = component_config.get(CONFIG_RECORDER, {}).get(CONFIG_TIERS, [])
+    if tiers and tiers[-1].get("promote_after") is not None:
+        raise vol.Invalid("promote_after requires a following recording tier")
     # Check continuous and events config in first tier
     first_tier = component_config.get(CONFIG_RECORDER, {}).get(CONFIG_TIERS, [])[0]
     continuous_enabled = "retention" in first_tier or _storage_type_enabled(
