@@ -166,7 +166,7 @@ def promotion(tmp_path, get_db_session):
     )
 
 
-def start_promotion(promotion, get_session):
+def start_promotion(promotion, get_session, *, on_complete=None):
     """Invoke the normal parent-side promotion entry point."""
 
     move_file(
@@ -183,6 +183,7 @@ def start_promotion(promotion, get_session):
             "segments"
         ].tier["path"],
         promotion.logger,
+        on_complete=on_complete,
     )
 
 

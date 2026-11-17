@@ -343,7 +343,9 @@ _TIER_SCHEMA_RECORDER = vol.Schema(
         vol.Optional(
             "on_full",
             description=(
-                "Full-tier policy: oldest_first, ordinary_first or preserve_events."
+                "Full-tier policy: oldest_first, ordinary_first or preserve_events. "
+                "With a next tier, budget pressure promotes footage; local reclamation "
+                "requires an unavailable destination or critical free space/inodes."
             ),
         ): {
             vol.Required(

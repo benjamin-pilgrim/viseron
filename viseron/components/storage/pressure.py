@@ -276,7 +276,16 @@ def reclaim(config, get_session, *, free_space=None, on_reclaimed=None):
                 "free": free_space(),
             }
         candidates, scanned = _candidates(config, session, staged)
-    if not config.get("reclaim", False):
+    can_forward = any(camera.get("has_next", False) for camera in config["cameras"])
+    promotion_has_headroom = (
+        can_forward
+        and not config.get("destination_unavailable", False)
+        and free_space() >= start_free
+        and free_inodes(0.10)
+    )
+    # A size budget starts forwarding; a quiet acknowledgement interval is not
+    # permission to destroy footage while there is still physical headroom.
+    if not config.get("reclaim", False) or promotion_has_headroom:
         return {
             "state": "promoting",
             "used": used,

@@ -168,6 +168,7 @@ class PressureManager:
                 continue
             previous = self.status.get(path, {})
             config["reclaim"] = self._can_reclaim(path, config, now)
+            config["destination_unavailable"] = path in self.promotion_failed
             with self.storage.pending_moves_lock:
                 config["reserved"] = tuple(self.storage.pending_moves)
             config["offset"] = previous.get("offset", 0)

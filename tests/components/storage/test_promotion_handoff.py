@@ -786,3 +786,54 @@ def test_recording_during_successful_promotion_does_not_trigger_eviction(
                 assert all(p.read_bytes() == b"x" * (256 * 1024) for p in copies)
         finally:
             manager.stop()
+
+
+def test_finished_transfer_replay_delivers_completion_and_progress(
+    promotion, get_db_session
+):
+    """Lost acknowledgement replay completes callbacks and credits the source tier."""
+    completed = Mock()
+    manager = Mock(spec=PressureManager)
+    promotion.storage.pressure_manager = manager
+    start_promotion(promotion, get_db_session, on_complete=completed)
+    item = promotion.storage.tier_check_worker_send_command.call_args.args[0]
+    copy_file(
+        get_db_session,
+        item.src,
+        item.dst,
+        promotion.logger,
+        camera_identifier="camera",
+        publication_meta=item.publication_meta,
+    )
+    target = _destination_handler(promotion.storage, promotion.dst.parents[2])
+    target._path = str(promotion.dst.parent.parent)
+    promotion.storage.camera_tier_handlers["camera"]["recorder"][1]["segments"] = target
+    with patch(
+        "viseron.components.storage.tier_handler.acknowledge_segment_move",
+        side_effect=SQLAlchemyError("interrupted acknowledgement"),
+    ):
+        target._on_created(FileCreatedEvent(str(promotion.dst)))
+    assert not promotion.src.exists()
+    assert promotion.dst.read_bytes() == b"video"
+    completed.assert_not_called()
+    manager.promotion_completed.assert_not_called()
+    source = object.__new__(TierHandler)
+    source._storage = promotion.storage
+    source._camera = SimpleNamespace(identifier="camera")
+    source._tier_id = 0
+    source._tier = {"path": str(promotion.src.parents[2])}
+    source._category = "recorder"
+    source._subcategory = "segments"
+    source._path = str(promotion.src.parent.parent)
+    source._source_intent_cursor = {}
+    source._hold_retry_stopping = False
+    source._hold_retry_lock = threading.Lock()
+    source._hold_retry_active = set()
+    source._logger = logging.getLogger(__name__)
+    source._replay_segment_moves()
+    completed.assert_called_once_with()
+    manager.promotion_completed.assert_called_once_with(str(promotion.src.parents[2]))
+    assert not promotion.storage.pending_moves
+    with get_db_session() as session:
+        assert session.execute(select(PendingSegmentMove)).first() is None
+    assert promotion.dst.read_bytes() == b"video"

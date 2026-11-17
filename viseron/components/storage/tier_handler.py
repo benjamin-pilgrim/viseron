@@ -586,7 +586,10 @@ class TierHandler(FileSystemEventHandler):
                             destination._complete_pending_move(
                                 pending,
                                 self._storage.pending_moves,
-                                {"source_snapshot": {"source": move.source}},
+                                {
+                                    "source_snapshot": {"source": move.source},
+                                    "meta": move.metadata_record,
+                                },
                                 move.destination,
                             )
                             continue

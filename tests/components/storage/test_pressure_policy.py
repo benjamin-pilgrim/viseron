@@ -789,3 +789,39 @@ def test_separate_percentage_rules_select_their_own_expired_footage(
         expected = paths[:events_expired] + paths[4 : 4 + ordinary_expired]
         assert set(item.data["path"]) == {str(path) for path in expected}
         assert all(path.exists() for path in paths), "Selection must not delete files"
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_budget_pressure_prefers_promotion_with_physical_headroom(
+    get_db_session, unavailable
+):
+    """A stalled soft budget must not evict while a next tier can accept copies."""
+    with _pressure_directory() as ram:
+        now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        paths = [
+            _record(
+                get_db_session,
+                ram,
+                "camera",
+                now + datetime.timedelta(seconds=i * 5),
+                1024**2,
+            )
+            for i in range(4)
+        ]
+        (ram / "buffer-occupancy").write_bytes(b"b" * (9 * 1024**2 + 512 * 1024))
+        info = os.statvfs(ram)
+        assert 0.15 < info.f_bavail / info.f_blocks < 0.20
+        config = _configuration(ram, "preserve_events", maximum="80%")
+        config.update(volatile=True, destination_unavailable=unavailable)
+        config["cameras"][0]["has_next"] = True
+        result = reclaim(config, get_db_session)
+        if unavailable:
+            assert result["deleted"] > 0
+            assert not paths[0].exists()
+        else:
+            assert result["deleted"] == 0
+            assert result["state"] == "promoting"
+            assert {item["path"] for item in result["promote"]} == {
+                str(p) for p in paths
+            }
+            assert all(p.read_bytes() == b"x" * 1024**2 for p in paths)
