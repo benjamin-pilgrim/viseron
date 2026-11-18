@@ -297,7 +297,15 @@ def reclaim(config, get_session, *, free_space=None, on_reclaimed=None):
                 view = {**config, "cameras": forwarding, "segments_only": True}
                 candidates, scanned = _candidates(view, session, [])
                 result["promote"] = candidates[:16]
-                result["batch_complete"] = not candidates and scanned < BATCH
+                outstanding = any(
+                    os.path.commonpath((os.path.abspath(camera["segments"]), path))
+                    == os.path.abspath(camera["segments"])
+                    for camera in forwarding
+                    for path in config.get("reserved", ())
+                )
+                result["batch_complete"] = (
+                    not candidates and scanned < BATCH and not outstanding
+                )
                 if not candidates and scanned == BATCH:
                     result["offset"] = config.get("offset", 0) + BATCH
             return result

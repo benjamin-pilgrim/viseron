@@ -9,6 +9,7 @@ import pytest
 import voluptuous as vol
 
 from viseron.components.storage.config import TIER_SCHEMA_RECORDER
+from viseron.components.storage.models import Files
 from viseron.components.storage.pressure import reclaim
 from viseron.components.storage.pressure_manager import PressureManager
 
@@ -142,8 +143,18 @@ def test_manager_opens_batch_at_deadline(get_db_session, tmp_path, monkeypatch):
         clock[0] = 161.0
         poll_once()
         assert [c["path"] for c in dispatched] == [str(p) for p in paths]
+        # The real copy/index handoff is covered separately. Complete this
+        # scheduler fixture's transfers before checking the next quiet period.
+        with get_db_session() as session:
+            session.query(Files).filter(Files.path.in_([str(p) for p in paths])).delete(
+                synchronize_session=False
+            )
+            session.commit()
+        for path in paths:
+            path.unlink()
+        storage.pending_moves.clear()
         clock[0] = 162.0
-        poll_once()  # Exhaust the fixed batch; all transfers are now reserved.
+        poll_once()
         later = _record(
             get_db_session,
             tmp_path,
@@ -195,3 +206,33 @@ def test_cameras_share_one_batch_clock(tmp_path, intervals):
         configuration = next(iter(roots.values()))
         assert configuration["promotion_batch_interval"] == 60
         assert {c["identifier"] for c in configuration["cameras"]} == {"one", "two"}
+
+
+def test_batch_waits_for_transfer_acknowledgement(get_db_session, tmp_path):
+    """Queued transfers must finish before the next quiet interval can start."""
+    path = _record(
+        get_db_session,
+        tmp_path,
+        "camera",
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=2),
+        1024,
+    )
+    config = batch_config(tmp_path)
+    config.update(
+        promotion_cutoff=datetime.datetime.now(datetime.UTC), reserved=(str(path),)
+    )
+    result = reclaim(config, get_db_session)
+    assert not result.get("promote")
+    assert not result["batch_complete"]
+    assert path.exists()
+
+
+def test_other_tier_transfers_do_not_delay_batch_completion(get_db_session, tmp_path):
+    """An abstract tier root must not wait for unrelated cameras' transfers."""
+    config = batch_config(tmp_path)
+    config.update(
+        promotion_cutoff=datetime.datetime.now(datetime.UTC),
+        reserved=(str(tmp_path / "another-tier" / "camera" / "file.m4s"),),
+    )
+    result = reclaim(config, get_db_session)
+    assert result["batch_complete"]
