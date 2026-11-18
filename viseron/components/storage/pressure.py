@@ -222,7 +222,9 @@ def _candidates(config, session, staged):
             minimum_age = max(
                 minimum_age, CAMERA_SEGMENT_DURATION * 5, camera["promote_after"]
             )
-        if candidate["end"] >= utcnow() - datetime.timedelta(seconds=minimum_age):
+        now = utcnow()
+        cutoff = min(config.get("promotion_cutoff") or now, now)
+        if candidate["end"] >= cutoff - datetime.timedelta(seconds=minimum_age):
             continue
         events = _events(session, candidate)
         # Finalized fragments of active events may move to another tier.
@@ -288,14 +290,19 @@ def reclaim(config, get_session, *, free_space=None, on_reclaimed=None):
                 for camera in config["cameras"]
                 if camera.get("has_next") and camera.get("promote_after") is not None
             ]
-            if forwarding:
+            if forwarding and (
+                not config.get("promotion_batch_interval")
+                or config.get("promotion_cutoff") is not None
+            ):
                 view = {**config, "cameras": forwarding, "segments_only": True}
                 candidates, scanned = _candidates(view, session, [])
                 result["promote"] = candidates[:16]
+                result["batch_complete"] = not candidates and scanned < BATCH
                 if not candidates and scanned == BATCH:
                     result["offset"] = config.get("offset", 0) + BATCH
             return result
-        candidates, scanned = _candidates(config, session, staged)
+        urgent = {**config, "promotion_cutoff": None}
+        candidates, scanned = _candidates(urgent, session, staged)
     can_forward = any(camera.get("has_next", False) for camera in config["cameras"])
     promotion_has_headroom = (
         can_forward

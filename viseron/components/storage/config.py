@@ -324,6 +324,14 @@ RECORDER_RETENTION_SCHEMA = TIER_SCHEMA_BASE.extend(
 _TIER_SCHEMA_RECORDER = vol.Schema(
     {
         vol.Optional(
+            "promotion_batch_interval",
+            description=(
+                "Seconds between prompt-forwarding batches. Zero or omitted "
+                "forwards continuously. Requires promote_after; shared source "
+                "roots must use the same interval. Storage pressure flushes early."
+            ),
+        ): vol.All(int, vol.Range(min=0)),
+        vol.Optional(
             "promote_after",
             description=(
                 "Minimum seconds after a finalized segment ends before forwarding "

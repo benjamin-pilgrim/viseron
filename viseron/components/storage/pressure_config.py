@@ -83,6 +83,13 @@ def validate_retention_size(value: Any) -> Any:
 def normalize_tier(value):
     """Keep old configs unchanged; simple limits enable both recording classes."""
     tier = copy.deepcopy(value)
+    interval = tier.get("promotion_batch_interval", 0)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval < 0:
+        raise vol.Invalid(
+            "promotion_batch_interval must be non-negative integer seconds"
+        )
+    if interval and tier.get("promote_after") is None:
+        raise vol.Invalid("promotion_batch_interval requires promote_after")
     delay = tier.get("promote_after")
     if delay is not None:
         if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:

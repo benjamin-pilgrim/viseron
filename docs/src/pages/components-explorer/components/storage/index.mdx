@@ -90,6 +90,56 @@ For technical reasons it is very likely that there will be a few extra megabytes
 
 :::
 
+### Batched forwarding
+
+To group transfers from RAM or local disk to the next recording tier, set
+`promote_after: 0` and `promotion_batch_interval: 60` on the source tier.
+Mount `/ram` and `/archive` inside the container before using this example:
+
+```yaml
+storage:
+  recorder:
+    tiers:
+      - path: /ram
+        promote_after: 0
+        promotion_batch_interval: 60
+        on_full:
+          policy: preserve_events
+        continuous:
+          max_age:
+            minutes: 5
+        events:
+          max_age:
+            minutes: 5
+      - path: /archive
+        continuous:
+          max_age:
+            days: 30
+        events:
+          max_age:
+            days: 90
+```
+
+The interval is in whole seconds. Omit it or use `0` for continuous forwarding.
+Cameras sharing a source tier path must use the same interval. A positive
+interval requires `promote_after` and a following tier.
+
+The first batch opens after the interval. Each batch forwards only footage that
+was eligible when it opened, so new footage cannot keep it running indefinitely.
+After the batch drains, the interval starts again. `promote_after` controls the
+minimum segment age independently; the playback and pre-roll safety window
+still applies.
+
+Storage pressure bypasses the batch timer and attempts to forward footage early.
+When the destination is unavailable, the existing `on_full` policy controls
+reclamation and recording admission. Transfer sources remain protected until
+the destination copy is verified and indexed.
+
+Batching retains more footage locally until transfer; footage on a RAM tier is
+lost if the machine loses power. It groups normal prompt forwarding only:
+retention-driven transfers, recovery, metadata polling and playback can still
+access the destination between batches. It does not guarantee disk standby.
+
 ### Continuous (24/7) recordings
 
 To allocate space for continuous recordings for **all** cameras you use the `continuous` configuration option for a tier.

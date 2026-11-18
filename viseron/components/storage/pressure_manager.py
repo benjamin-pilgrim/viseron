@@ -8,6 +8,7 @@ import time
 from viseron.components.storage.pressure import log_reclaimed, run_pressure
 from viseron.components.storage.startup_reconciliation import volatile_roots
 from viseron.const import CAMERA_SEGMENT_DURATION
+from viseron.helpers import utcnow
 from viseron.helpers.child_process_context import get_child_process_context
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class PressureManager:
         self.last_progress = {}
         self.promotion_failed = set()
         self.results = {}
+        self.batches = {}
 
     def configurations(self):
         """Resolve camera tier paths without touching remote filesystems."""
@@ -57,6 +59,9 @@ class PressureManager:
                         "probe": handler._path,
                         "policy": policy,
                         "max_size": maximum,
+                        "promotion_batch_interval": handler.tier.get(
+                            "promotion_batch_interval", 0
+                        ),
                         "markers": dict(self.storage.config.get("tier_markers", {})),
                         "cameras": [],
                         "requested": {},
@@ -66,6 +71,10 @@ class PressureManager:
                     raise ValueError(
                         "A shared tier needs one pressure policy and budget"
                     )
+                if root["promotion_batch_interval"] != handler.tier.get(
+                    "promotion_batch_interval", 0
+                ):
+                    raise ValueError("A shared tier needs one promotion batch interval")
                 root["cameras"].append(
                     {
                         "identifier": identifier,
@@ -127,6 +136,13 @@ class PressureManager:
             )
             connection.close()
             self.pending.pop(path)
+            if config.get("promotion_batch_interval") and (
+                result.get("batch_complete") or result["state"] != "normal"
+            ):
+                self.batches[path] = {
+                    "due": now + config["promotion_batch_interval"],
+                    "cutoff": None,
+                }
             previous_result = self.status.get(path, {})
             previous = previous_result.get("state")
             if (
@@ -167,6 +183,14 @@ class PressureManager:
         for path, config in roots.items():
             if path in self.pending or now < self.retry.get(path, 0):
                 continue
+            interval = config.get("promotion_batch_interval", 0)
+            if interval:
+                batch = self.batches.setdefault(
+                    path, {"due": now + interval, "cutoff": None}
+                )
+                if batch["cutoff"] is None and now >= batch["due"]:
+                    batch["cutoff"] = utcnow()
+                config["promotion_cutoff"] = batch["cutoff"]
             previous = self.status.get(path, {})
             config["reclaim"] = self._can_reclaim(path, config, now)
             config["destination_unavailable"] = path in self.promotion_failed

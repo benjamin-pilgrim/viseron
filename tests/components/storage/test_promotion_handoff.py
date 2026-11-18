@@ -655,12 +655,31 @@ def test_held_timing_requires_original_source_and_valid_observation(tmp_path, mu
     assert read_source_intent_time(source, destination) is None
 
 
+@pytest.fixture
+def pressure_nas(tmp_path):
+    """Optionally exercise verified handoffs on a disposable CIFS mount."""
+    mount = os.environ.get("VISERON_TEST_CIFS")
+    if mount:
+        with tempfile.TemporaryDirectory(prefix="pressure-", dir=mount) as directory:
+            yield Path(directory)
+    else:
+        root = tmp_path / "nas"
+        root.mkdir()
+        yield root
+
+
+@pytest.mark.parametrize("batch_interval", [0, 60])
 @pytest.mark.parametrize(
     "admission_failure,acknowledge",
     [(None, True), (16, True), (18, True), ("unavailable", True), (None, False)],
 )
 def test_recording_during_successful_promotion_does_not_trigger_eviction(
-    get_db_session, tmp_path, monkeypatch, admission_failure, acknowledge
+    get_db_session,
+    monkeypatch,
+    admission_failure,
+    acknowledge,
+    batch_interval,
+    pressure_nas,
 ):
     """Acknowledged NAS copies count as progress even if recording refills RAM."""
     clock = [100.0]
@@ -672,8 +691,7 @@ def test_recording_during_successful_promotion_does_not_trigger_eviction(
         "viseron.components.storage.pressure_manager.run_pressure", _real_pressure_child
     )
     with _pressure_directory() as ram:
-        nas = tmp_path / "nas"
-        nas.mkdir()
+        nas = pressure_nas
         now = datetime.now(UTC) - timedelta(hours=1)
         paths = [
             _record(
@@ -731,6 +749,7 @@ def test_recording_during_successful_promotion_does_not_trigger_eviction(
         config = _configuration(ram, "preserve_events", maximum="80%")
         config.update(
             volatile=True,
+            promotion_batch_interval=batch_interval,
             test_db_url=get_db_session.kw["bind"].url.render_as_string(
                 hide_password=False
             ),

@@ -109,6 +109,7 @@ jobs:
               tests/components/storage/test_lost_source_recovery.py \
               tests/components/storage/test_journal_db_prototype.py \
               tests/components/storage/test_pressure_policy.py \
+              tests/components/storage/test_promotion_batching.py \
               tests/components/storage/test_migrations.py \
               tests/components/storage/test_tier_handler.py \
               tests/components/storage/test_jobs.py \
