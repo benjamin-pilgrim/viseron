@@ -7,6 +7,8 @@ on:
       - docker/go2rtc/**
       - docker/go2rtc-diagnostics/**
       - viseron/components/ffmpeg/**
+      - viseron/components/darknet/**
+      - tests/components/darknet/**
       - tests/components/ffmpeg/**
       - viseron/domains/camera/fragmenter_process.py
       - viseron/domains/camera/config.py
@@ -68,6 +70,7 @@ jobs:
         timeout-minutes: 8
         run: |
           cp -R viseron/components/ffmpeg docker/go2rtc-diagnostics/ffmpeg
+          cp -R viseron/components/darknet docker/go2rtc-diagnostics/darknet
           cp viseron/domains/camera/fragmenter_process.py docker/go2rtc-diagnostics/fragmenter_process.py
           cp viseron/domains/camera/config.py docker/go2rtc-diagnostics/camera_config.py
           cp -R viseron/components/storage docker/go2rtc-diagnostics/storage
@@ -92,6 +95,9 @@ jobs:
               pytest==9.1.1 pytest-postgresql==9.1.1 pytest-mock==3.17.0 pytest-alembic==0.13.1 "psycopg[binary]" &&
             python3 -m pytest -q -o addopts= -p no:cacheprovider \
               tests/components/ffmpeg/test_stream.py \
+              tests/components/darknet \
+              tests/domains/object_detector \
+              tests/components/nvr \
               tests/components/storage/test_polling.py \
               tests/components/storage/test_config.py \
               tests/components/storage/test_check_tier.py \
