@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+import errno
 import logging
 import multiprocessing
 import sys
@@ -181,5 +183,47 @@ def test_segment_writer_watchdog_restart_publishes_new_run(tmp_path):
         second = marker.value.decode("ascii")
         assert first != second
         assert (tmp_path / second).is_dir()
+    finally:
+        pipe.close()
+
+
+def test_contract_write_failure_is_reported_without_stopping_recording(
+    tmp_path, caplog
+):
+    """A failed timing marker stays untrusted and exposes the recovery limitation."""
+    actual_open = builtins.open
+
+    def open_contract(path, *args, **kwargs):
+        if str(path).endswith(".viseron-playlist-timing-contract"):
+            raise OSError(errno.ENOSPC, "injected full disk")
+        return actual_open(path, *args, **kwargs)
+
+    marker = multiprocessing.get_context("fork").Array("c", 64)
+    command = [
+        sys.executable,
+        "-c",
+        "import time;time.sleep(60)",
+        str(tmp_path / "__VISERON_RUN__" / "index.m3u8"),
+    ]
+    pipe = FFmpegPipe(
+        "test",
+        LOGGER,
+        20,
+        decoder_command=command,
+        run_marker=marker,
+        timing_capture_safe=True,
+    )
+    try:
+        with patch(
+            "viseron.components.ffmpeg.pipe.open",
+            side_effect=open_contract,
+            create=True,
+        ):
+            pipe.start()
+        assert pipe.poll() is None
+        run = tmp_path / marker.value.decode("ascii")
+        assert not (run / ".viseron-playlist-timing-contract").exists()
+        assert "automatic timing recovery is unavailable" in caplog.text
+        assert "injected full disk" in caplog.text
     finally:
         pipe.close()

@@ -3,6 +3,7 @@ ARG BASE_IMAGE=ghcr.io/benjamin-pilgrim/viseron@sha256:671793e54a0bb333887030814
 FROM ${BASE_IMAGE}
 ARG DIAGNOSTIC_COMMIT
 COPY --chmod=0755 go2rtc /usr/local/bin/go2rtc
+COPY --chmod=0644 recording_timing_contract.py /src/viseron/helpers/recording_timing_contract.py
 COPY ffmpeg/ /src/viseron/components/ffmpeg/
 COPY darknet/ /src/viseron/components/darknet/
 COPY storage/ /src/viseron/components/storage/

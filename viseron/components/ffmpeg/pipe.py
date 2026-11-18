@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import fcntl
 import subprocess as sp
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, BinaryIO
+from typing import BinaryIO
 from uuid import uuid4
 
 from viseron.helpers.logs import LogPipe
@@ -19,8 +20,7 @@ from viseron.watchdog.subprocess_watchdog import RestartablePopen
 
 from .const import ORIN_RAWVIDEO_OUTPUT
 
-if TYPE_CHECKING:
-    import logging
+LOGGER = logging.getLogger(__name__)
 
 
 RUN_TOKEN = "__VISERON_RUN__"
@@ -61,7 +61,14 @@ def _leased_command_for_run(
                             contract.write(TIMING_CONTRACT_CONTENT)
                             contract.flush()
                             os.fsync(contract.fileno())
-                    except OSError:
+                    except OSError as error:
+                        LOGGER.warning(
+                            "Cannot preserve recorder timing contract in %s: %s; "
+                            "recording continues but automatic timing recovery "
+                            "is unavailable for this run",
+                            run_dir,
+                            error,
+                        )
                         # Recording can continue; recovery simply fails closed.
                         try:
                             os.unlink(marker)

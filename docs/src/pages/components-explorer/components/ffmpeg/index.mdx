@@ -197,6 +197,19 @@ FFmpeg will write small 5 second segments of the stream to disk.<br />
 The reason for using segments instead of just starting the recorder on an event, is to support the `lookback` feature which makes it possible to record _before_ an event actually happened.
 It also makes it possible to have continuous recordings.
 
+### Staged timing recovery
+
+For supported generated recorder commands, including automatic VA-API decoding,
+Viseron saves timing observed in FFmpeg's playlist so that unfinished publication
+can recover after the playlist rotates or the process restarts. Arbitrary raw
+commands and custom argument lists that can override HLS output do not enable
+this recovery mechanism.
+
+A staged fragment without trusted timing remains unindexed together with its
+`init.mp4`. Updating Viseron does not reconstruct missing historical timestamps.
+Preserve the complete run directory on durable storage before attempting manual
+recovery; RAM staging is lost if the machine loses power.
+
 ### Store video segments in memory
 
 To place the video segments in memory instead of writing to disk, you can mount a tmpfs disk in the container.

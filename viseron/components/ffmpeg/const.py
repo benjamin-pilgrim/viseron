@@ -3,6 +3,8 @@
 import logging
 from typing import Final
 
+from viseron.helpers import recording_timing_contract
+
 COMPONENT = "ffmpeg"
 
 DESC_COMPONENT = "FFmpeg Configuration."
@@ -53,7 +55,7 @@ FFPROBE_LOGLEVELS = FFMPEG_LOGLEVELS
 FFPROBE_TIMEOUT = 15
 
 # Hardware acceleration constants
-HWACCEL_VAAPI = ["-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128"]
+HWACCEL_VAAPI = recording_timing_contract.HWACCEL_VAAPI
 HWACCEL_CUDA_DECODER_CODEC_MAP = {
     "h264": "h264_cuvid",
     "h265": "hevc_cuvid",
