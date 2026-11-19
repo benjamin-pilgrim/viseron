@@ -27,7 +27,18 @@ def test_poll_interval_configuration(schema) -> None:
             schema({"path": "/recordings", "poll_interval": invalid})
 
 
-def test_archive_polling_honors_interval_and_detects_changes(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("tier_id", "category", "subcategory"),
+    [
+        (0, "recorder", "segments"),
+        (1, "recorder", "thumbnails"),
+        (1, "recorder", "event_clips"),
+        (1, "snapshots", "object_detector"),
+    ],
+)
+def test_archive_polling_honors_interval_and_detects_changes(
+    tmp_path: Path, tier_id: int, category: str, subcategory: str
+) -> None:
     """A slower poll retains recursive create/delete detection for run files."""
     archived = tmp_path / "old-run"
     archived.mkdir()
@@ -35,6 +46,9 @@ def test_archive_polling_honors_interval_and_detects_changes(tmp_path: Path) -> 
         (archived / f"{number}.m4s").touch()
     handler = TierHandler.__new__(TierHandler)
     handler._path = str(tmp_path)
+    handler._tier_id = tier_id
+    handler._category = category
+    handler._subcategory = subcategory
     handler._tier = {"poll": True, "poll_interval": 30}
     handler._storage = MagicMock()
     handler._storage.ignored_files = []
@@ -70,6 +84,9 @@ def test_recovered_tier_retains_poll_interval(tmp_path: Path) -> None:
     """Replacing a watcher after an outage must retain the configured scan rate."""
     handler = TierHandler.__new__(TierHandler)
     handler._path = str(tmp_path)
+    handler._tier_id = 0
+    handler._category = "recorder"
+    handler._subcategory = "segments"
     handler._tier = {"poll": True, "poll_interval": 30}
     handler._storage = MagicMock()
     handler._storage.tier_available.return_value = True
@@ -91,3 +108,44 @@ def test_recovered_tier_retains_poll_interval(tmp_path: Path) -> None:
         handler._observer.join(timeout=2)
         old.stop()
         old.join(timeout=2)
+
+
+@pytest.mark.parametrize("poll", [False, True])
+def test_segment_archive_recovery_does_not_enumerate_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll: bool
+) -> None:
+    """Known-writer arrivals and recovery must not rescan closed NAS runs."""
+    archived = tmp_path / "old-run"
+    archived.mkdir()
+    for number in range(100):
+        (archived / f"{number}.m4s").touch()
+    scans = []
+    scandir = os.scandir
+
+    def counted_scandir(path):
+        scans.append(os.fspath(path))
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", counted_scandir)
+    handler = TierHandler.__new__(TierHandler)
+    handler._path = str(tmp_path)
+    handler._tier_id = 1
+    handler._category = "recorder"
+    handler._subcategory = "segments"
+    handler._tier = {"poll": poll, "poll_interval": 30}
+    handler._storage = MagicMock()
+    handler._storage.tier_available.return_value = True
+    handler._storage.ignored_files = []
+    handler._event_queue = queue.Queue()
+    handler._observer_lock = threading.Lock()
+    handler._observer_stopping = False
+    handler._replay_pending_publications = MagicMock()
+    handler._observer = handler._start_observer()
+    try:
+        assert handler.restart_for_tier(str(tmp_path))
+        handler._replay_pending_publications.assert_called_once()
+        assert scans == [], "starting/recovering a tier enumerated its archive"
+    finally:
+        if handler._observer is not None:
+            handler._observer.stop()
+            handler._observer.join(timeout=2)

@@ -978,6 +978,15 @@ class TierHandler(FileSystemEventHandler):
 
     def _start_observer(self):
         """Create a fresh observer for the current directory mount."""
+        if (
+            self._tier_id > 0
+            and self._category == TIER_CATEGORY_RECORDER
+            and self._subcategory == TIER_SUBCATEGORY_SEGMENTS
+        ):
+            # Viseron is the only writer. Transfers notify this handler with
+            # exact paths; durable pending moves recover lost notifications.
+            # A recursive watcher would stat the entire archive every poll.
+            return None
         os.makedirs(self._path, exist_ok=True)
         observer = (
             PollingObserverVFS(

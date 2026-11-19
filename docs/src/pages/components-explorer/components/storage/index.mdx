@@ -140,6 +140,12 @@ lost if the machine loses power. It groups normal prompt forwarding only:
 retention-driven transfers, recovery, metadata polling and playback can still
 access the destination between batches. It does not guarantee disk standby.
 
+Later recorder segment tiers receive new files through transfer notifications
+and recover unfinished transfers from the database. They do not recursively
+watch the archive. `poll` and `poll_interval` still apply to first-tier segments,
+snapshots, thumbnails and event clips. Use Viseron to manage archived footage;
+manually adding or deleting archive files does not trigger watcher updates.
+
 ### Continuous (24/7) recordings
 
 To allocate space for continuous recordings for **all** cameras you use the `continuous` configuration option for a tier.
