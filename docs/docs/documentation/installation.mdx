@@ -21,6 +21,8 @@ Pulling `roflcoopter/viseron:latest` should automatically pull the correct image
 An exception to this is if you have the need for a specific container, eg the CUDA version.
 Then you will need to specify your desired image.
 
+Allow at least 90 seconds when stopping the container so Viseron, PostgreSQL and the service supervisor can finish. With Podman Quadlet, set `StopTimeout=90` in `[Container]` and `TimeoutStopSec=120` in `[Service]`.
+
 The images available are:
 
 | Image                             | Architecture | Description                                                                                                                                                 |
@@ -60,6 +62,7 @@ docker run --rm \
   -v /etc/localtime:/etc/localtime:ro \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   roflcoopter/viseron:latest
 ```
@@ -72,6 +75,7 @@ services:
   viseron:
     image: roflcoopter/viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -106,6 +110,7 @@ docker run --rm \
   -v /etc/localtime:/etc/localtime:ro \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   --device /dev/dri \
   roflcoopter/viseron:latest
@@ -119,6 +124,7 @@ services:
   viseron:
     image: roflcoopter/viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -155,6 +161,7 @@ docker run --rm \
   -v /etc/localtime:/etc/localtime:ro \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   --runtime=nvidia \
   roflcoopter/amd64-cuda-viseron:latest
@@ -168,6 +175,7 @@ services:
   viseron:
     image: roflcoopter/amd64-cuda-viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -210,6 +218,7 @@ docker run --rm \
   -v /etc/localtime:/etc/localtime:ro \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   --runtime=nvidia \
   --privileged \
@@ -231,6 +240,7 @@ services:
   viseron:
     image: roflcoopter/jetson-nano-viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -277,6 +287,7 @@ docker run --rm \
   -v /opt/vc/lib:/opt/vc/lib \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   --device=/dev/video10:/dev/video10 \
   --device=/dev/video11:/dev/video11 \
@@ -293,6 +304,7 @@ services:
   viseron:
     image: roflcoopter/viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -349,6 +361,7 @@ docker run --rm \
   -v /opt/vc/lib:/opt/vc/lib \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   --device /dev/vchiq:/dev/vchiq \
   --device /dev/vcsm:/dev/vcsm \
@@ -364,6 +377,7 @@ services:
   viseron:
     image: roflcoopter/viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments
@@ -515,6 +529,7 @@ docker run --rm \
   -v /etc/localtime:/etc/localtime:ro \
   -p 8888:8888 \
   --name viseron \
+  --stop-timeout 90 \
   --shm-size=1024mb \
   -e PUID=1000 \
   -e PGID=1000 \
@@ -533,6 +548,7 @@ services:
   viseron:
     image: roflcoopter/viseron:latest
     container_name: viseron
+    stop_grace_period: 90s
     shm_size: "1024mb"
     volumes:
       - {segments path}:/segments

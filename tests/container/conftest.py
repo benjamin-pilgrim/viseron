@@ -323,7 +323,7 @@ def viseron_container(
         return
 
     try:
-        container.stop(timeout=15)
+        container.stop(timeout=90)
     finally:
         container.remove(force=True)
 
