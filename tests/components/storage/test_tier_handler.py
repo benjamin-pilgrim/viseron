@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import logging
 import os
 import shutil
@@ -891,6 +892,69 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
     ):
         retries.drain()
     assert worker.call_count == 3
+
+
+@pytest.mark.parametrize(
+    ("error_number", "expected_retry"), [(errno.EAGAIN, True), (errno.EACCES, False)]
+)
+def test_accepted_clip_move_retries_temporary_publish_errors(
+    error_number: int,
+    expected_retry: bool,
+    vis: MockViseron,
+    db_storage: Mock,
+    tmp_path: Path,
+) -> None:
+    """Retry the exact archive move while retaining the source until publish."""
+    db_storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+    send = db_storage.tier_check_worker_send_command
+    clip = Path("event_clips/test/2026-11-20/clip.mp4")
+    src = _create_file(str(tmp_path / clip))
+    archive = tmp_path / "archive"
+    (archive / clip.parent.parent).mkdir(parents=True)
+    dst = archive / clip
+    src_tier = str(tmp_path)
+    upsert_file_at_location(
+        db_storage.get_session, "test", "recorder", "event_clips", 0, src_tier, src
+    )
+    handle_file(
+        vis,
+        db_storage.get_session,
+        db_storage,
+        "test",
+        0,
+        "recorder",
+        "event_clips",
+        Tier(path=src_tier),
+        Tier(path=str(archive)),
+        src,
+        src_tier,
+        Mock(),
+    )
+
+    attempt = send.call_args
+    worker = Worker()
+    with patch(
+        "viseron.components.storage.util.os.replace",
+        side_effect=OSError(error_number, os.strerror(error_number)),
+    ):
+        worker.work_input(attempt.args[0])
+    attempt.kwargs["callback"](attempt.args[0])
+    assert Path(src).read_bytes() == b"data"
+    assert not dst.exists()
+    assert list(_file_keys(db_storage)) == [src]
+
+    with patch(
+        "viseron.components.storage.tier_handler.utcnow",
+        return_value=utcnow() + datetime.timedelta(seconds=6),
+    ):
+        ArtifactRetryQueue(vis, db_storage).drain()
+    assert send.call_count == 1 + expected_retry
+    if expected_retry:
+        retry = send.call_args
+        worker.work_input(retry.args[0])
+        retry.kwargs["callback"](retry.args[0])
+        assert dst.read_bytes() == b"data"
+        assert list(_file_keys(db_storage)) == [str(dst)]
 
 
 def test_retention_skips_missing_thumbnail(vis: MockViseron) -> None:

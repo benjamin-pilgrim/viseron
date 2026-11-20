@@ -267,7 +267,7 @@ Storage tiers can be used to move recordings to different storage locations base
 
 See the [storage component tiers documentation](/components-explorer/components/storage#tiers) for more information.
 
-During a tier move, Viseron records the new location before removing the old copy. When the storage worker is busy, Viseron saves declined thumbnail and event clip operations in PostgreSQL and retries them as capacity becomes available.
+During a tier move, Viseron records the new location before removing the old copy. Viseron saves deferred thumbnail and event clip operations in PostgreSQL. It also queues their moves after temporary filesystem failures, such as a disconnected network share.
 
 :::
 

@@ -31,6 +31,7 @@ TEMP_STORAGE_FILE_PREFIX = ".viseron-tmp-"
 TRANSIENT_FILESYSTEM_ERRNOS = {
     error_number
     for error_number in (
+        errno.EAGAIN,
         errno.EIO,
         getattr(errno, "ESTALE", None),
         errno.ETIMEDOUT,
@@ -196,8 +197,14 @@ def tier_path_available(path: str) -> bool:
 def raise_if_path_unavailable(path: str) -> None:
     """Raise OSError if the parent directory for path is not available."""
     directory = os.path.dirname(path)
-    if directory and not tier_path_available(directory):
-        raise OSError(f"Parent directory is unavailable for {path}: {directory}")
+    if directory:
+        raise_if_directory_unavailable(directory)
+
+
+def raise_if_directory_unavailable(directory: str) -> None:
+    """Check directory availability while preserving filesystem error numbers."""
+    if not stat.S_ISDIR(os.stat(directory).st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), directory)
 
 
 def get_segments_path(tier: Tier, camera: AbstractCamera | FailedCamera) -> str:

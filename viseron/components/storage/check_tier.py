@@ -23,8 +23,10 @@ from viseron.components.storage.models import (
 )
 from viseron.components.storage.util import (
     copy_file_atomic,
+    is_transient_filesystem_error,
+    path_exists,
+    raise_if_directory_unavailable,
     raise_if_path_unavailable,
-    tier_path_available,
 )
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_state_changes
@@ -409,6 +411,8 @@ class Worker:
                 e,
             )
             item.error = str(e)
+            if isinstance(e, OSError) and item.cmd in ("copy_file", "move_file"):
+                item.retryable_error = is_transient_filesystem_error(e)
 
     def load_tier(self, item: DataItem):
         """Load the tier data for the camera."""
@@ -983,14 +987,16 @@ def copy_file_for_tier_worker(
     logger.debug("Copying file from %s to %s", src, dst)
     if destination_root is None:
         raise_if_path_unavailable(dst)
-    elif os.path.commonpath(
-        (destination_root, dst)
-    ) != destination_root or not tier_path_available(destination_root):
-        raise OSError(f"Destination directory is unavailable: {destination_root}")
+    else:
+        if os.path.commonpath((destination_root, dst)) != destination_root:
+            raise ValueError(f"Destination {dst} is outside {destination_root}")
+        raise_if_directory_unavailable(destination_root)
+    raise_if_path_unavailable(src)
     try:
-        raise_if_path_unavailable(src)
         size = copy_file_atomic(src, dst)
     except FileNotFoundError as error:
+        if path_exists(src):
+            raise
         logger.debug("Failed to copy file %s to %s: %s", src, dst, error)
         try:
             size = os.path.getsize(dst) if allow_existing_destination else None

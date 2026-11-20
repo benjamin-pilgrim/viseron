@@ -94,6 +94,7 @@ class DataItemMoveFile:
     callback_id: str | None = None
     coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
+    retryable_error: bool = False
     deferred: bool = False
     published: bool = False
     source_missing: bool = False
@@ -110,6 +111,7 @@ class DataItemCopyFile:
     callback_id: str | None = None
     coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
+    retryable_error: bool = False
     deferred: bool = False
     copied: bool = False
     published: bool = False

@@ -1643,9 +1643,11 @@ def move_file(
         delete_file(storage, src)
 
     def _move_file_callback(item: DataItemMoveFile) -> None:
-        if item.deferred:
+        if item.deferred or item.retryable_error:
             storage.temporary_files_meta.pop(dst, None)
             storage.temporary_moving_files.discard(src)
+            if item.retryable_error:
+                logger.warning("Retrying move from %s to %s: %s", src, dst, item.error)
             if on_complete is not None:
                 on_complete(False)
             elif _is_recording_artifact(_curr_tier_category, _curr_tier_subcategory):
@@ -1724,7 +1726,7 @@ def move_file(
         )
 
     def _copy_init_callback(item: DataItemCopyFile) -> None:
-        if item.deferred:
+        if item.deferred or item.retryable_error:
             _retry_tier(
                 storage,
                 camera_identifier,
