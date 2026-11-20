@@ -202,6 +202,37 @@ It will automatically use OpenCV with OpenCL for object detection.
 
 The `dnn_backend` and `dnn_target` controls how the model runs.
 
+##### Preserve the Intel OpenCL compiler cache
+
+Intel's OpenCL driver caches compiled GPU kernels. Keeping that cache on
+persistent local storage avoids recompilation after replacing a container.
+Create `cache/intel-opencl` under the host directory mounted at `/config`, with
+write permission for the container's configured `PUID` and `PGID`.
+
+Add these variables to the **container environment**, rather than
+`config.yaml`:
+
+```yaml title="Docker Compose service environment"
+environment:
+  NEO_CACHE_DIR: /config/cache/intel-opencl
+  NEO_CACHE_MAX_SIZE: "67108864"
+```
+
+For Podman Quadlet, use:
+
+```ini
+[Container]
+Environment=NEO_CACHE_DIR=/config/cache/intel-opencl
+Environment=NEO_CACHE_MAX_SIZE=67108864
+```
+
+This example limits the cache to 64 MiB. Keep `/config` on local persistent
+storage for this layout. An empty cache still requires an initial compilation
+pass; new kernels or driver changes can also cause cache misses. Keep the cache
+directory when recreating the container. See the
+[Intel compiler-cache reference](https://github.com/intel/compute-runtime/blob/master/programmers-guide/COMPILER_CACHE.md)
+for cache keys, size limits and driver support.
+
 :::warning
 
 Since upgrading to Ubuntu 22.04, OpenCV 4.9.0 and OpenVINO 2023.3, the `openvino` backend is broken and causes segmentation faults.
