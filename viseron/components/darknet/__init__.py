@@ -161,6 +161,27 @@ def unload(vis: Viseron) -> None:
     vis.data.pop(COMPONENT, None)
 
 
+def _get_current_result(
+    result_queue: Queue,
+    camera_identifier: str,
+    request_id: str,
+    submitted: float,
+) -> Any:
+    """Ignore expired requests without extending this frame's wait budget."""
+    deadline = submitted + 3
+    while (remaining := deadline - time.monotonic()) > 0:
+        item = result_queue.get(timeout=remaining)
+        if item.get("request_id") == request_id:
+            return item["result"]
+        LOGGER.debug(
+            "Discarding late detector result camera=%s expected=%s received=%s",
+            camera_identifier,
+            request_id,
+            item.get("request_id"),
+        )
+    raise Empty
+
+
 class LoadDarknetError(ViseronError):
     """Raised when failing to load Darknet network."""
 
@@ -307,7 +328,9 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
             },
         )
         try:
-            item = result_queue.get(timeout=3)
+            return _get_current_result(
+                result_queue, camera_identifier, request_id, submitted
+            )
         except Empty:
             activity = self._worker_activity
             LOGGER.warning(
@@ -327,14 +350,6 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
                 else None,
             )
             return None
-        if item.get("request_id") != request_id:
-            LOGGER.warning(
-                "Detector result request mismatch camera=%s expected=%s received=%s",
-                camera_identifier,
-                request_id,
-                item.get("request_id"),
-            )
-        return item["result"]
 
     def work_output(self, item) -> None:
         """Put result into queue."""
@@ -494,19 +509,23 @@ class DarknetNative(BaseDarknet, ChildProcessWorker):
     ):
         """Perform detection."""
         self._result_queues[camera_identifier] = result_queue
+        request_id = uuid.uuid4().hex
+        submitted = time.monotonic()
         pop_if_full(
             self.input_queue,
             {
                 "frame": frame,
                 "camera_identifier": camera_identifier,
                 "min_confidence": min_confidence,
+                "request_id": request_id,
             },
         )
         try:
-            item = result_queue.get(timeout=3)
+            return _get_current_result(
+                result_queue, camera_identifier, request_id, submitted
+            )
         except Empty:
             return None
-        return item["result"]
 
     def post_process(self, detections, camera_resolution) -> list[DetectedObject]:
         """Post process detections."""

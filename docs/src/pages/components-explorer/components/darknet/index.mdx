@@ -32,6 +32,11 @@ YOLOv7 is the default model used by `darknet` in all images.
 
 :::
 
+Detection requests wait up to three seconds for their result. If a request times
+out, its late result is discarded instead of being applied to a newer frame.
+That frame's result cannot trigger an object-detection event; subsequent frames
+continue to be processed.
+
 ## Configuration
 
 <details>
