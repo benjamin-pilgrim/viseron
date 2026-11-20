@@ -21,7 +21,22 @@ Pulling `roflcoopter/viseron:latest` should automatically pull the correct image
 An exception to this is if you have the need for a specific container, eg the CUDA version.
 Then you will need to specify your desired image.
 
-Allow at least 90 seconds when stopping the container so Viseron, PostgreSQL and the service supervisor can finish. With Podman Quadlet, set `StopTimeout=90` in `[Container]` and `TimeoutStopSec=120` in `[Service]`.
+Allow at least 90 seconds when stopping the container so Viseron, PostgreSQL and the service supervisor can finish.
+
+With Podman Quadlet, set `StopTimeout=90` in `[Container]`. Also configure the
+service stop command explicitly: the generated `podman rm --force` command has
+its own timeout. For a Quadlet named `viseron.container`, create
+`/etc/systemd/system/viseron.service.d/stop-grace.conf`:
+
+```ini
+[Service]
+ExecStop=
+ExecStop=/usr/bin/podman stop --time 90 systemd-viseron
+TimeoutStopSec=120
+```
+
+Run `systemctl daemon-reload` after changing the Quadlet or service override.
+Adjust the service and container names if your Quadlet has a different name.
 
 The images available are:
 
