@@ -9,6 +9,7 @@ import pytest
 
 from viseron.components.storage.util import (
     is_transient_filesystem_error,
+    move_file_atomic,
     path_exists,
     tier_path_available,
 )
@@ -45,3 +46,19 @@ def test_tier_path_available_uses_stat_not_scandir() -> None:
 
     stat_mock.assert_called_once_with("/remote/tier")
     scandir_mock.assert_not_called()
+
+
+def test_failed_replace_preserves_source_with_same_size_destination(tmp_path) -> None:
+    """A stale same-size file must never authorize removal of the source."""
+    src, dst = tmp_path / "source", tmp_path / "destination"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"old")
+    with (
+        patch("os.replace", side_effect=OSError(errno.EIO, "rename failed")),
+        pytest.raises(OSError, match="rename failed"),
+    ):
+        move_file_atomic(str(src), str(dst))
+
+    assert src.read_bytes() == b"new"
+    assert dst.read_bytes() == b"old"
+    assert set(tmp_path.iterdir()) == {src, dst}

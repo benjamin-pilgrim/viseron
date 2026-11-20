@@ -183,7 +183,10 @@ function SyncManager({ children }: SyncManagerProps) {
       return;
     }
 
-    if (playersWithTime.length === 1) {
+    if (
+      playersWithTime.length === 1 &&
+      !playersWithTime[0].current.media?.paused
+    ) {
       const player = playersWithTime[0];
       if (currentReferencePlayer !== player.current) {
         setReferencePlayer(player.current);

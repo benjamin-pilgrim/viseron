@@ -1144,6 +1144,9 @@ class ThumbnailTierHandler(TierHandler):
                 )
                 return
 
+            if recording.thumbnail_path is None:
+                return
+
             handle_file(
                 self._vis,
                 self._storage.get_session,
@@ -1336,6 +1339,10 @@ class ArtifactRetryQueue:
             )
             for operation in pending:
                 operation.retry_at = now + timedelta(seconds=5)
+            # The worker callbacks need these values after the session closes.
+            session.flush()
+            for operation in pending:
+                session.expunge(operation)
             session.commit()
 
         for operation in pending:
@@ -1696,11 +1703,22 @@ def move_file(
         moving_files = getattr(storage, "temporary_moving_files", None)
         if moving_files is not None:
             moving_files.add(src)
+        destination_root = None
+        if (
+            _curr_tier_category == TIER_CATEGORY_RECORDER
+            and _curr_tier_subcategory == TIER_SUBCATEGORY_EVENT_CLIPS
+        ):
+            destination_root = os.path.normpath(
+                os.path.join(
+                    dst_tier_path, TIER_SUBCATEGORY_EVENT_CLIPS, camera_identifier
+                )
+            )
         storage.tier_check_worker_send_command(
             DataItemMoveFile(
                 cmd="move_file",
                 src=src,
                 dst=dst,
+                destination_root=destination_root,
             ),
             callback=_move_file_callback,
         )

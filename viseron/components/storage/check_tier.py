@@ -24,6 +24,7 @@ from viseron.components.storage.models import (
 from viseron.components.storage.util import (
     copy_file_atomic,
     raise_if_path_unavailable,
+    tier_path_available,
 )
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_state_changes
@@ -356,7 +357,11 @@ class Worker:
         """Move file from source to destination."""
         with self._file_lock(item.src):
             result = copy_file_for_tier_worker(
-                item.src, item.dst, LOGGER, allow_existing_destination=False
+                item.src,
+                item.dst,
+                LOGGER,
+                allow_existing_destination=False,
+                destination_root=item.destination_root,
             )
             item.published = result.published
             item.source_missing = result.source_missing
@@ -972,10 +977,16 @@ def copy_file_for_tier_worker(
     logger: logging.Logger,
     *,
     allow_existing_destination: bool = True,
+    destination_root: str | None = None,
 ) -> FileCopyResult:
     """Copy file from src to dst without removing src."""
     logger.debug("Copying file from %s to %s", src, dst)
-    raise_if_path_unavailable(dst)
+    if destination_root is None:
+        raise_if_path_unavailable(dst)
+    elif os.path.commonpath(
+        (destination_root, dst)
+    ) != destination_root or not tier_path_available(destination_root):
+        raise OSError(f"Destination directory is unavailable: {destination_root}")
     try:
         raise_if_path_unavailable(src)
         size = copy_file_atomic(src, dst)

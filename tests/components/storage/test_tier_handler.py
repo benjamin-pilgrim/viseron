@@ -9,15 +9,18 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
 from sqlalchemy import event, insert, select, text
+from sqlalchemy.orm import sessionmaker
 from watchdog.events import FileCreatedEvent, FileDeletedEvent, FileMovedEvent
 
 from viseron.components.storage import TIER_CATEGORIES, Storage
+from viseron.components.storage.check_tier import Worker
 from viseron.components.storage.config import RecorderTier, Tier
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
@@ -77,11 +80,10 @@ from tests.common import BaseTestWithRecordings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from numpy._typing._array_like import NDArray
     from sqlalchemy.engine import ExceptionContext
-    from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy.orm import Session
 
     from viseron import Viseron
 
@@ -814,11 +816,14 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
     vis: MockViseron, db_storage: Mock, tmp_path: Path
 ) -> None:
     """The durable queue retains different operations for the same source."""
+    db_storage.get_session = sessionmaker(bind=db_storage.get_session.kw["bind"])
     db_storage.camera_requested_files_count = {"test": Mock(filenames=set())}
     worker = db_storage.tier_check_worker_send_command
-    src = _create_file(str(tmp_path / "event_clips" / "test" / "clip.mp4"))
-    archive = str(tmp_path / "archive")
-    dst = f"{archive}/event_clips/test/clip.mp4"
+    clip = Path("event_clips/test/2026-11-20/clip.mp4")
+    src = _create_file(str(tmp_path / clip))
+    archive = tmp_path / "archive"
+    (archive / clip.parent.parent).mkdir(parents=True)
+    dst = archive / clip
     tier_path = str(tmp_path)
     upsert_file_at_location(
         db_storage.get_session, "test", "recorder", "event_clips", 0, tier_path, src
@@ -829,7 +834,7 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
         callback(item)
 
     worker.side_effect = defer
-    for next_tier in (Tier(path=archive), None, None):
+    for next_tier in (Tier(path=str(archive)), None, None):
         handle_file(
             vis,
             db_storage.get_session,
@@ -857,19 +862,17 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
     sent_move = worker.call_args
     move = sent_move.args[0]
     assert isinstance(move, DataItemMoveFile)
-    assert (move.src, move.dst) == (src, dst)
-    sent_move.kwargs["callback"](
-        DataItemMoveFile(
-            cmd="move_file", src=src, dst=dst, published=True, size=os.stat(src).st_size
-        )
-    )
+    assert (move.src, move.dst) == (src, str(dst))
+    Worker().work_input(move)
+    assert dst.read_bytes() == Path(src).read_bytes()
+    sent_move.kwargs["callback"](move)
     with db_storage.get_session() as session:
         locations = dict(
             session.execute(select(FileLocations.path, FileLocations.state)).all()
         )
     assert locations == {
         src: FileLocationState.PENDING_DELETE.value,
-        dst: FileLocationState.AVAILABLE.value,
+        str(dst): FileLocationState.AVAILABLE.value,
     }
     with patch(
         "viseron.components.storage.tier_handler.utcnow",
@@ -888,6 +891,19 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
     ):
         retries.drain()
     assert worker.call_count == 3
+
+
+def test_retention_skips_missing_thumbnail(vis: MockViseron) -> None:
+    """A missing thumbnail does not block artifact retention."""
+    storage = MagicMock(spec=Storage)
+    storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+    with storage.get_session() as session:
+        session.execute.return_value.scalar_one.return_value.thumbnail_path = None
+    handler = _make_bare_tier_handler(
+        ThumbnailTierHandler, vis, storage, 0, "/active", "recorder", "thumbnails"
+    )
+    handler.move_thumbnail(42, Tier(path="/archive"))
+    storage.tier_check_worker_send_command.assert_not_called()
 
 
 @pytest.mark.parametrize("move", [True, False])

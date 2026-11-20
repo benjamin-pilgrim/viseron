@@ -211,6 +211,24 @@ describe("HlsPlayer requestedTimestamp seeking", () => {
     expect(video.currentTime).toBe(42);
   });
 
+  it("loads the explicit timestamp when the earlier playlist is still loading", () => {
+    act(() => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(PLAYLIST_START);
+    });
+    renderWithContext(<HlsPlayer camera={mockCamera} />);
+    const originalPlayer = latestHls();
+    const target = PLAYLIST_START + 86400;
+
+    act(() => {
+      useReferencePlayerStore.getState().setRequestedTimestamp(target);
+    });
+
+    expect(originalPlayer.destroy).toHaveBeenCalledOnce();
+    expect(latestHls().loadSource).toHaveBeenCalledWith(
+      expect.stringContaining(`start_timestamp=${target - 3600}`),
+    );
+  });
+
   it("reinitializes when requestedTimestamp is outside the playlist", () => {
     setupPlayingPlayer();
 

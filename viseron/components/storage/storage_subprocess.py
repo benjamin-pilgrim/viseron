@@ -90,6 +90,7 @@ class DataItemMoveFile:
     cmd: Literal["move_file"]
     src: str
     dst: str
+    destination_root: str | None = None
     callback_id: str | None = None
     coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None

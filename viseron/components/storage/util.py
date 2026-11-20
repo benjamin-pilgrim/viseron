@@ -128,17 +128,21 @@ def copy_file_atomic(src: str, dst: str) -> int:
         try:
             os.replace(tmp_dst, dst)
         except OSError as replace_error:
-            # Network filesystems can publish the rename server-side but lose the
-            # success reply. If the destination now verifies at the expected size,
-            # treat the publish as committed instead of retrying a duplicate move.
+            # A lost rename acknowledgement can leave a published destination.
+            # Verify the bytes before allowing a move to remove its source.
             try:
-                dst_size = os.path.getsize(dst)
-            except OSError as stat_error:
-                raise replace_error from stat_error
-            if dst_size == src_size:
-                fsync_directory(os.path.dirname(dst))
-                return src_size
-            raise replace_error
+                if path_exists(tmp_dst) or os.path.getsize(dst) != src_size:
+                    raise replace_error
+                with open(src, "rb") as source, open(dst, "rb") as destination:
+                    while chunk := source.read(1024 * 1024):
+                        if destination.read(len(chunk)) != chunk:
+                            raise replace_error
+                    if destination.read(1):
+                        raise replace_error
+            except OSError as verify_error:
+                if verify_error is not replace_error:
+                    raise replace_error from verify_error
+                raise
         fsync_directory(os.path.dirname(dst))
         return src_size
     except Exception:

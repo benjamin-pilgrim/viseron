@@ -15,7 +15,7 @@ from math import ceil
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from viseron.components.storage.const import (
     TIER_CATEGORY_RECORDER,
@@ -391,19 +391,20 @@ def _get_hashed_init_file(
     init_filename = f"init-{init_hash}.mp4"
     with get_session() as session:
         stmt = (
-            select(FileLocations.path)
+            select(FileLocations.directory)
             .join(Files, Files.id == FileLocations.file_id)
             .where(Files.camera_identifier == camera_identifier)
             .where(Files.category == TIER_CATEGORY_RECORDER)
             .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
             .where(Files.hls_init_hash == init_hash)
             .where(FileLocations.state == FileLocationState.AVAILABLE.value)
-            .order_by(FileLocations.tier_id.asc())
+            .group_by(FileLocations.directory)
+            .order_by(func.min(FileLocations.tier_id), FileLocations.directory)
         )
-        segment_paths = session.execute(stmt).scalars().all()
+        directories = session.execute(stmt).scalars().all()
 
-    for segment_path in segment_paths:
-        init_path = os.path.join(os.path.dirname(segment_path), init_filename)
+    for directory in directories:
+        init_path = os.path.join(directory, init_filename)
         if not file_tier_for_path(
             storage,
             camera_identifier,
@@ -502,28 +503,28 @@ def _hashed_init_file_url(
     return f"{subpath}/api/v1/hls/init/{camera.identifier}/{init_hash}.mp4"
 
 
-def _init_file_url(
-    camera: AbstractCamera | FailedCamera,
-    subpath: str,
-    files: list,
-) -> str | None:
-    """Return logical HLS init file URL for the first fragment."""
-    if not files:
-        return None
-    if getattr(files[0], "hls_init_hash", None):
-        return _hashed_init_file_url(camera, subpath, files[0].hls_init_hash)
-    return _legacy_init_file_url(camera, subpath, files[0].tier_id)
-
-
-def _legacy_init_files_available(
+def _legacy_init_tiers(
     camera: AbstractCamera | FailedCamera,
     files: list,
-) -> bool:
-    """Return if all legacy fragments have an available init.mp4."""
+) -> dict[int, int] | None:
+    """Map recorded legacy tiers to configured init routes."""
     legacy_tier_ids = {
         file.tier_id for file in files if not getattr(file, "hls_init_hash", None)
     }
-    return all(_get_init_file(camera, tier_id) for tier_id in legacy_tier_ids)
+    tiers = {}
+    fallback = None
+    for tier_id in sorted(legacy_tier_ids):
+        if _get_init_file(camera, tier_id):
+            tiers[tier_id] = tier_id
+            if tier_id == 0:
+                fallback = True
+            continue
+        if fallback is None:
+            fallback = tier_id != 0 and _get_init_file(camera, 0) is not None
+        if not fallback:
+            return None
+        tiers[tier_id] = 0
+    return tiers
 
 
 def get_target_duration(fragments: list[Fragment]) -> int:
@@ -569,7 +570,12 @@ def update_hls_client(
     return hls_client, 0
 
 
-def files_to_fragments(subpath: str, files: list) -> list[Fragment]:
+def files_to_fragments(
+    camera: AbstractCamera | FailedCamera,
+    subpath: str,
+    files: list,
+    legacy_init_tiers: dict[int, int],
+) -> list[Fragment]:
     """Create fragments that reference segments by their file key.
 
     Segment URIs must not change between updates of a playlist, and the file key
@@ -582,13 +588,10 @@ def files_to_fragments(subpath: str, files: list) -> list[Fragment]:
             f"{subpath}/file/{file.camera_identifier}/{file.file_key:x}",
             file.duration,
             file.orig_ctime,
-            (
-                f"{subpath}/api/v1/hls/init/{file.camera_identifier}/"
-                f"{file.hls_init_hash}.mp4"
-            )
+            _hashed_init_file_url(camera, subpath, file.hls_init_hash)
             if getattr(file, "hls_init_hash", None)
-            else (
-                f"{subpath}/api/v1/hls/init/{file.camera_identifier}/{file.tier_id}.mp4"
+            else _legacy_init_file_url(
+                camera, subpath, legacy_init_tiers[file.tier_id]
             ),
         )
         for file in files
@@ -649,10 +652,10 @@ def _generate_playlist(
         get_session,
         now=now,
     )
-    fragments = files_to_fragments(subpath, files)
-
-    if not fragments:
+    legacy_init_tiers = _legacy_init_tiers(camera, files)
+    if not files or legacy_init_tiers is None:
         return None
+    fragments = files_to_fragments(camera, subpath, files, legacy_init_tiers)
 
     end: bool = True
     # Recording has not ended yet
@@ -672,16 +675,9 @@ def _generate_playlist(
         LOGGER.debug("Recording has ended but the last file is not finished yet")
         end = False
 
-    if not _legacy_init_files_available(camera, files):
-        return None
-
-    init_file_url = _init_file_url(camera, subpath, files)
-    if not init_file_url:
-        return None
-
     return _render_client_playlist(
         fragments,
-        init_file_url,
+        fragments[0].init_file or "",
         hls_client_id,
         skip_requested=skip_requested,
         end=end,
@@ -714,20 +710,17 @@ def _generate_playlist_time_period(
     files = get_time_period_fragments(
         [camera.identifier], start_timestamp, end_timestamp, get_session
     )
-    fragments = files_to_fragments(subpath, files)
+    if not files:
+        return generate_playlist([], "", end=True) if end_playlist else None
 
-    if not fragments and end_playlist:
-        return generate_playlist([], "", end=True)
-
-    if not _legacy_init_files_available(camera, files):
+    legacy_init_tiers = _legacy_init_tiers(camera, files)
+    if legacy_init_tiers is None:
         return None
-    init_file_url = _init_file_url(camera, subpath, files)
-    if not init_file_url:
-        return None
+    fragments = files_to_fragments(camera, subpath, files, legacy_init_tiers)
 
     return _render_client_playlist(
         fragments,
-        init_file_url,
+        fragments[0].init_file or "",
         hls_client_id,
         skip_requested=skip_requested,
         end=end_playlist,

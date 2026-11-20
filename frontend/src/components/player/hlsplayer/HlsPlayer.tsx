@@ -301,21 +301,16 @@ const useSeekToTimestamp = (
     }
     handledTimestampRef.current = requestedTimestamp;
 
-    if (!hlsRef.current || !videoRef.current || !hlsRef.current.media) {
+    const player = hlsRef.current;
+    const video = videoRef.current;
+    const fragments = player?.levels[player.currentLevel]?.details?.fragments;
+    if (!player?.media || !video || !fragments?.length) {
+      // A request made while the previous playlist loads supersedes that load.
+      reInitPlayer();
       return;
     }
 
     const requestedTimestampMillis = requestedTimestamp * 1000;
-    // Set seek target timestamp
-    const currentLevel = hlsRef.current.levels[hlsRef.current.currentLevel];
-    if (!currentLevel || !currentLevel.details) {
-      return;
-    }
-
-    const fragments = currentLevel.details.fragments;
-    if (!fragments || fragments.length === 0) {
-      return;
-    }
     const fragment = findFragmentByTimestamp(
       fragments,
       requestedTimestampMillis,
@@ -323,8 +318,8 @@ const useSeekToTimestamp = (
 
     if (fragment) {
       const seekTarget = getSeekTarget(fragment, requestedTimestampMillis);
-      seekMediaAndStartLoad(hlsRef.current, videoRef.current, seekTarget);
-      videoRef.current.play().catch(() => {
+      seekMediaAndStartLoad(player, video, seekTarget);
+      video.play().catch(() => {
         // Ignore play errors
       });
     } else {

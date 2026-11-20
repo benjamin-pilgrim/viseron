@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import uuid
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -448,6 +449,75 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
             archive_init.write_bytes(b"archive init")
             assert self.fetch(init_url).body == b"archive init"
             assert self.fetch("/api/v1/hls/init/test/999.mp4").code == 404
+            with self._get_db_session() as session:
+                session.execute(
+                    update(Files)
+                    .where(Files.camera_identifier == "test")
+                    .values(tier_id=999)
+                )
+                session.commit()
+            migrated = self.fetch("/api/v1/hls/test/1/index.m3u8")
+            assert migrated.code == 200
+            assert b'/api/v1/hls/init/test/0.mp4"' in migrated.body
+            assert self.fetch("/api/v1/hls/init/test/0.mp4").body == b"legacy init"
+
+    def test_hashed_init_tries_each_media_directory_once(self) -> None:
+        """An unavailable share costs one init lookup even with many segment rows."""
+        roots = self._tier_roots
+        primary = roots[0] / "segments" / "test"
+        archive = roots[1] / "segments" / "test"
+        init_hash = "a" * 64
+        filename = f"init-{init_hash}.mp4"
+        archive.mkdir(parents=True)
+        (archive / filename).write_bytes(b"archive init")
+        with self._get_db_session() as session:
+            test_files = session.scalars(
+                select(Files).where(Files.camera_identifier == "test")
+            ).all()
+            for index, file in enumerate(test_files):
+                file.hls_init_hash = init_hash
+                tier_id = int(index == len(test_files) - 1)
+                directory = archive if tier_id else primary
+                session.execute(
+                    update(FileLocations)
+                    .where(FileLocations.file_id == file.id)
+                    .values(
+                        tier_id=tier_id,
+                        directory=str(directory),
+                        path=str(directory / file.filename),
+                    )
+                )
+            session.commit()
+
+        size = os.path.getsize
+        primary_attempts = []
+
+        def getsize(path):
+            if path == str(primary / filename):
+                primary_attempts.append(path)
+            return size(path)
+
+        with (
+            patch.object(
+                HlsAPIHandler, "_get_camera", return_value=MockCamera(identifier="test")
+            ),
+            patch.object(
+                HlsAPIHandler, "_get_session", side_effect=self._get_db_session
+            ),
+            patch(
+                "viseron.components.webserver.api.v1.hls.file_tier_for_path",
+                return_value=True,
+            ),
+            patch(
+                "viseron.components.webserver.api.v1.hls.os.path.getsize",
+                side_effect=getsize,
+            ),
+        ):
+            response = self.fetch(f"/api/v1/hls/init/test/{init_hash}.mp4")
+
+        assert response.code == 200
+        assert response.body == b"archive init"
+        assert len(primary_attempts) == 1
 
     def _fetch_playlist(
         self,
