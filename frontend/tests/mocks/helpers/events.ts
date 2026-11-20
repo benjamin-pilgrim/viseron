@@ -47,7 +47,7 @@ const snapshotEvent = (
   lookback: LOOKBACK,
   time: isoString(timestamp),
   timestamp,
-  snapshot_path: `/files/tier1/snapshots/${camera_identifier}/${type}-${id}.jpg`,
+  snapshot_url: `/files/tier1/snapshots/${camera_identifier}/${type}-${id}.jpg`,
 });
 
 // Each event is motion followed by a recording, and depending on the slot
@@ -65,7 +65,7 @@ const generateEvents = (
     {
       ...timedEvent(camera_identifier, id, start, start + MOTION_DURATION),
       type: "motion",
-      snapshot_path: `/files/tier1/snapshots/${camera_identifier}/motion-${id}.jpg`,
+      snapshot_url: `/files/tier1/snapshots/${camera_identifier}/motion-${id}.jpg`,
     },
     {
       ...timedEvent(
@@ -77,7 +77,7 @@ const generateEvents = (
       type: "recording",
       trigger_type: kind === 3 ? "motion" : "object",
       hls_url: `/api/v1/hls/${camera_identifier}/${id}/index.m3u8`,
-      thumbnail_path: `/files/tier1/thumbnails/${camera_identifier}/${id}.jpg`,
+      thumbnail_url: `/files/tier1/thumbnails/${camera_identifier}/${id}.jpg`,
     },
   ];
   const detected = start + 5;

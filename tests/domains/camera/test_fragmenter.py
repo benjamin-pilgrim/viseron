@@ -93,6 +93,32 @@ def test_generate_playlist() -> None:
 PLAYLIST_BASE_TIME = datetime.datetime(2024, 1, 1)
 
 
+def test_generate_playlist_discontinuity_sequence() -> None:
+    """Test generate_playlist uses independent discontinuity sequence."""
+    now = utcnow()
+    fragments = [
+        Fragment("test1.mp4", "/test/test1.mp4", 5, now),
+        Fragment(
+            "test2.mp4",
+            "/test/test2.mp4",
+            5,
+            now + datetime.timedelta(seconds=20),
+        ),
+    ]
+
+    playlist = generate_playlist(
+        fragments,
+        "/test/init.mp4",
+        media_sequence=12,
+        discontinuity_sequence=3,
+    )
+
+    playlist_lines = playlist.splitlines()
+    assert "#EXT-X-MEDIA-SEQUENCE:12" in playlist
+    assert "#EXT-X-DISCONTINUITY-SEQUENCE:3" in playlist
+    assert playlist_lines.count("#EXT-X-DISCONTINUITY") == 1
+
+
 def _playlist_segment(index: int, program_date_time: str) -> list[str]:
     return [
         f"#EXT-X-PROGRAM-DATE-TIME:2024-01-01T{program_date_time}+00:00",
@@ -386,6 +412,7 @@ def _fragmenter_work(temp_segments_folder: str, segments_folder: str) -> Fragmen
         None,
         None,
         get_child_process_context().Event(),
+        get_child_process_context().Value("Q", 0),
     )
 
 
@@ -446,21 +473,35 @@ class TestFragmenterWork:
             check=True,
         )
 
-    @patch("viseron.domains.camera.fragmenter_process.shutil.move")
-    def test_move_to_segments_folder_mp4box(self, mock_shutil_move: Mock) -> None:
-        """Test that the files are moved to the segments folder."""
-        mock_shutil_move.return_value = MagicMock()
-        self.work._move_to_segments_folder_mp4box("test.mp4", utcnow())
-        mock_shutil_move.assert_any_call(
-            os.path.join(self.temp_segments_folder, "test", "clip_1.m4s"),
-            os.path.join(self.segments_folder, "test.m4s"),
-        )
+    @pytest.mark.parametrize("acknowledge", [True, False])
+    def test_publish_waits_for_matching_metadata(self, acknowledge: bool) -> None:
+        """A fragment is visible only with its init and acknowledged metadata."""
+        src = os.path.join(self.temp_segments_folder, "123.m4s")
+        init = os.path.join(self.temp_segments_folder, "init.mp4")
+        dst = os.path.join(self.segments_folder, "123.m4s")
+        with open(src, "wb") as file:
+            file.write(b"segment")
+        with open(init, "wb") as file:
+            file.write(b"init")
 
-        mock_shutil_move.assert_any_call(
-            os.path.join(self.temp_segments_folder, "test", "clip_init.mp4"),
-            os.path.join(self.segments_folder, "init.mp4"),
-        )
-        assert mock_shutil_move.call_count == 2
+        def process_metadata(item) -> None:
+            assert not os.path.exists(dst)
+            if "metadata_request" in item and acknowledge:
+                self.work._metadata_ack.value = item["metadata_request"]
+                self.work._worker_event.set()
+
+        self.work.output_queue = MagicMock()
+        self.work.output_queue.put.side_effect = process_metadata
+        assert self.work._publish_segment(init, src, dst, utcnow(), 5.0) == acknowledge
+        assert os.path.exists(dst) == acknowledge
+        assert os.path.exists(src) != acknowledge
+        if acknowledge:
+            metadata = self.work.output_queue.put.call_args.args[0]
+            sidecar = os.path.join(
+                self.segments_folder, f"init-{metadata['hls_init_hash']}.mp4"
+            )
+            with open(sidecar, "rb") as file:
+                assert file.read() == b"init"
 
 
 class TestFragmenter:
@@ -755,14 +796,21 @@ def test_timelapse_frame_metadata_uses_segment_orig_ctime(
         "/timelapse/test_camera",
         "/tmp/timelapse/test_camera",
         MagicMock(),
+        MagicMock(),
     )
     order = MagicMock()
     work.output_queue = order.output_queue
+
+    def acknowledge(item) -> None:
+        work._metadata_ack.value = item["metadata_request"]
+
+    work.output_queue.put.side_effect = acknowledge
 
     with (
         patch.object(work, "_read_m3u8", return_value=m3u8),
         patch.object(work, "_read_m3u8_mp4box", return_value=m3u8),
         patch.object(work, "_mp4box_command", return_value=True),
+        patch.object(work, "_publish_segment") as publish,
         patch("viseron.domains.camera.fragmenter_process.sp.run") as mock_run,
         patch("viseron.domains.camera.fragmenter_process.shutil", order.shutil),
         patch("viseron.domains.camera.fragmenter_process.os.remove"),
@@ -771,14 +819,13 @@ def test_timelapse_frame_metadata_uses_segment_orig_ctime(
         getattr(work, handler)(file)
 
     frame_path = "/timelapse/test_camera/1723111156.jpg"
-    frame_meta = call.output_queue.put(
-        {"path": frame_path, "orig_ctime": expected_orig_ctime, "duration": None}
-    )
-    assert frame_meta in order.mock_calls
+    frame_metadata = order.output_queue.put.call_args.args[0]
+    assert frame_metadata["path"] == frame_path
+    assert frame_metadata["orig_ctime"] == expected_orig_ctime
+    frame_meta = call.output_queue.put(frame_metadata)
     # The metadata must be registered before the file appears in the tier
     frame_move = call.shutil.move(
         "/tmp/timelapse/test_camera/1723111156.jpg", frame_path
     )
     assert order.mock_calls.index(frame_meta) < order.mock_calls.index(frame_move)
-    segment_meta = order.output_queue.put.call_args_list[0].args[0]
-    assert segment_meta["orig_ctime"] == expected_orig_ctime
+    assert publish.call_args.args[-2] == expected_orig_ctime

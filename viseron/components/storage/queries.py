@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from sqlalchemy import ColumnElement, and_, desc, distinct, func, or_, select
+from sqlalchemy import ColumnElement, and_, desc, distinct, exists, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.functions import coalesce
 
@@ -18,7 +18,12 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_SEGMENTS,
     TIER_SUBCATEGORY_TIMELAPSE,
 )
-from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.models import (
+    FileLocations,
+    FileLocationState,
+    Files,
+    Recordings,
+)
 from viseron.helpers import utcnow
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +59,11 @@ def get_recording_fragments(
         .where(Files.category == TIER_CATEGORY_RECORDER)
         .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
         .where(Files.duration.isnot(None))
+        .where(
+            exists()
+            .where(FileLocations.file_id == Files.id)
+            .where(FileLocations.state == FileLocationState.AVAILABLE.value)
+        )
         .where(
             or_(
                 # Fetch all files that start within the recording
@@ -119,6 +129,11 @@ def get_time_period_fragments(
         .where(Files.category == TIER_CATEGORY_RECORDER)
         .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
         .where(Files.duration.isnot(None))
+        .where(
+            exists()
+            .where(FileLocations.file_id == Files.id)
+            .where(FileLocations.state == FileLocationState.AVAILABLE.value)
+        )
         .where(
             or_(
                 # Fetch all files that start between the start and end timestamp
@@ -194,6 +209,17 @@ def _timelapse_filter(camera_identifiers: list[str]) -> tuple[ColumnElement[bool
     )
 
 
+def _available_timelapse_location() -> ColumnElement[bool]:
+    return (
+        exists()
+        .correlate(Files)
+        .where(
+            FileLocations.file_id == Files.id,
+            FileLocations.state == FileLocationState.AVAILABLE.value,
+        )
+    )
+
+
 def get_timelapse_frames(
     camera_identifier: str,
     start_timestamp: float,
@@ -210,6 +236,7 @@ def get_timelapse_frames(
     """
     in_range = (
         *_timelapse_filter([camera_identifier]),
+        _available_timelapse_location(),
         Files.orig_ctime.between(
             datetime.datetime.fromtimestamp(start_timestamp, tz=datetime.timezone.utc),
             datetime.datetime.fromtimestamp(end_timestamp, tz=datetime.timezone.utc),
@@ -227,10 +254,11 @@ def get_timelapse_frames(
             return TimelapseFrames(total=0, step=None, frames=[])
 
         unique_frames = (
-            select(Files.file_key, Files.path, Files.orig_ctime)
-            .where(*in_range)
+            select(Files.file_key, FileLocations.path, Files.orig_ctime)
+            .join(FileLocations, FileLocations.file_id == Files.id)
+            .where(*in_range, FileLocations.state == FileLocationState.AVAILABLE.value)
             .distinct(Files.file_key)
-            .order_by(Files.file_key, Files.tier_id)
+            .order_by(Files.file_key, FileLocations.tier_id)
             .subquery()
         )
         span = (last - first).total_seconds()
@@ -290,15 +318,26 @@ def get_timelapse_summary(
             func.min(Files.orig_ctime).label("first"),
             func.max(Files.orig_ctime).label("last"),
         )
-        .where(*_timelapse_filter(camera_identifiers))
+        .where(*_timelapse_filter(camera_identifiers), _available_timelapse_location())
         .group_by(Files.camera_identifier)
         .subquery()
     )
     latest = (
-        select(Files.camera_identifier, Files.file_key, Files.path, Files.orig_ctime)
+        select(
+            Files.camera_identifier,
+            Files.file_key,
+            FileLocations.path,
+            Files.orig_ctime,
+        )
+        .join(FileLocations, FileLocations.file_id == Files.id)
         .where(*_timelapse_filter(camera_identifiers))
+        .where(FileLocations.state == FileLocationState.AVAILABLE.value)
         .distinct(Files.camera_identifier)
-        .order_by(Files.camera_identifier, Files.orig_ctime.desc(), Files.tier_id.asc())
+        .order_by(
+            Files.camera_identifier,
+            Files.orig_ctime.desc(),
+            FileLocations.tier_id.asc(),
+        )
         .subquery()
     )
 
@@ -338,7 +377,9 @@ def get_timelapse_days(
                 local_date,
                 func.count(distinct(Files.file_key)),
             )
-            .where(*_timelapse_filter([camera_identifier]))
+            .where(
+                *_timelapse_filter([camera_identifier]), _available_timelapse_location()
+            )
             .group_by(local_date)
         ).all()
     return {day.isoformat(): count for day, count in rows}
@@ -352,10 +393,12 @@ def get_timelapse_frame_paths(
     """Return every stored path of the given timelapse frames, lowest tier first."""
     with get_session() as session:
         rows = session.execute(
-            select(Files.file_key, Files.path)
+            select(Files.file_key, FileLocations.path)
+            .join(FileLocations, FileLocations.file_id == Files.id)
+            .where(FileLocations.state == FileLocationState.AVAILABLE.value)
             .where(*_timelapse_filter([camera_identifier]))
             .where(Files.file_key.in_(file_keys))
-            .order_by(Files.file_key, Files.tier_id)
+            .order_by(Files.file_key, FileLocations.tier_id)
         ).all()
     paths: dict[int, list[str]] = {}
     for file_key, path in rows:

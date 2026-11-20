@@ -10,7 +10,7 @@ from unittest.mock import PropertyMock, patch
 import pytest
 from sqlalchemy import insert
 
-from viseron.components.storage.models import Motion, PostProcessorResults
+from viseron.components.storage.models import Files, Motion, PostProcessorResults
 from viseron.components.webserver.api.handlers import BaseAPIHandler
 from viseron.components.webserver.auth import Role, User
 from viseron.domains.camera.const import CONFIG_LOOKBACK, CONFIG_RECORDER
@@ -75,11 +75,31 @@ class TestEventsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
             )
             # Stored on a date of its own so the assertions on 2024-06-21/22
             # are unaffected
+            file_id = session.execute(
+                insert(Files)
+                .values(
+                    camera_identifier="test",
+                    category="snapshots",
+                    subcategory="image_classification",
+                    file_key=4242,
+                    path="/snapshots/image_classification/test/classification.jpg",
+                    directory="/snapshots/image_classification/test",
+                    filename="classification.jpg",
+                    tier_id=0,
+                    tier_path="/",
+                    size=123,
+                    orig_ctime=datetime.datetime(
+                        2024, 6, 25, 12, tzinfo=datetime.timezone.utc
+                    ),
+                )
+                .returning(Files.id)
+            ).scalar_one()
             session.execute(
                 insert(PostProcessorResults).values(
                     camera_identifier="test",
                     domain="image_classification",
-                    snapshot_path="/classification.jpg",
+                    snapshot_path="/snapshots/image_classification/test/classification.jpg",
+                    snapshot_file_id=file_id,
                     data={
                         "camera_identifier": "test",
                         "label": "package",
@@ -133,7 +153,7 @@ class TestEventsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
             "label": "package",
             "confidence": 0.87,
         }
-        assert events[0]["snapshot_path"] == "/files/classification.jpg"
+        assert events[0]["snapshot_url"] == "/file/test/1092"
         assert events[0]["created_at"] == "2024-06-25T12:00:00+00:00"
 
     def test_get_events_utc_offset_negative(self):

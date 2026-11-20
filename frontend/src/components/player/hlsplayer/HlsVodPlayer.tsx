@@ -10,6 +10,7 @@ import { HlsErrorOverlay } from "components/player/hlsplayer/HlsErrorOverlay";
 import { useFullscreen } from "components/player/hlsplayer/useFullscreen";
 import { useHlsPlayerControls } from "components/player/hlsplayer/useHlsPlayerControls";
 import {
+  HlsPlaybackMode,
   cleanupHlsInstance,
   createHlsInstance,
   setupHlsErrorHandling,
@@ -72,7 +73,7 @@ const initializePlayer = (
   }
 
   // Create a new hls instance using shared factory
-  hlsRef.current = createHlsInstance(auth, hlsClientIdRef);
+  hlsRef.current = createHlsInstance(auth, hlsClientIdRef, HlsPlaybackMode.Vod);
 
   // The shared config uses autoStartLoad: false, so nothing but the playlist is
   // fetched until startLoad is called. Register before loadSource so an early
@@ -194,6 +195,7 @@ export function HlsVodPlayer({
     handlePlayPause,
     handleJumpBackward,
     handleJumpForward,
+    handleProgressSeek,
     handleVolumeChange,
     handleMuteToggle,
     handleMouseEnter,
@@ -204,7 +206,7 @@ export function HlsVodPlayer({
     isHovering,
     isPlaying,
     isMuted,
-  } = useHlsPlayerControls(videoRef);
+  } = useHlsPlayerControls(videoRef, hlsRef);
 
   const { isFullscreen, isFullscreenSupported, toggleFullscreen } =
     useFullscreen(videoRef);
@@ -263,6 +265,7 @@ export function HlsVodPlayer({
         onMuteToggle={handleMuteToggle}
         videoRef={videoRef}
         showProgressBar={!!recording}
+        onProgressSeek={handleProgressSeek}
         isFullscreen={isFullscreen}
         onFullscreenToggle={toggleFullscreen}
         isFullscreenSupported={isFullscreenSupported}

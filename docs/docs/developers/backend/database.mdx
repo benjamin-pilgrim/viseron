@@ -21,6 +21,8 @@ See the [storage component documentation](/components-explorer/components/storag
 
 The database models are defined in the `viseron/components/storage/models.py` file.
 
+Media references point to logical files. The `file_locations` table tracks individual copies across storage tiers. Clients retrieve stored media through `/file/<camera>/<hex key>`. A key stays valid when its file moves, and a migrated key can resolve to the same logical file as the current key. Event clip identity includes the path within its tier so that clips with the same filename on different dates stay distinct.
+
 ## Migrations
 
 The database is managed using `alembic`.

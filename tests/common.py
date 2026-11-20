@@ -10,6 +10,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from multiprocessing.context import set_spawning_popen
 from multiprocessing.reduction import ForkingPickler
+from multiprocessing.resource_sharer import DupFd
 from typing import TYPE_CHECKING, Any, TypeVar
 from unittest.mock import MagicMock, Mock, patch
 
@@ -17,7 +18,7 @@ import pytest
 from sqlalchemy import insert
 
 from viseron.components import Component
-from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.models import FileLocations, Files, Recordings
 from viseron.const import LOADED
 from viseron.domain_registry import DomainState
 from viseron.domains.camera.const import (
@@ -54,7 +55,14 @@ def pickle_for_child_process(obj: T) -> T:
     Multiprocessing primitives such as Event refuse to be pickled unless a child
     process is being spawned, so pretend that one is.
     """
-    set_spawning_popen(object())
+
+    class Spawn:
+        """Duplicate shared-memory descriptors for a local round trip."""
+
+        DupFd = staticmethod(DupFd)
+        duplicate_for_child = staticmethod(int)
+
+    set_spawning_popen(Spawn())
     try:
         data = ForkingPickler.dumps(obj)
     finally:
@@ -356,7 +364,7 @@ class BaseTestWithRecordings:
             for i in range(15):
                 timestamp = self._now + datetime.timedelta(seconds=5 * i)
                 filename = f"{int(timestamp.timestamp())}.m4s"
-                session.execute(
+                file_result = session.execute(
                     insert(Files).values(
                         tier_id=0,
                         tier_path="/test/",
@@ -372,7 +380,21 @@ class BaseTestWithRecordings:
                         created_at=timestamp,
                     )
                 )
+                file_id = file_result.inserted_primary_key[0]
                 session.execute(
+                    insert(FileLocations).values(
+                        file_id=file_id,
+                        tier_id=0,
+                        tier_path="/test/",
+                        path=f"/test/{filename}",
+                        directory="test",
+                        filename=filename,
+                        size=10,
+                        state="available",
+                        created_at=timestamp,
+                    )
+                )
+                file_result = session.execute(
                     insert(Files).values(
                         tier_id=0,
                         tier_path="/test2/",
@@ -385,6 +407,20 @@ class BaseTestWithRecordings:
                         size=10,
                         orig_ctime=timestamp,
                         duration=5,
+                        created_at=timestamp,
+                    )
+                )
+                file_id = file_result.inserted_primary_key[0]
+                session.execute(
+                    insert(FileLocations).values(
+                        file_id=file_id,
+                        tier_id=0,
+                        tier_path="/test2/",
+                        path=f"/test2/{filename}",
+                        directory="test2",
+                        filename=filename,
+                        size=10,
+                        state="available",
                         created_at=timestamp,
                     )
                 )

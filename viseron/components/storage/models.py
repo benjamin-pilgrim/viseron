@@ -11,8 +11,10 @@ from typing import Literal
 from sqlalchemy import (
     BigInteger,
     ColumnElement,
+    Computed,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     Label,
@@ -115,6 +117,14 @@ class Files(Base):
         Index("idx_files_path", "path"),
         Index("idx_files_camera_id", "camera_identifier"),
         Index(
+            "uq_files_logical_key",
+            "camera_identifier",
+            "category",
+            "subcategory",
+            "logical_path",
+            unique=True,
+        ),
+        Index(
             "idx_files_tier_lookup",
             "camera_identifier",
             "tier_id",
@@ -139,8 +149,7 @@ class Files(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # Identifies the logical file across tier moves. Not unique: the source and
-    # destination rows carry the same key while a move is in flight.
+    # Public key for this logical file, independent of its physical locations.
     file_key: Mapped[int] = mapped_column(
         BigInteger,
         FILE_KEY_SEQUENCE,
@@ -154,11 +163,77 @@ class Files(Base):
     path: Mapped[str] = mapped_column(String, unique=True)
     directory: Mapped[str] = mapped_column(String)
     filename: Mapped[str] = mapped_column(String)
+    logical_path: Mapped[str] = mapped_column(
+        String,
+        Computed(
+            """CASE WHEN category = 'recorder' AND subcategory = 'event_clips'
+THEN substr(path, length(rtrim(tier_path, '/')) + 2)
+ELSE filename END""",
+            persisted=True,
+        ),
+    )
     size: Mapped[int] = mapped_column(Integer)
     duration: Mapped[float] = mapped_column(Float, nullable=True)
+    hls_init_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     orig_ctime: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), nullable=False
     )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        UTCDateTime(timezone=False), onupdate=UTCNow(), nullable=True
+    )
+
+
+class FileKeyAliases(Base):
+    """Upstream file keys retained when physical rows are consolidated."""
+
+    __tablename__ = "file_key_aliases"
+
+    file_key: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    file_id: Mapped[int] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), index=True
+    )
+
+
+class FileLocationState(str, Enum):
+    """Physical file location states."""
+
+    AVAILABLE = "available"
+    PENDING_DELETE = "pending_delete"
+    UNAVAILABLE = "unavailable"
+
+
+class FileLocations(Base):
+    """Database model for physical file locations."""
+
+    __tablename__ = "file_locations"
+
+    __table_args__ = (
+        Index("idx_file_locations_file_id", "file_id"),
+        Index("idx_file_locations_path", "path", unique=True),
+        Index("idx_file_locations_state", "state"),
+        Index(
+            "idx_file_locations_tier_lookup",
+            "tier_id",
+            "state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=False
+    )
+    tier_id: Mapped[int] = mapped_column(Integer)
+    tier_path: Mapped[str] = mapped_column(String)
+    path: Mapped[str] = mapped_column(String)
+    directory: Mapped[str] = mapped_column(String)
+    filename: Mapped[str] = mapped_column(String)
+    size: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="available")
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
     )
@@ -176,16 +251,7 @@ class FilesMeta:
 
     orig_ctime: datetime.datetime
     duration: float | None
-    file_key: int | None = None
-
-
-@dataclass
-class PendingMove:
-    """Destination of a file that is being moved to another tier."""
-
-    dst: str
-    tier_id: int
-    tier_path: str
+    hls_init_hash: str | None = None
 
 
 class TriggerTypes(Enum):
@@ -206,7 +272,9 @@ class Recordings(Base):
             "idx_recordings_camera_times", "camera_identifier", "start_time", "end_time"
         ),
         Index("idx_recordings_thumbnail", "thumbnail_path"),
+        Index("idx_recordings_thumbnail_file_id", "thumbnail_file_id"),
         Index("idx_recordings_clip", "clip_path"),
+        Index("idx_recordings_clip_file_id", "clip_file_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -225,7 +293,13 @@ class Recordings(Base):
     trigger_type: Mapped[TriggerTypes | None] = mapped_column(nullable=True)
     trigger_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     thumbnail_path: Mapped[str] = mapped_column(String, nullable=True)
+    thumbnail_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="SET NULL"), nullable=True
+    )
     clip_path: Mapped[str] = mapped_column(String, nullable=True)
+    clip_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="SET NULL"), nullable=True
+    )
     adjusted_start_time: Mapped[datetime.datetime | None] = mapped_column(
         UTCDateTime(timezone=False), nullable=False
     )
@@ -250,7 +324,10 @@ class Objects(Base):
 
     __tablename__ = "objects"
 
-    __table_args__ = (Index("idx_objects_snapshot", "snapshot_path"),)
+    __table_args__ = (
+        Index("idx_objects_snapshot", "snapshot_path"),
+        Index("idx_objects_snapshot_file_id", "snapshot_file_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_identifier: Mapped[str] = mapped_column(String)
@@ -263,6 +340,9 @@ class Objects(Base):
     x2: Mapped[float] = mapped_column(Float)
     y2: Mapped[float] = mapped_column(Float)
     snapshot_path: Mapped[str] = mapped_column(String, nullable=True)
+    snapshot_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="SET NULL"), nullable=True
+    )
     zone: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
@@ -277,7 +357,10 @@ class Motion(Base):
 
     __tablename__ = "motion"
 
-    __table_args__ = (Index("idx_motion_snapshot", "snapshot_path"),)
+    __table_args__ = (
+        Index("idx_motion_snapshot", "snapshot_path"),
+        Index("idx_motion_snapshot_file_id", "snapshot_file_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_identifier: Mapped[str] = mapped_column(String)
@@ -286,6 +369,9 @@ class Motion(Base):
         UTCDateTime(timezone=False), nullable=True
     )
     snapshot_path: Mapped[str] = mapped_column(String, nullable=True)
+    snapshot_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True
     )
@@ -315,12 +401,18 @@ class PostProcessorResults(Base):
 
     __tablename__ = "post_processor_results"
 
-    __table_args__ = (Index("idx_ppr_snapshot", "snapshot_path"),)
+    __table_args__ = (
+        Index("idx_ppr_snapshot", "snapshot_path"),
+        Index("idx_ppr_snapshot_file_id", "snapshot_file_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_identifier: Mapped[str] = mapped_column(String)
     domain: Mapped[str] = mapped_column(String)
     snapshot_path: Mapped[str] = mapped_column(String, nullable=True)
+    snapshot_file_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="SET NULL"), nullable=True
+    )
     data: Mapped[ColumnMeta] = mapped_column(JSONB)
     created_at: Mapped[datetime.datetime] = mapped_column(
         UTCDateTime(timezone=False), server_default=UTCNow(), nullable=True

@@ -7,8 +7,8 @@ import os
 import secrets
 from abc import abstractmethod
 from collections import deque
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from threading import Event, Timer
 from typing import TYPE_CHECKING, Any, Literal
@@ -17,20 +17,14 @@ from uuid import uuid4
 import cv2
 import imutils
 from apscheduler.jobstores.base import JobLookupError
-from sqlalchemy import or_, select
 from typing_extensions import assert_never
 
 from viseron.components.go2rtc.const import COMPONENT as GO2RTC_COMPONENT
 from viseron.components.storage.config import validate_tiers
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
-    TIER_CATEGORY_RECORDER,
-    TIER_CATEGORY_SNAPSHOTS,
-    TIER_SUBCATEGORY_SEGMENTS,
-    TIER_SUBCATEGORY_THUMBNAILS,
 )
-from viseron.components.storage.models import Files, TriggerTypes
-from viseron.components.webserver.const import COMPONENT as WEBSERVER_COMPONENT
+from viseron.components.storage.models import TriggerTypes
 from viseron.const import TEMP_DIR
 from viseron.domain_registry import DomainEntry, DomainState
 from viseron.domains import AbstractDomain
@@ -86,9 +80,8 @@ from .shared_frames import SharedFrames
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from apscheduler.job import Job
-
     import numpy as np
+    from apscheduler.job import Job
 
     from viseron import Viseron
     from viseron.components.nvr.nvr import FrameIntervalCalculator
@@ -613,6 +606,15 @@ class AbstractCamera(AbstractDomain):
             return ret, jpg.tobytes()
         return ret, None
 
+    def tier_base_path(self, tier_id: int, tier_category: str, subcategory: str) -> str:
+        """Return the configured storage path of a tier."""
+        try:
+            return self._storage.camera_tier_handlers[self.identifier][tier_category][
+                tier_id
+            ][subcategory].tier_base_path
+        except (IndexError, KeyError) as error:
+            raise ValueError("No matching configured tier") from error
+
     def _get_folder(self, domain: SnapshotDomain) -> str:
         if domain is SnapshotDomain.OBJECT_DETECTOR:
             return self.snapshots_object_folder
@@ -729,74 +731,12 @@ class FailedCamera:
 
     def __init__(self, vis: Viseron, entry: DomainEntry) -> None:
         """Initialize failed camera."""
-        # Local import to avoid circular import
-        # pylint: disable=import-outside-toplevel
-        from viseron.components.storage.tier_handler import (  # noqa: PLC0415
-            add_file_handler,
-        )
-
         self._vis = vis
         self._entry = entry
         self._config: dict[str, Any] = entry.config[entry.identifier]
 
         self._storage = vis.data[STORAGE_COMPONENT]
-        self._webserver = vis.data[WEBSERVER_COMPONENT]
         self._recorder = FailedCameraRecorder(vis, self._config, self)
-
-        # Try to guess the path to the camera recordings
-        with self._storage.get_session() as session:
-            recorder_dir_stmt = (
-                select(Files)
-                .distinct(Files.directory)
-                .where(Files.camera_identifier == self.identifier)
-                .where(Files.category == TIER_CATEGORY_RECORDER)
-                .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
-                .order_by(Files.directory, Files.created_at.desc())
-            )
-            for file in session.execute(recorder_dir_stmt).scalars():
-                add_file_handler(
-                    vis,
-                    self._webserver,
-                    file.directory,
-                    rf"{file.directory}/(.*.m4s$)",
-                    self,
-                    TIER_CATEGORY_RECORDER,
-                    TIER_SUBCATEGORY_SEGMENTS,
-                )
-                add_file_handler(
-                    vis,
-                    self._webserver,
-                    file.directory,
-                    rf"{file.directory}/(.*.mp4$)",
-                    self,
-                    TIER_CATEGORY_RECORDER,
-                    TIER_SUBCATEGORY_SEGMENTS,
-                )
-
-        # Try to guess the path to the camera snapshots and thumbnails
-        with self._storage.get_session() as session:
-            jpg_dir_stmt = (
-                select(Files)
-                .distinct(Files.directory)
-                .where(Files.camera_identifier == self.identifier)
-                .where(
-                    or_(
-                        Files.category == TIER_CATEGORY_SNAPSHOTS,
-                        Files.subcategory == TIER_SUBCATEGORY_THUMBNAILS,
-                    )
-                )
-                .order_by(Files.directory, Files.created_at.desc())
-            )
-            for file in session.execute(jpg_dir_stmt).scalars():
-                add_file_handler(
-                    vis,
-                    self._webserver,
-                    file.directory,
-                    rf"{file.directory}/(.*.jpg$)",
-                    self,
-                    file.category,
-                    file.subcategory,
-                )
 
     def as_dict(self) -> dict[str, Any]:
         """Return camera as dict."""
@@ -858,6 +798,16 @@ class FailedCamera:
     def recorder(self) -> FailedCameraRecorder:
         """Return recorder."""
         return self._recorder
+
+    def tier_base_path(self, tier_id: int, tier_category: str, subcategory: str) -> str:
+        """Return storage tier base path."""
+        paths = self._storage.configured_tier_paths(
+            self.identifier, tier_category, subcategory
+        )
+        try:
+            return paths[tier_id]
+        except IndexError as error:
+            raise ValueError("No matching configured tier") from error
 
 
 def setup_failed(vis: Viseron, entry: DomainEntry) -> FailedCamera:

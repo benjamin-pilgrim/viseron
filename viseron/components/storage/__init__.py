@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 import pathlib
@@ -54,6 +55,7 @@ from viseron.components.storage.const import (
     TIMELAPSE_RENDER_MANAGER,
     TIMELAPSE_SEGMENT_CACHE_PATH,
     TIMELAPSE_SEGMENT_ENCODER,
+    CleanupJobNames,
 )
 from viseron.components.storage.jobs import CleanupManager
 from viseron.components.storage.models import (
@@ -61,7 +63,6 @@ from viseron.components.storage.models import (
     Files,
     FilesMeta,
     Motion,
-    PendingMove,
     Recordings,
 )
 from viseron.components.storage.storage_subprocess import TierCheckWorker
@@ -84,7 +85,7 @@ from viseron.components.storage.util import (
 )
 from viseron.const import EVENT_DOMAIN_REGISTERED, VISERON_SIGNAL_STOPPING
 from viseron.domains.camera.const import CONFIG_STORAGE, DOMAIN as CAMERA_DOMAIN
-from viseron.exceptions import ComponentNotReady
+from viseron.exceptions import ComponentNotReady, DomainNotRegisteredError
 from viseron.helpers import utcnow
 from viseron.helpers.logs import StreamToLogger
 
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     from viseron import Event, Viseron
     from viseron.components.storage.storage_subprocess import (
         DataItem,
+        DataItemCopyFile,
         DataItemDeleteFile,
         DataItemMoveFile,
     )
@@ -275,8 +277,7 @@ class Storage:
         self._get_session: Callable[[], Session] | None = None
 
         self.temporary_files_meta: dict[str, FilesMeta] = {}
-        # Keyed by the source path
-        self.pending_moves: dict[str, PendingMove] = {}
+        self.temporary_moving_files: set[str] = set()
 
         self.cleanup_manager = CleanupManager(vis, self)
         self.cleanup_manager.start()
@@ -309,6 +310,22 @@ class Storage:
         """Return the number of files to process in a single batch."""
         return self._config.tier_check_batch_size
 
+    def configured_tier_paths(
+        self, camera_identifier: str, category: str, subcategory: str
+    ) -> list[str]:
+        """Return configured tier roots even when a camera is not running."""
+        try:
+            camera = self._vis.get_registered_domain(CAMERA_DOMAIN, camera_identifier)
+        except DomainNotRegisteredError:
+            entry = self._vis.domain_registry.get(CAMERA_DOMAIN, camera_identifier)
+            camera = entry.error_instance if entry else None
+        config = _get_tier_config(self._config, camera) if camera else self._config
+        return [tier.path for tier in _get_tiers(config, category, subcategory)]
+
+    def queue_file_repair(self, file_id: int) -> None:
+        """Queue a stale Files row for asynchronous repair."""
+        self.cleanup_manager.queue_file_reference_repair(file_id)
+
     @property
     def sleep_between_batches(self) -> float:
         """Return the number of seconds to sleep between batches."""
@@ -318,6 +335,7 @@ class Storage:
         """Initialize storage component."""
         self._alembic_cfg = self._get_alembic_config()
         self.create_database()
+        self.cleanup_manager.run_job(CleanupJobNames.FILE_REFERENCES)
 
         self._vis.listen_event(
             EVENT_DOMAIN_REGISTERED.format(domain=CAMERA_DOMAIN),
@@ -653,6 +671,13 @@ class Storage:
         if filename not in self.ignored_files:
             self.ignored_files.append(filename)
 
+    def is_ignored_file(self, filename: str) -> bool:
+        """Return if filename matches an ignored filename or pattern."""
+        return any(
+            filename == ignored_file or fnmatch.fnmatch(filename, ignored_file)
+            for ignored_file in self.ignored_files
+        )
+
     def _camera_registered(
         self, event_data: Event[EventDomainRegisteredData[AbstractCamera]]
     ) -> None:
@@ -718,13 +743,20 @@ class Storage:
     @overload
     def tier_check_worker_send_command(
         self,
+        item: DataItemCopyFile,
+        callback: Callable[[DataItemCopyFile], None] | None = None,
+    ) -> None: ...
+
+    @overload
+    def tier_check_worker_send_command(
+        self,
         item: DataItemDeleteFile,
         callback: Callable[[DataItemDeleteFile], None] | None = None,
     ) -> None: ...
 
     def tier_check_worker_send_command(
         self,
-        item: DataItem | DataItemMoveFile | DataItemDeleteFile,
+        item: DataItem | DataItemCopyFile | DataItemMoveFile | DataItemDeleteFile,
         callback: Callable[[Any], None] | None = None,
     ) -> None:
         """Send command to tier check worker."""
@@ -766,14 +798,14 @@ def _get_tier_config(config: StorageConfig, camera: AbstractCamera) -> StorageCo
     """
     if not hasattr(camera, "config"):
         return config
-    camera_storage = camera.config[CONFIG_STORAGE] or {}
+    camera_storage = camera.config.get(CONFIG_STORAGE) or {}
 
     # Override recorder tiers with camera config
     recorder = config.recorder
     recorder_tier: dict[str, Any] = {}
-    if continuous := camera.config[CONFIG_RECORDER].get(CONFIG_CONTINUOUS):
+    if continuous := camera.config.get(CONFIG_RECORDER, {}).get(CONFIG_CONTINUOUS):
         recorder_tier[CONFIG_CONTINUOUS] = continuous
-    if events := camera.config[CONFIG_RECORDER].get(CONFIG_EVENTS):
+    if events := camera.config.get(CONFIG_RECORDER, {}).get(CONFIG_EVENTS):
         recorder_tier[CONFIG_EVENTS] = events
 
     recorder_tiers: list[dict[str, Any]] | None = None

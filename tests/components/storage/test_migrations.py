@@ -93,3 +93,101 @@ def test_timelapse_orig_ctime_backfill(
         2: INSERT_TIME,
         1723111161: INSERT_TIME,
     }
+
+
+def test_upgrade_from_upstream_retains_keys_for_both_locations(
+    alembic_runner: MigrationContext, alembic_engine: Engine
+) -> None:
+    """Upgrading upstream preserves both publicly visible keys after deduplication."""
+    alembic_runner.migrate_up_to(TIMELAPSE_ORIG_CTIME_REVISION)
+    source = _file_row(1)
+    destination = _file_row(2, filename="1.m4s")
+    destination.update(
+        tier_id=1, tier_path="/tier1", path="/tier1/segments/camera/1.m4s"
+    )
+    alembic_runner.insert_into(
+        "files", [{**source, "file_key": 100}, {**destination, "file_key": 200}]
+    )
+
+    alembic_runner.migrate_up_to("95d084e17032")
+
+    with alembic_engine.begin() as connection:
+        assert connection.execute(text("SELECT id, file_key FROM files")).one() == (
+            1,
+            100,
+        )
+        assert connection.execute(
+            text("SELECT file_key, file_id FROM file_key_aliases")
+        ).one() == (200, 1)
+        assert connection.execute(
+            text("SELECT file_id, tier_id FROM file_locations ORDER BY tier_id")
+        ).all() == [(1, 0), (1, 1)]
+
+
+def test_upgrade_from_fork_preserves_logical_file_and_locations(
+    alembic_runner: MigrationContext, alembic_engine: Engine
+) -> None:
+    """An existing fork recording keeps its logical file ID and init hash."""
+    alembic_runner.migrate_up_to("6c7d2f8e9a10")
+    # Reproduce the deployed fork schema rather than replaying the improved
+    # deduplication migration that a fresh upstream upgrade will execute.
+    with alembic_engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_files_logical_key"))
+        connection.execute(text("ALTER TABLE files DROP COLUMN logical_path"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_files_logical_key ON files "
+                "(camera_identifier, category, subcategory, filename)"
+            )
+        )
+    file = _file_row(37)
+    alembic_runner.insert_into("files", [{**file, "hls_init_hash": "a" * 64}])
+    alembic_runner.insert_into(
+        "file_locations",
+        [
+            {
+                "file_id": 37,
+                "tier_id": 0,
+                "tier_path": file["tier_path"],
+                "path": file["path"],
+                "directory": file["directory"],
+                "filename": file["filename"],
+                "size": 10,
+                "state": "available",
+            }
+        ],
+    )
+
+    alembic_runner.migrate_up_to("95d084e17032")
+
+    with alembic_engine.begin() as connection:
+        row = connection.execute(
+            text("SELECT id, file_key, hls_init_hash FROM files")
+        ).one()
+        assert row.id == 37
+        assert row.file_key is not None
+        assert row.hls_init_hash == "a" * 64
+        assert connection.execute(
+            text("SELECT file_id, state, path FROM file_locations")
+        ).one() == (37, "available", file["path"])
+
+
+def test_upgrade_preserves_same_named_clips_from_different_dates(
+    alembic_runner: MigrationContext, alembic_engine: Engine
+) -> None:
+    """Clips with distinct relative paths retain distinct public identities."""
+    alembic_runner.migrate_up_to(TIMELAPSE_ORIG_CTIME_REVISION)
+    rows = []
+    for i in (1, 2):
+        row = _file_row(i, "recorder", "event_clips", "clip.mp4")
+        row["directory"] = f"/tier0/event_clips/camera/2026-01-0{i}"
+        row["path"] = f"{row['directory']}/clip.mp4"
+        rows.append({**row, "file_key": 100 + i})
+    alembic_runner.insert_into("files", rows)
+
+    alembic_runner.migrate_up_to("95d084e17032")
+
+    with alembic_engine.begin() as connection:
+        assert connection.execute(
+            text("SELECT file_key FROM files ORDER BY id")
+        ).scalars().all() == [101, 102]

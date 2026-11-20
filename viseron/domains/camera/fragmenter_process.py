@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import datetime
 import errno
+import hashlib
 import logging
 import os
 import re
 import shutil
 import subprocess as sp
+import tempfile
+import time
 from typing import TYPE_CHECKING
 
 import psutil
 from path import Path
 
+from viseron.components.storage.util import copy_file_atomic, move_file_atomic
 from viseron.domains.camera.const import MP4BOX_PATH
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
@@ -135,6 +139,7 @@ class FragmenterWork(ChildProcessWork):
         timelapse_folder: str | None,
         temp_timelapse_folder: str | None,
         worker_event: Event,
+        metadata_ack,
     ) -> None:
         self._camera_identifier = camera_identifier
         self.temp_segments_folder = temp_segments_folder
@@ -142,6 +147,7 @@ class FragmenterWork(ChildProcessWork):
         self._timelapse_folder = timelapse_folder
         self._temp_timelapse_folder = temp_timelapse_folder
         self._worker_event = worker_event
+        self._metadata_ack = metadata_ack
         self._logger = logging.getLogger(fragmenter_logger_names(camera_identifier)[0])
         self._log_pipe: LogPipe
 
@@ -280,8 +286,8 @@ class FragmenterWork(ChildProcessWork):
             )
             if result.returncode == 0:
                 self._logger.debug(f"Timelapse: Extracted frame {tmp_frame_path}")
-                self._send_files_metadata(frame_path, orig_ctime, None)
-                shutil.move(tmp_frame_path, frame_path)
+                if self._send_files_metadata(frame_path, orig_ctime, None):
+                    shutil.move(tmp_frame_path, frame_path)
             else:
                 self._logger.warning(
                     f"Timelapse: Failed to extract frame {frame_path}: {result.stderr}"
@@ -302,76 +308,76 @@ class FragmenterWork(ChildProcessWork):
             except FileNotFoundError:
                 pass
 
-    def _move_to_segments_folder_mp4box(
-        self, file: str, orig_ctime: datetime.datetime
-    ) -> None:
-        """Move fragmented mp4 created by mp4box to segments folder."""
-        self._segment_hook_mp4box(file, orig_ctime)
-        try:
-            shutil.move(
-                os.path.join(
-                    self.temp_segments_folder,
-                    file.split(".", maxsplit=1)[0],
-                    "clip_1.m4s",
-                ),
-                os.path.join(
-                    self.segments_folder, file.split(".", maxsplit=1)[0] + ".m4s"
-                ),
-            )
-            shutil.move(
-                os.path.join(
-                    self.temp_segments_folder,
-                    file.split(".", maxsplit=1)[0],
-                    "clip_init.mp4",
-                ),
-                os.path.join(self.segments_folder, "init.mp4"),
-            )
-        except FileNotFoundError:
-            self._logger.debug(f"{file} not found")
-
-    def _move_to_segments_folder(
-        self, file: str, orig_ctime: datetime.datetime
-    ) -> None:
-        """Move fragmented mp4 created by encoder to segments folder."""
-        self._segment_hook(file, orig_ctime)
-        try:
-            shutil.move(
-                os.path.join(self.temp_segments_folder, file),
-                os.path.join(self.segments_folder, file),
-            )
-            shutil.copy(
-                os.path.join(self.temp_segments_folder, "init.mp4"),
-                os.path.join(self.segments_folder, "init.mp4"),
-            )
-        except FileNotFoundError:
-            self._logger.debug(f"{file} not found", exc_info=True)
-        except OSError as err:
-            if err.errno == errno.ENOSPC:
-                self._logger.error(
-                    "No space left on device, trigger tier check",
-                    exc_info=err,
-                )
-                self._worker_event.clear()
-                self.output_queue.put(
-                    {
-                        "error": "no_space_left",
-                    }
-                )
-                self._worker_event.wait(timeout=1)
-
     def _send_files_metadata(
-        self, path: str, orig_ctime: datetime.datetime, duration: float | None
-    ) -> None:
-        """Save temporary metadata which is later used when inserting into the DB."""
+        self,
+        path: str,
+        orig_ctime: datetime.datetime,
+        duration: float | None,
+        init_hash: str | None = None,
+    ) -> bool:
+        """Stage metadata in the parent and wait for this request's acknowledgement."""
+        request_id = time.monotonic_ns()
         self._worker_event.clear()
         self.output_queue.put(
             {
                 "path": path,
                 "orig_ctime": orig_ctime,
                 "duration": duration,
+                "hls_init_hash": init_hash,
+                "metadata_request": request_id,
             }
         )
-        self._worker_event.wait(timeout=1)
+        if (
+            self._worker_event.wait(timeout=1)
+            and self._metadata_ack.value == request_id
+        ):
+            return True
+        self.output_queue.put({"discard_metadata": path})
+        self._logger.warning("Metadata acknowledgement timed out for %s", path)
+        return False
+
+    def _publish_segment(
+        self,
+        init_src: str,
+        src: str,
+        dst: str,
+        orig_ctime: datetime.datetime,
+        duration: float,
+    ) -> bool:
+        """Publish a segment only after its init and metadata are ready."""
+        try:
+            with open(init_src, "rb") as init:
+                init_bytes = init.read()
+            init_hash = hashlib.sha256(init_bytes).hexdigest()
+            sidecar = os.path.join(self.segments_folder, f"init-{init_hash}.mp4")
+            if not os.path.isfile(sidecar):
+                # Publish exactly the bytes that were hashed, even if the encoder
+                # replaces its mutable init.mp4 while remounting or restarting.
+                with tempfile.NamedTemporaryFile(
+                    dir=self.temp_segments_folder
+                ) as staged:
+                    staged.write(init_bytes)
+                    staged.flush()
+                    copy_file_atomic(staged.name, sidecar)
+            copy_file_atomic(sidecar, os.path.join(self.segments_folder, "init.mp4"))
+
+            if not self._send_files_metadata(dst, orig_ctime, duration, init_hash):
+                return False
+            try:
+                result = move_file_atomic(src, dst)
+                if not result.source_removed:
+                    self._logger.warning(
+                        "Published %s but could not remove %s", dst, src
+                    )
+            except OSError:
+                self.output_queue.put({"discard_metadata": dst})
+                raise
+        except OSError as error:
+            self._logger.warning("Failed to publish segment %s: %s", dst, error)
+            if error.errno == errno.ENOSPC:
+                self.output_queue.put({"error": "no_space_left"})
+            return False
+        return True
 
     def _read_m3u8_mp4box(self, file: str) -> str:
         """Read m3u8 file created by MP4Box."""
@@ -395,55 +401,47 @@ class FragmenterWork(ChildProcessWork):
         ).read()
 
     def _handle_mp4(self, file: str) -> None:
-        """Handle mp4 files."""
+        """Fragment and publish an MP4, retaining the input on publish failure."""
+        stem = file.split(".", maxsplit=1)[0]
+        outdir = os.path.join(self.temp_segments_folder, stem)
         try:
-            if self._mp4box_command(file):
-                extinf = _extract_extinf_number(
-                    self._read_m3u8_mp4box(file), "clip_1.m4s"
-                )
-                if extinf:
-                    orig_ctime = _get_orig_ctime(file, None)
-                    self._send_files_metadata(
-                        os.path.join(
-                            self.segments_folder,
-                            file.split(".", maxsplit=1)[0] + ".m4s",
-                        ),
-                        orig_ctime,
-                        extinf,
-                    )
-                    self._move_to_segments_folder_mp4box(file, orig_ctime)
-                else:
-                    self._logger.error(f"Failed to get extinf for {file}")
-        except Exception as err:  # pylint: disable=broad-except
-            self._logger.error(f"Failed to fragment {file}", exc_info=err)
-
-        try:
-            os.remove(os.path.join(self.temp_segments_folder, file))
-            shutil.rmtree(
-                os.path.join(self.temp_segments_folder, file.split(".", maxsplit=1)[0]),
-            )
-        except FileNotFoundError as err:
-            self._logger.error("Failed to delete broken fragment", exc_info=err)
+            if not self._mp4box_command(file):
+                return
+            extinf = _extract_extinf_number(self._read_m3u8_mp4box(file), "clip_1.m4s")
+            if not extinf:
+                self._logger.error("Failed to get extinf for %s", file)
+                return
+            orig_ctime = _get_orig_ctime(file, None)
+            self._segment_hook_mp4box(file, orig_ctime)
+            if self._publish_segment(
+                os.path.join(outdir, "clip_init.mp4"),
+                os.path.join(outdir, "clip_1.m4s"),
+                os.path.join(self.segments_folder, stem + ".m4s"),
+                orig_ctime,
+                extinf,
+            ):
+                os.remove(os.path.join(self.temp_segments_folder, file))
+        except (OSError, ValueError):
+            self._logger.exception("Failed to fragment %s", file)
+        finally:
+            shutil.rmtree(outdir, ignore_errors=True)
 
     def _handle_m4s(self, file: str) -> None:
-        """Handle m4s (fragmented mp4) files."""
+        """Publish an encoder fragment with its matching init file."""
         try:
             m3u8 = self._read_m3u8()
             extinf = _extract_extinf_number(m3u8, file)
-            program_date_time = _extract_program_date_time(m3u8, file)
-            if extinf:
-                orig_ctime = _get_orig_ctime(file, program_date_time)
-                self._send_files_metadata(
-                    os.path.join(self.segments_folder, file), orig_ctime, extinf
-                )
-                self._move_to_segments_folder(file, orig_ctime)
-            else:
-                self._logger.error(f"Failed to get extinf for {file}")
-                os.remove(os.path.join(self.temp_segments_folder, file))
-        except Exception as err:  # pylint: disable=broad-except
-            self._logger.error(f"Failed to process m4s file {file}", exc_info=err)
-        finally:
-            try:
-                os.remove(os.path.join(self.temp_segments_folder, file))
-            except FileNotFoundError:
-                pass
+            if not extinf:
+                self._logger.error("Failed to get extinf for %s", file)
+                return
+            orig_ctime = _get_orig_ctime(file, _extract_program_date_time(m3u8, file))
+            self._segment_hook(file, orig_ctime)
+            self._publish_segment(
+                os.path.join(self.temp_segments_folder, "init.mp4"),
+                os.path.join(self.temp_segments_folder, file),
+                os.path.join(self.segments_folder, file),
+                orig_ctime,
+                extinf,
+            )
+        except (OSError, ValueError):
+            self._logger.exception("Failed to process segment %s", file)

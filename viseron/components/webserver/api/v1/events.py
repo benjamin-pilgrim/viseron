@@ -38,6 +38,40 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 
+def _snapshot_keys(session: Session, events) -> dict[int, int]:
+    """Look up all file keys for this page of events."""
+    ids = {
+        event.snapshot_file_id for event in events if event.snapshot_file_id is not None
+    }
+    if not ids:
+        return {}
+    return dict(
+        session.execute(select(Files.id, Files.file_key).where(Files.id.in_(ids)))
+        .tuples()
+        .all()
+    )
+
+
+def _file_url(file_key: int | None, camera: str, subpath: str) -> str | None:
+    """Return an upstream-style camera-scoped media URL."""
+    if file_key is not None:
+        return f"{subpath}/file/{camera}/{file_key:x}"
+    return None
+
+
+def _recording_thumbnail_url(
+    recording: Recordings,
+    subpath: str,
+) -> str | None:
+    """Return a recording thumbnail URL if the recording has a recoverable reference."""
+    if recording.thumbnail_file_id or recording.thumbnail_path:
+        return (
+            f"{subpath}/api/v1/recordings/"
+            f"{recording.camera_identifier}/{recording.id}/thumbnail"
+        )
+    return None
+
+
 class EventsAPIHandler(BaseAPIHandler):
     """API handler for Events."""
 
@@ -110,6 +144,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 .where(Motion.start_time <= time_to_datetime)
             ).order_by(Motion.start_time.desc())
             motion = session.execute(stmt).scalars().all()
+            file_keys = _snapshot_keys(session, motion)
         motion_events = []
         if motion:
             for event in motion:
@@ -127,9 +162,11 @@ class EventsAPIHandler(BaseAPIHandler):
                         "duration": (event.end_time - event.start_time).total_seconds()
                         if event.end_time
                         else None,
-                        "snapshot_path": f"{subpath}/files{event.snapshot_path}"
-                        if event.snapshot_path
-                        else None,
+                        "snapshot_url": _file_url(
+                            file_keys.get(event.snapshot_file_id),
+                            event.camera_identifier,
+                            subpath,
+                        ),
                         "created_at": event.created_at,
                         "created_at_timestamp": event.created_at.timestamp(),
                         "lookback": camera.recorder.lookback,
@@ -159,6 +196,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 .where(Objects.created_at.between(time_from_datetime, time_to_datetime))
             ).order_by(Objects.created_at.desc())
             objects = session.execute(stmt).scalars().all()
+            file_keys = _snapshot_keys(session, objects)
         object_events = []
         if objects:
             for event in objects:
@@ -173,7 +211,11 @@ class EventsAPIHandler(BaseAPIHandler):
                         "confidence": event.confidence,
                         "created_at": event.created_at,
                         "created_at_timestamp": event.created_at.timestamp(),
-                        "snapshot_path": f"{subpath}/files{event.snapshot_path}",
+                        "snapshot_url": _file_url(
+                            file_keys.get(event.snapshot_file_id),
+                            event.camera_identifier,
+                            subpath,
+                        ),
                         "lookback": camera.recorder.lookback,
                     }
                 )
@@ -224,7 +266,7 @@ class EventsAPIHandler(BaseAPIHandler):
                             f"{subpath}/api/v1/hls/"
                             f"{event.camera_identifier}/{event.id}/index.m3u8"
                         ),
-                        "thumbnail_path": f"{subpath}/files{event.thumbnail_path}",
+                        "thumbnail_url": _recording_thumbnail_url(event, subpath),
                         "created_at": event.created_at,
                         "created_at_timestamp": event.created_at.timestamp(),
                         "lookback": camera.recorder.lookback,
@@ -267,6 +309,7 @@ class EventsAPIHandler(BaseAPIHandler):
                 )
             ).order_by(PostProcessorResults.created_at.desc())
             post_processor_results = session.execute(stmt).scalars().all()
+            file_keys = _snapshot_keys(session, post_processor_results)
         post_processor_events = []
         if post_processor_results:
             for event in post_processor_results:
@@ -277,7 +320,11 @@ class EventsAPIHandler(BaseAPIHandler):
                         "id": event.id,
                         "time": event.created_at,
                         "timestamp": event.created_at.timestamp(),
-                        "snapshot_path": f"{subpath}/files{event.snapshot_path}",
+                        "snapshot_url": _file_url(
+                            file_keys.get(event.snapshot_file_id),
+                            event.camera_identifier,
+                            subpath,
+                        ),
                         "data": event.data,
                         "created_at": event.created_at,
                         "created_at_timestamp": event.created_at.timestamp(),

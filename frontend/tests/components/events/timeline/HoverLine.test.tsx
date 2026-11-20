@@ -1,4 +1,5 @@
 import { fireEvent, render } from "@testing-library/react";
+import { Profiler } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HoverLine } from "components/events/timeline/HoverLine";
@@ -18,17 +19,20 @@ const renderLine = (container: HTMLDivElement) => {
   const now = getDayjs().unix();
   const startRef = { current: now };
   const endRef = { current: now - 3600 };
+  const onCommit = vi.fn();
   const { container: root } = render(
-    <HoverLine
-      containerRef={{ current: container }}
-      startRef={startRef}
-      endRef={endRef}
-    />,
+    <Profiler id="hover-line" onRender={onCommit}>
+      <HoverLine
+        containerRef={{ current: container }}
+        startRef={startRef}
+        endRef={endRef}
+      />
+    </Profiler>,
   );
   const line = root.firstElementChild as HTMLElement;
   const timeAt = (y: number) =>
     getTimeStringFromDayjs(getDateAtPosition(y, 1000, startRef, endRef));
-  return { line, timeAt };
+  return { line, timeAt, onCommit };
 };
 
 describe("HoverLine", () => {
@@ -38,9 +42,10 @@ describe("HoverLine", () => {
 
   it("follows the cursor without reading the layout on each move", () => {
     const { container, getBounds } = createContainer(100);
-    const { line } = renderLine(container);
+    const { line, onCommit } = renderLine(container);
     fireEvent.mouseEnter(container);
     getBounds.mockClear();
+    onCommit.mockClear();
 
     fireEvent.mouseMove(container, { clientY: 150 });
     fireEvent.mouseMove(container, { clientY: 160 });
@@ -49,6 +54,7 @@ describe("HoverLine", () => {
     expect(line.style.visibility).toBe("visible");
     expect(line.textContent).not.toBe("");
     expect(getBounds).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
   });
 
   it("stays under the cursor and updates the time when an ancestor scrolls", () => {

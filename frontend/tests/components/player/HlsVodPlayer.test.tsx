@@ -117,7 +117,7 @@ const mockRecording: types.Recording = {
   end_timestamp: 1767225660,
   trigger_type: "object",
   trigger_id: null,
-  thumbnail_path: "/thumbnail.jpg",
+  thumbnail_url: "/thumbnail.jpg",
   hls_url: "/api/v1/hls/camera1/1/index.m3u8",
 };
 

@@ -111,6 +111,7 @@ interface CustomControlsProps {
   extraButtons?: React.ReactNode;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
   showProgressBar?: boolean;
+  onProgressSeek?: (mediaTime: number) => void;
   hasStarted?: boolean;
 }
 
@@ -138,6 +139,7 @@ export function CustomControls({
   extraButtons,
   videoRef,
   showProgressBar = false,
+  onProgressSeek,
   hasStarted = true,
 }: CustomControlsProps) {
   const canHover = useCanHover();
@@ -353,6 +355,7 @@ export function CustomControls({
               isProgressDragging={isProgressDragging}
               onDragStart={handleProgressDragStart}
               onDragEnd={handleProgressDragEnd}
+              onSeek={onProgressSeek}
             />
           )}
 

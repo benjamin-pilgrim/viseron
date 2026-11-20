@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 from sqlalchemy import event, insert, select, text
-from watchdog.events import FileCreatedEvent, FileDeletedEvent
+from watchdog.events import FileCreatedEvent, FileDeletedEvent, FileMovedEvent
 
 from viseron.components.storage import TIER_CATEGORIES, Storage
 from viseron.components.storage.config import RecorderTier, Tier
@@ -42,6 +42,7 @@ from viseron.components.storage.models import (
     Recordings,
 )
 from viseron.components.storage.storage_subprocess import (
+    DataItemCopyFile,
     DataItemDeleteFile,
     DataItemMoveFile,
 )
@@ -56,6 +57,7 @@ from viseron.components.storage.tier_handler import (
     find_next_tier_segments,
     handle_file,
     move_file,
+    move_file as tier_handler_move_file,
 )
 from viseron.components.storage.util import EventFileCreated
 from viseron.domains.camera.const import (
@@ -70,6 +72,7 @@ from viseron.helpers import utcnow
 from tests.common import BaseTestWithRecordings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from numpy._typing._array_like import NDArray
@@ -81,6 +84,295 @@ if TYPE_CHECKING:
     from tests.conftest import MockViseron
 
 _TierHandlerT = TypeVar("_TierHandlerT", bound=TierHandler)
+
+
+class MoveCallbackScalarResult:
+    """Fake scalar result for move callback tests."""
+
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def scalar_one(self):
+        """Return fake row."""
+        return self._row
+
+
+class MoveCallbackRowcountResult:
+    """Fake rowcount result for move callback tests."""
+
+    rowcount = 1
+
+    def scalar_one_or_none(self):
+        """Represent an unpublished destination."""
+
+
+class MoveCallbackSession:
+    """Fake session for move callback tests."""
+
+    def __init__(self) -> None:
+        self.execute_count = 0
+        self.committed = False
+        self.rolled_back = False
+
+    def __enter__(self):
+        """Return context manager session."""
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        """Exit context manager."""
+
+    def execute(self, _stmt):
+        """Return metadata row first, then successful update result."""
+        self.execute_count += 1
+        if self.execute_count == 1:
+            return MoveCallbackScalarResult(
+                MagicMock(orig_ctime=utcnow(), duration=1.0, hls_init_hash=None)
+            )
+        return MoveCallbackRowcountResult()
+
+    def commit(self) -> None:
+        """Record commit."""
+        self.committed = True
+
+    def rollback(self) -> None:
+        """Record rollback."""
+        self.rolled_back = True
+
+
+def test_on_any_event_ignores_storage_temp_file() -> None:
+    """Internal temporary files should not be queued for DB insertion."""
+    tier_handler = TierHandler.__new__(TierHandler)
+    tier_handler._storage = MagicMock(ignored_files=[])
+    tier_handler._storage.is_ignored_file.return_value = False
+    tier_handler._event_queue = MagicMock()
+
+    tier_handler.on_any_event(FileCreatedEvent("/tmp/.viseron-tmp-file.m4s.1.abc"))
+
+    tier_handler._event_queue.put.assert_not_called()
+
+
+def test_on_any_event_queues_moved_file_from_storage_temp_file() -> None:
+    """Atomic publishes should be treated as destination create events."""
+    tier_handler = TierHandler.__new__(TierHandler)
+    tier_handler._storage = MagicMock(ignored_files=[])
+    tier_handler._storage.is_ignored_file.return_value = False
+    tier_handler._event_queue = MagicMock()
+    tier_handler._path = "/tmp"
+    event = FileMovedEvent(
+        "/tmp/.viseron-tmp-file.m4s.1.abc",
+        "/tmp/file.m4s",
+    )
+
+    tier_handler.on_any_event(event)
+
+    tier_handler._event_queue.put.assert_called_once_with(event)
+
+
+def test_on_created_missing_file_does_not_pop_metadata(tmp_path) -> None:
+    """A disappeared create event should not kill the handler or consume metadata."""
+    path = str(tmp_path / "missing.m4s")
+    tier_handler = TierHandler.__new__(TierHandler)
+    tier_handler._logger = MagicMock()
+    tier_handler._storage = MagicMock()
+    tier_handler._storage.temporary_files_meta = {path: MagicMock()}
+
+    tier_handler._on_created(FileCreatedEvent(path))
+
+    assert path in tier_handler._storage.temporary_files_meta
+
+
+def test_on_created_duplicate_path_is_ignored(
+    tmp_path, get_db_session, vis: MockViseron
+) -> None:
+    """Duplicate create events for the same path should be database no-ops."""
+    path = str(tmp_path / "duplicate.m4s")
+    with open(path, "wb") as file:
+        file.write(b"segment")
+
+    tier_handler = TierHandler.__new__(TierHandler)
+    tier_handler._logger = MagicMock()
+    tier_handler._vis = vis
+    tier_handler._storage = MagicMock()
+    tier_handler._storage.get_session = get_db_session
+    tier_handler._storage.temporary_files_meta = {
+        path: FilesMeta(orig_ctime=utcnow(), duration=5.0)
+    }
+    tier_handler._camera = MagicMock(identifier="test")
+    tier_handler._tier_id = 1
+    tier_handler._tier = Tier(path="/")
+    tier_handler._category = TIER_CATEGORY_RECORDER
+    tier_handler._subcategory = TIER_SUBCATEGORY_SEGMENTS
+    tier_handler.check_tier = MagicMock()
+
+    tier_handler._on_created(FileCreatedEvent(path))
+    tier_handler._storage.temporary_files_meta[path] = FilesMeta(
+        orig_ctime=utcnow(), duration=5.0
+    )
+    tier_handler._on_created(FileCreatedEvent(path))
+
+    with get_db_session() as session:
+        files = session.execute(select(Files).where(Files.path == path)).all()
+
+    assert len(files) == 1
+    assert vis.dispatch_event.call_count == 1
+    assert tier_handler.check_tier.call_count == 2
+
+
+def test_check_tier_force_bypasses_throttle() -> None:
+    """Forced tier checks should bypass the main-process throttle."""
+    tier_handler = TierHandler.__new__(TierHandler)
+    tier_handler._check_tier_lock = threading.Lock()
+    tier_handler._tier_check_in_progress = False
+    tier_handler._throttle_period = datetime.timedelta(minutes=1)
+    tier_handler._time_of_last_call = utcnow()
+    tier_handler._storage = MagicMock()
+    tier_handler._create_dataitem = MagicMock(return_value=MagicMock())
+    tier_handler.on_check_tier_result = MagicMock()
+
+    tier_handler.check_tier()
+
+    tier_handler._storage.tier_check_worker_send_command.assert_not_called()
+
+    tier_handler.check_tier(force=True)
+
+    tier_handler._create_dataitem.assert_called_once_with(force=True)
+    tier_handler._storage.tier_check_worker_send_command.assert_called_once_with(
+        tier_handler._create_dataitem.return_value,
+        tier_handler.on_check_tier_result,
+    )
+
+
+def test_move_file_callback_commits_published_move() -> None:
+    """A published destination should commit even when source cleanup failed."""
+    src = "/tier1/segments/camera/1.m4s"
+    dst = "/tier2/segments/camera/1.m4s"
+    session = MoveCallbackSession()
+    vis = MagicMock()
+    storage = MagicMock()
+    storage.temporary_files_meta = {}
+
+    tier_handler_move_file(
+        vis,
+        storage,
+        lambda: session,
+        "camera",
+        0,
+        TIER_CATEGORY_RECORDER,
+        TIER_SUBCATEGORY_SEGMENTS,
+        src,
+        dst,
+        "/tier2",
+        MagicMock(),
+    )
+
+    copy_call = storage.tier_check_worker_send_command.call_args_list[0]
+    assert isinstance(copy_call.args[0], DataItemCopyFile)
+    assert copy_call.args[0].src == "/tier1/segments/camera/init.mp4"
+    assert copy_call.args[0].dst == "/tier2/segments/camera/init.mp4"
+
+    copy_callback = copy_call.kwargs["callback"]
+    copy_callback(
+        DataItemCopyFile(
+            cmd="copy_file",
+            src="/tier1/segments/camera/init.mp4",
+            dst="/tier2/segments/camera/init.mp4",
+            copied=True,
+            published=True,
+            size=4,
+        )
+    )
+
+    move_call = storage.tier_check_worker_send_command.call_args_list[1]
+    assert isinstance(move_call.args[0], DataItemMoveFile)
+    callback = move_call.kwargs["callback"]
+    callback(
+        DataItemMoveFile(
+            cmd="move_file",
+            src=src,
+            dst=dst,
+            moved=True,
+            published=True,
+            source_removed=False,
+            source_remove_error="unlink failed",
+            size=7,
+        )
+    )
+
+    assert session.committed is True
+    assert session.rolled_back is False
+    assert dst not in storage.temporary_files_meta
+    assert vis.dispatch_event.called
+
+
+def test_move_file_skips_segment_move_when_init_sidecar_missing() -> None:
+    """A segment should not be moved to a tier without init.mp4."""
+    src = "/tier1/segments/camera/1.m4s"
+    dst = "/tier2/segments/camera/1.m4s"
+    session = MoveCallbackSession()
+    storage = MagicMock()
+    storage.temporary_files_meta = {}
+
+    tier_handler_move_file(
+        MagicMock(),
+        storage,
+        lambda: session,
+        "camera",
+        0,
+        TIER_CATEGORY_RECORDER,
+        TIER_SUBCATEGORY_SEGMENTS,
+        src,
+        dst,
+        "/tier2",
+        MagicMock(),
+    )
+
+    copy_call = storage.tier_check_worker_send_command.call_args_list[0]
+    copy_callback = copy_call.kwargs["callback"]
+    copy_callback(
+        DataItemCopyFile(
+            cmd="copy_file",
+            src="/tier1/segments/camera/init.mp4",
+            dst="/tier2/segments/camera/init.mp4",
+            source_missing=True,
+            published=False,
+        )
+    )
+
+    assert storage.tier_check_worker_send_command.call_count == 1
+    assert dst not in storage.temporary_files_meta
+
+
+def test_move_file_copies_hashed_init_sidecar() -> None:
+    """A segment with hls_init_hash should copy the matching init sidecar."""
+    src = "/tier1/segments/camera/1.m4s"
+    dst = "/tier2/segments/camera/1.m4s"
+    session = MoveCallbackSession()
+    session.execute = MagicMock(
+        return_value=MoveCallbackScalarResult(
+            MagicMock(orig_ctime=utcnow(), duration=1.0, hls_init_hash="abc123")
+        )
+    )
+    storage = MagicMock()
+    storage.temporary_files_meta = {}
+
+    tier_handler_move_file(
+        MagicMock(),
+        storage,
+        lambda: session,
+        "camera",
+        0,
+        TIER_CATEGORY_RECORDER,
+        TIER_SUBCATEGORY_SEGMENTS,
+        src,
+        dst,
+        "/tier2",
+        MagicMock(),
+    )
+
+    copy_call = storage.tier_check_worker_send_command.call_args_list[0]
+    assert isinstance(copy_call.args[0], DataItemCopyFile)
+    assert copy_call.args[0].src == "/tier1/segments/camera/init-abc123.mp4"
+    assert copy_call.args[0].dst == "/tier2/segments/camera/init-abc123.mp4"
 
 
 @patch("viseron.components.storage.tier_handler.delete_file")
@@ -106,7 +398,8 @@ def test_handle_file_delete(mock_delete_file: Mock, vis: MockViseron) -> None:
         "/tmp/tier1/",
         logger,
     )
-    mock_delete_file.assert_called_once_with(storage, file)
+    assert mock_delete_file.call_args.args == (storage, file)
+    assert callable(mock_delete_file.call_args.kwargs["callback"])
 
 
 @patch("viseron.components.storage.tier_handler.move_file")
@@ -469,6 +762,9 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 "/tmp/",
                 tier_handlers[0]._logger,
                 force_delete=force_delete,
+                next_tier_id=tier_handlers[next_tier_index].tier_id
+                if next_tier_index
+                else None,
             )
             if move_thumbnail_called:
                 thumbnail_tier_handler.move_thumbnail.assert_called_once_with(
@@ -521,6 +817,21 @@ class TestCheckTierCallbackLifecycle:
             tier_handler.check_tier()
 
         assert send.call_count == 1
+
+    def test_capacity_deferral_schedules_a_new_check(self, vis: MockViseron) -> None:
+        """A deferred check is tried again even without more filesystem events."""
+        handler = self._make_tier_handler(vis)
+        send = cast("Mock", handler._storage.tier_check_worker_send_command)
+        handler.check_tier()
+        item, callback = send.call_args.args
+        item.deferred = True
+        with patch.object(vis.background_scheduler, "add_job") as add_job:
+            callback(item)
+
+        scheduled_func = add_job.call_args.args[0]
+        scheduled_func(**add_job.call_args.kwargs["kwargs"])
+        assert send.call_count == 2
+        assert send.call_args.args[0].force
 
     def test_no_op_reply_releases_slot(self, vis: MockViseron) -> None:
         """A reply with no data releases the slot and advances the throttle."""
@@ -843,7 +1154,7 @@ def fixture_db_storage(get_db_session: sessionmaker[Session]) -> Mock:
     storage = Mock(spec=Storage)
     storage.get_session = get_db_session
     storage.temporary_files_meta = {}
-    storage.pending_moves = {}
+    storage.temporary_moving_files = set()
     return storage
 
 
@@ -906,8 +1217,8 @@ def _start_move(
     src_handler: TierHandler,
     dst_handler: TierHandler,
     filename: str,
-) -> tuple[str, str]:
-    """Run move_file, then replay the copy and delete done by the subprocess."""
+) -> tuple[str, str, Callable[[], None]]:
+    """Run move_file and replay the copy and delete done by the subprocess."""
     src = _tier_file(src_handler, filename)
     dst = _tier_file(dst_handler, filename)
     move_file(
@@ -923,10 +1234,35 @@ def _start_move(
         dst_handler.tier[CONFIG_PATH],
         logging.getLogger(__name__),
     )
+    sent = storage.tier_check_worker_send_command.call_args
+    if isinstance(sent.args[0], DataItemCopyFile):
+        sent.kwargs["callback"](
+            DataItemCopyFile(
+                cmd="copy_file",
+                src=sent.args[0].src,
+                dst=sent.args[0].dst,
+                published=True,
+            )
+        )
+        sent = storage.tier_check_worker_send_command.call_args
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy(src, dst)
     os.remove(src)
-    return src, dst
+
+    def complete() -> None:
+        sent.kwargs["callback"](
+            DataItemMoveFile(
+                cmd="move_file",
+                src=src,
+                dst=dst,
+                published=True,
+                moved=True,
+                source_removed=True,
+                size=os.stat(dst).st_size,
+            )
+        )
+
+    return src, dst, complete
 
 
 def _simulate_move(
@@ -942,13 +1278,14 @@ def _simulate_move(
     The source and destination observers drain separate event queues, so the
     order in which their callbacks run is not guaranteed.
     """
-    src, dst = _start_move(vis, storage, src_handler, dst_handler, filename)
+    src, dst, complete = _start_move(vis, storage, src_handler, dst_handler, filename)
     observers = {
         "created": lambda: dst_handler._on_created(FileCreatedEvent(dst)),
         "deleted": lambda: src_handler._on_deleted(FileDeletedEvent(src)),
     }
     for observer in observer_order:
         observers[observer]()
+    complete()
 
 
 OBSERVER_ORDERS = [
@@ -981,7 +1318,7 @@ def test_file_key_survives_move(
 
     assert _file_keys(db_storage) == {_tier_file(tier1, "1.m4s"): original_key}
     assert db_storage.temporary_files_meta == {}
-    assert db_storage.pending_moves == {}
+    assert not db_storage.temporary_moving_files
 
 
 def test_file_key_resolvable_before_destination_is_observed(
@@ -1004,8 +1341,9 @@ def test_file_key_resolvable_before_destination_is_observed(
     tier0._on_created(FileCreatedEvent(src))
     original_key = _file_keys(db_storage)[src]
 
-    src, dst = _start_move(vis, db_storage, tier0, tier1, "1.m4s")
+    src, dst, complete = _start_move(vis, db_storage, tier0, tier1, "1.m4s")
     tier0._on_deleted(FileDeletedEvent(src))
+    complete()
 
     assert _file_keys(db_storage) == {dst: original_key}
 
@@ -1074,7 +1412,7 @@ def test_hand_over_row_concurrent_with_destination_insert(
     src = _create_file(_tier_file(tier0, "1.m4s"))
     tier0._on_created(FileCreatedEvent(src))
     original_key = _file_keys(db_storage)[src]
-    src, dst = _start_move(vis, db_storage, tier0, tier1, "1.m4s")
+    src, dst, complete = _start_move(vis, db_storage, tier0, tier1, "1.m4s")
 
     db_errors: list[BaseException] = []
 
@@ -1102,11 +1440,11 @@ def test_hand_over_row_concurrent_with_destination_insert(
     dst_storage = Mock(spec=Storage)
     dst_storage.get_session = get_gated_session
     dst_storage.temporary_files_meta = db_storage.temporary_files_meta
-    dst_storage.pending_moves = db_storage.pending_moves
+    dst_storage.temporary_moving_files = db_storage.temporary_moving_files
     tier1._storage = dst_storage
 
     created = threading.Thread(target=tier1._on_created, args=(FileCreatedEvent(dst),))
-    deleted = threading.Thread(target=tier0._on_deleted, args=(FileDeletedEvent(src),))
+    deleted = threading.Thread(target=complete)
     try:
         created.start()
         assert inserted.wait(10)

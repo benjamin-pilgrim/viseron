@@ -11,6 +11,13 @@ from typing import TYPE_CHECKING
 import aiofiles.os
 import requests
 
+from viseron.components.storage.const import (
+    COMPONENT as STORAGE_COMPONENT,
+    TIER_CATEGORY_RECORDER,
+    TIER_SUBCATEGORY_EVENT_CLIPS,
+    TIER_SUBCATEGORY_THUMBNAILS,
+)
+from viseron.components.storage.files import resolve_file_id
 from viseron.const import VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import EVENT_RECORDER_COMPLETE, EVENT_RECORDER_START
 from viseron.helpers.notifications import (
@@ -34,6 +41,18 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = DiscordRoot
+
+
+THUMBNAIL_FILE_TYPES = frozenset(
+    {
+        (TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_THUMBNAILS),
+    }
+)
+EVENT_CLIP_FILE_TYPES = frozenset(
+    {
+        (TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_EVENT_CLIPS),
+    }
+)
 
 
 def setup(vis: Viseron, config: DiscordRoot) -> bool:
@@ -62,6 +81,7 @@ class DiscordNotifier:
     def __init__(self, vis: Viseron, config: DiscordConfig) -> None:
         self._vis = vis
         self._config = config
+        self._storage = vis.data[STORAGE_COMPONENT]
         self._webhook_url = config.webhook_url
         self._loop = asyncio.new_event_loop()
         self._stop_event = asyncio.Event()
@@ -142,6 +162,51 @@ class DiscordNotifier:
                 return True, obj.label
         return False, None
 
+    def _resolve_recording_file_path(
+        self,
+        file_id: int | None,
+        fallback_path: str | None,
+        allowed_file_types: frozenset[tuple[str, str]],
+    ) -> str | None:
+        """Resolve a recording artifact path, preferring the stable Files id."""
+        if file_id is not None:
+            resolved_file = resolve_file_id(
+                self._storage.get_session,
+                self._storage,
+                file_id,
+                allowed_file_types,
+            )
+            if resolved_file is not None:
+                return resolved_file.path
+
+        if fallback_path is not None and os.path.exists(fallback_path):
+            return fallback_path
+        return None
+
+    async def _async_resolve_recording_file_path(
+        self,
+        file_id: int | None,
+        fallback_path: str | None,
+        allowed_file_types: frozenset[tuple[str, str]],
+    ) -> str | None:
+        """Resolve a recording artifact path without blocking the notifier loop."""
+        if file_id is not None:
+            loop = asyncio.get_running_loop()
+            resolved_file = await loop.run_in_executor(
+                None,
+                resolve_file_id,
+                self._storage.get_session,
+                self._storage,
+                file_id,
+                allowed_file_types,
+            )
+            if resolved_file is not None:
+                return resolved_file.path
+
+        if fallback_path is not None and await aiofiles.os.path.exists(fallback_path):
+            return fallback_path
+        return None
+
     def _recorder_start_event(self, event_data: Event[EventRecorderData]) -> None:
         """Handle recorder start event."""
         camera = event_data.data.camera
@@ -167,13 +232,13 @@ class DiscordNotifier:
             if camera_config.send_detection_thumbnail is not None
             else self._config.send_detection_thumbnail
         )
-        thumbnail_path = recording.thumbnail_path
+        thumbnail_path = self._resolve_recording_file_path(
+            recording.thumbnail_file_id,
+            recording.thumbnail_path,
+            THUMBNAIL_FILE_TYPES,
+        )
 
-        if (
-            send_thumbnail
-            and thumbnail_path is not None
-            and os.path.exists(thumbnail_path)
-        ):
+        if send_thumbnail and thumbnail_path is not None:
             # Send message with thumbnail
             self._send_discord_file(
                 thumbnail_path, message, "thumbnail.jpg", camera.identifier
@@ -230,13 +295,12 @@ class DiscordNotifier:
             message += f" - Detected {label}"
 
         # Check if we can send video
-        clip_path = recording.clip_path
-        can_send_video = (
-            not already_sent
-            and send_video
-            and clip_path is not None
-            and await aiofiles.os.path.exists(clip_path)
+        clip_path = await self._async_resolve_recording_file_path(
+            recording.clip_file_id,
+            recording.clip_path,
+            EVENT_CLIP_FILE_TYPES,
         )
+        can_send_video = not already_sent and send_video and clip_path is not None
 
         # If we can't send video, send a message with thumbnail
         if not can_send_video:
@@ -249,12 +313,12 @@ class DiscordNotifier:
                 if camera_config.send_detection_thumbnail is not None
                 else self._config.send_detection_thumbnail
             )
-            thumbnail_path = recording.thumbnail_path
-            if (
-                send_thumbnail
-                and thumbnail_path is not None
-                and await aiofiles.os.path.exists(thumbnail_path)
-            ):
+            thumbnail_path = await self._async_resolve_recording_file_path(
+                recording.thumbnail_file_id,
+                recording.thumbnail_path,
+                THUMBNAIL_FILE_TYPES,
+            )
+            if send_thumbnail and thumbnail_path is not None:
                 self._send_discord_file(
                     thumbnail_path,
                     f"Thumbnail for {camera.identifier}",

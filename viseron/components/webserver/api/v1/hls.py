@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from itertools import pairwise
@@ -12,20 +14,31 @@ from math import ceil
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from viseron.components.storage.const import (
     TIER_CATEGORY_RECORDER,
     TIER_SUBCATEGORY_SEGMENTS,
 )
-from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.files import file_tier_for_path
+from viseron.components.storage.models import (
+    FileLocations,
+    FileLocationState,
+    Files,
+    Recordings,
+)
 from viseron.components.storage.queries import get_time_period_fragments
 from viseron.components.webserver.api.handlers import BaseAPIHandler
+from viseron.components.webserver.api.v1.files import (
+    ResolvedFile,
+    authorize_file_request,
+    serve_resolved_file,
+)
 from viseron.const import CAMERA_SEGMENT_DURATION, HLS_SKIP_BOUNDARY_TARGET_DURATIONS
 from viseron.domains.camera import AbstractCamera
 from viseron.domains.camera.fragmenter import (
     Fragment,
-    gap_in_fragments,
+    discontinuity_in_fragments,
     generate_playlist,
     get_available_timespans,
 )
@@ -37,9 +50,12 @@ if TYPE_CHECKING:
 
     from sqlalchemy.orm import Session
 
+    from viseron.components.storage import Storage
     from viseron.domains.camera import FailedCamera
 
 LOGGER = logging.getLogger(__name__)
+HLS_SEGMENT_RESPONSE_WARN_SECONDS = 0.05
+HLS_INIT_HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
 
 def count_files_removed(
@@ -63,7 +79,7 @@ def count_discontinuities(fragments: list[Fragment]) -> int:
     return sum(
         1
         for previous, fragment in pairwise(fragments)
-        if gap_in_fragments(previous, fragment)
+        if discontinuity_in_fragments(previous, fragment)
     )
 
 
@@ -150,6 +166,26 @@ class HlsAPIHandler(BaseAPIHandler):
                 )
             ),
         },
+        {
+            "path_pattern": (
+                r"/hls/init/(?P<camera_identifier>[A-Za-z0-9_]+)/"
+                r"(?P<init_hash>[a-f0-9]{64}).mp4"
+            ),
+            "supported_methods": ["GET"],
+            "method": "get_hls_init_file",
+            "allow_token_parameter": True,
+            "requires_auth": False,
+        },
+        {
+            "path_pattern": (
+                r"/hls/init/(?P<camera_identifier>[A-Za-z0-9_]+)/"
+                r"(?P<tier_id>[0-9]+).mp4"
+            ),
+            "supported_methods": ["GET"],
+            "method": "get_legacy_hls_init_file",
+            "allow_token_parameter": True,
+            "requires_auth": False,
+        },
     ]
 
     async def get_recording_hls_playlist(
@@ -177,6 +213,11 @@ class HlsAPIHandler(BaseAPIHandler):
             self.request_arguments["_HLS_skip"] is not None,
         )
         if not playlist:
+            LOGGER.warning(
+                "Returning 404 for HLS playlist (camera=%s, recording_id=%s)",
+                camera_identifier,
+                recording_id,
+            )
             self.response_error(
                 HTTPStatus.NOT_FOUND, f"Recording with id {recording_id} not found"
             )
@@ -215,6 +256,14 @@ class HlsAPIHandler(BaseAPIHandler):
             self.request_arguments["_HLS_skip"] is not None,
         )
         if not playlist:
+            LOGGER.warning(
+                "Returning 404 for HLS time-period playlist "
+                "(camera=%s, start_timestamp=%s, end_timestamp=%s, date=%s)",
+                camera_identifier,
+                self.request_arguments["start_timestamp"],
+                self.request_arguments["end_timestamp"],
+                self.request_arguments["date"],
+            )
             self.response_error(
                 HTTPStatus.NOT_FOUND, "HLS playlist could not be generated"
             )
@@ -258,34 +307,202 @@ class HlsAPIHandler(BaseAPIHandler):
         )
         await self.response_success(response={"timespans": timespans})
 
+    async def get_hls_init_file(self, camera_identifier: str, init_hash: str):
+        """Get a hash-addressed HLS init file for a camera."""
+        if not await authorize_file_request(self, camera_identifier, failed=True):
+            return
 
-def _get_init_file(
-    get_session: Callable[[], Session], camera: AbstractCamera | FailedCamera
-) -> str | None:
-    """Get the init file for a camera."""
-    # Normally in the first tier, so avoid querying every tier on each playlist poll
-    if isinstance(camera, AbstractCamera):
-        init_file = os.path.join(camera.segments_folder, "init.mp4")
-        if os.path.exists(init_file):
-            return init_file
+        camera = self._get_camera(camera_identifier, failed=True)
+        if not camera:
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                reason=f"Camera {camera_identifier} not found",
+            )
+            return
 
+        if not HLS_INIT_HASH_PATTERN.match(init_hash):
+            self.response_error(HTTPStatus.BAD_REQUEST, reason="Invalid init hash")
+            return
+
+        init_file = await self.run_in_executor(
+            _get_hashed_init_file,
+            self._get_session,
+            self._storage,
+            camera_identifier,
+            init_hash,
+        )
+        if init_file is None:
+            LOGGER.warning(
+                "Returning 404 for missing HLS init file (camera=%s, init_hash=%s)",
+                camera_identifier,
+                init_hash,
+            )
+            self.response_error(HTTPStatus.NOT_FOUND, reason="Init file not found")
+            return
+
+        await serve_resolved_file(
+            self,
+            init_file,
+            cache_control="public, max-age=31536000, immutable",
+        )
+
+    async def get_legacy_hls_init_file(self, camera_identifier: str, tier_id: str):
+        """Get a legacy HLS init file by camera and tier id."""
+        if not await authorize_file_request(self, camera_identifier, failed=True):
+            return
+
+        camera = self._get_camera(camera_identifier, failed=True)
+        if not camera:
+            self.response_error(
+                HTTPStatus.NOT_FOUND,
+                reason=f"Camera {camera_identifier} not found",
+            )
+            return
+
+        init_file = await self.run_in_executor(
+            _get_init_file,
+            camera,
+            int(tier_id),
+        )
+        if init_file is None:
+            LOGGER.warning(
+                "Returning 404 for missing HLS init file (camera=%s, tier_id=%s)",
+                camera_identifier,
+                tier_id,
+            )
+            self.response_error(HTTPStatus.NOT_FOUND, reason="Init file not found")
+            return
+
+        await serve_resolved_file(
+            self,
+            init_file,
+            cache_control="public, max-age=31536000, immutable",
+        )
+
+
+def _get_hashed_init_file(
+    get_session: Callable[[], Session],
+    storage: Storage,
+    camera_identifier: str,
+    init_hash: str,
+) -> ResolvedFile | None:
+    """Get a hash-addressed HLS init sidecar referenced by available segments."""
+    init_filename = f"init-{init_hash}.mp4"
     with get_session() as session:
         stmt = (
-            select(Files.directory)
-            .where(Files.camera_identifier == camera.identifier)
+            select(FileLocations.path)
+            .join(Files, Files.id == FileLocations.file_id)
+            .where(Files.camera_identifier == camera_identifier)
             .where(Files.category == TIER_CATEGORY_RECORDER)
             .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
-            .group_by(Files.directory)
-            .order_by(func.min(Files.tier_id), func.max(Files.created_at).desc())
+            .where(Files.hls_init_hash == init_hash)
+            .where(FileLocations.state == FileLocationState.AVAILABLE.value)
+            .order_by(FileLocations.tier_id.asc())
         )
-        directories = session.execute(stmt).scalars().all()
+        segment_paths = session.execute(stmt).scalars().all()
 
-    for directory in directories:
-        init_file = os.path.join(directory, "init.mp4")
-        if os.path.exists(init_file):
-            return init_file
-    LOGGER.error(f"Could not find init.mp4 file for camera {camera.identifier}")
+    for segment_path in segment_paths:
+        init_path = os.path.join(os.path.dirname(segment_path), init_filename)
+        if not file_tier_for_path(
+            storage,
+            camera_identifier,
+            TIER_CATEGORY_RECORDER,
+            TIER_SUBCATEGORY_SEGMENTS,
+            init_path,
+        ):
+            continue
+        try:
+            size = os.path.getsize(init_path)
+        except OSError:
+            continue
+        if os.path.isfile(init_path):
+            return ResolvedFile(
+                file_id=0,
+                camera_identifier=camera_identifier,
+                category=TIER_CATEGORY_RECORDER,
+                subcategory=TIER_SUBCATEGORY_SEGMENTS,
+                path=init_path,
+                size=size,
+            )
     return None
+
+
+def _get_init_file(
+    camera: AbstractCamera | FailedCamera,
+    tier_id: int,
+) -> ResolvedFile | None:
+    """Get the init file for a camera tier."""
+    try:
+        tier_path = camera.tier_base_path(
+            tier_id,
+            TIER_CATEGORY_RECORDER,
+            TIER_SUBCATEGORY_SEGMENTS,
+        )
+    except ValueError:
+        return None
+
+    init_path = os.path.normpath(
+        os.path.join(
+            os.path.join(tier_path, TIER_SUBCATEGORY_SEGMENTS, camera.identifier),
+            "init.mp4",
+        )
+    )
+    if not os.path.isfile(init_path) or os.path.realpath(init_path) != os.path.join(
+        os.path.realpath(os.path.dirname(init_path)), "init.mp4"
+    ):
+        LOGGER.error("Could not find init.mp4 file for camera %s", camera.identifier)
+        return None
+
+    return ResolvedFile(
+        file_id=0,
+        camera_identifier=camera.identifier,
+        category=TIER_CATEGORY_RECORDER,
+        subcategory=TIER_SUBCATEGORY_SEGMENTS,
+        path=init_path,
+        size=os.path.getsize(init_path),
+    )
+
+
+def _legacy_init_file_url(
+    camera: AbstractCamera | FailedCamera,
+    subpath: str,
+    tier_id: int,
+) -> str:
+    """Return logical legacy HLS init file URL."""
+    return f"{subpath}/api/v1/hls/init/{camera.identifier}/{tier_id}.mp4"
+
+
+def _hashed_init_file_url(
+    camera: AbstractCamera | FailedCamera,
+    subpath: str,
+    init_hash: str,
+) -> str:
+    """Return logical hash-addressed HLS init file URL."""
+    return f"{subpath}/api/v1/hls/init/{camera.identifier}/{init_hash}.mp4"
+
+
+def _init_file_url(
+    camera: AbstractCamera | FailedCamera,
+    subpath: str,
+    files: list,
+) -> str | None:
+    """Return logical HLS init file URL for the first fragment."""
+    if not files:
+        return None
+    if getattr(files[0], "hls_init_hash", None):
+        return _hashed_init_file_url(camera, subpath, files[0].hls_init_hash)
+    return _legacy_init_file_url(camera, subpath, files[0].tier_id)
+
+
+def _legacy_init_files_available(
+    camera: AbstractCamera | FailedCamera,
+    files: list,
+) -> bool:
+    """Return if all legacy fragments have an available init.mp4."""
+    legacy_tier_ids = {
+        file.tier_id for file in files if not getattr(file, "hls_init_hash", None)
+    }
+    return all(_get_init_file(camera, tier_id) for tier_id in legacy_tier_ids)
 
 
 def get_target_duration(fragments: list[Fragment]) -> int:
@@ -344,6 +561,14 @@ def files_to_fragments(subpath: str, files: list) -> list[Fragment]:
             f"{subpath}/file/{file.camera_identifier}/{file.file_key:x}",
             file.duration,
             file.orig_ctime,
+            (
+                f"{subpath}/api/v1/hls/init/{file.camera_identifier}/"
+                f"{file.hls_init_hash}.mp4"
+            )
+            if getattr(file, "hls_init_hash", None)
+            else (
+                f"{subpath}/api/v1/hls/init/{file.camera_identifier}/{file.tier_id}.mp4"
+            ),
         )
         for file in files
     ]
@@ -405,6 +630,9 @@ def _generate_playlist(
     )
     fragments = files_to_fragments(subpath, files)
 
+    if not fragments:
+        return None
+
     end: bool = True
     # Recording has not ended yet
     if recording.end_time is None:
@@ -423,13 +651,16 @@ def _generate_playlist(
         LOGGER.debug("Recording has ended but the last file is not finished yet")
         end = False
 
-    init_file = _get_init_file(get_session, camera)
-    if not init_file or not fragments:
+    if not _legacy_init_files_available(camera, files):
+        return None
+
+    init_file_url = _init_file_url(camera, subpath, files)
+    if not init_file_url:
         return None
 
     return _render_client_playlist(
         fragments,
-        f"{subpath}/files{init_file}",
+        init_file_url,
         hls_client_id,
         skip_requested=skip_requested,
         end=end,
@@ -464,13 +695,18 @@ def _generate_playlist_time_period(
     )
     fragments = files_to_fragments(subpath, files)
 
-    init_file = _get_init_file(get_session, camera)
-    if not init_file:
+    if not fragments and end_playlist:
+        return generate_playlist([], "", end=True)
+
+    if not _legacy_init_files_available(camera, files):
+        return None
+    init_file_url = _init_file_url(camera, subpath, files)
+    if not init_file_url:
         return None
 
     return _render_client_playlist(
         fragments,
-        f"{subpath}/files{init_file}",
+        init_file_url,
         hls_client_id,
         skip_requested=skip_requested,
         end=end_playlist,

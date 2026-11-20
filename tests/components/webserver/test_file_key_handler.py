@@ -5,13 +5,14 @@ from __future__ import annotations
 import datetime
 import os
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
-from viseron.components.storage.models import Files
+from viseron.components.storage.models import FileLocations, Files
 from viseron.domain_registry import DomainState
 from viseron.domains.camera.const import DOMAIN as CAMERA_DOMAIN
 
@@ -75,14 +76,40 @@ class FileKeyTestMixin:
             "size": 10,
             "orig_ctime": datetime.datetime.now(datetime.timezone.utc),
         }
-        if file_key is not None:
-            values["file_key"] = file_key
+        storage = self.vis.data["storage"]
+        tiers = storage.camera_tier_handlers.setdefault(
+            camera_identifier, {}
+        ).setdefault("recorder", [])
+        while len(tiers) <= tier_id:
+            tiers.append({})
+        tiers[tier_id]["segments"] = SimpleNamespace(
+            tier=SimpleNamespace(path=tier_path),
+            _path=directory,
+        )
+
         with self._get_db_session() as session:
-            key = session.execute(
-                insert(Files).values(**values).returning(Files.file_key)
-            ).scalar_one()
+            if file_key is None:
+                file_id, file_key = session.execute(
+                    insert(Files).values(**values).returning(Files.id, Files.file_key)
+                ).one()
+            else:
+                file_id = session.execute(
+                    select(Files.id).where(Files.file_key == file_key)
+                ).scalar_one()
+            session.execute(
+                insert(FileLocations).values(
+                    file_id=file_id,
+                    tier_id=tier_id,
+                    tier_path=tier_path,
+                    directory=directory,
+                    path=path,
+                    filename="1.m4s",
+                    size=10,
+                    state="available",
+                )
+            )
             session.commit()
-        return key
+        return file_key
 
 
 def _url(camera_identifier: str, file_key: int) -> str:
@@ -101,6 +128,21 @@ class TestFileKeyHandler(FileKeyTestMixin, TestAppBaseNoAuth):
         assert response.code == HTTPStatus.OK
         assert response.body == b"segment"
         assert response.headers["Etag"]
+
+    def test_static_http_requests(self) -> None:
+        """HEAD, conditional GET, and byte ranges work for a logical file."""
+        url = _url("test", self._store_file(0, b"segment"))
+        head = self.fetch(url, method="HEAD")
+        assert head.code == HTTPStatus.OK
+        assert head.body == b""
+        assert head.headers["Content-Length"] == "7"
+        assert (
+            self.fetch(url, headers={"If-None-Match": head.headers["Etag"]}).code
+            == HTTPStatus.NOT_MODIFIED
+        )
+        response = self.fetch(url, headers={"Range": "bytes=1-3"})
+        assert response.code == HTTPStatus.PARTIAL_CONTENT
+        assert response.body == b"egm"
 
     def test_prefers_source_while_both_copies_exist(self) -> None:
         """Test that the source is served while the destination may be mid-copy."""
@@ -176,6 +218,9 @@ class TestFileKeyHandlerAuth(FileKeyTestMixin, TestAppBaseAuth):
     def test_authenticated(self) -> None:
         """Test that a valid token for the camera in the URL is served the file."""
         MockCamera(vis=self.vis, identifier="test")
+        self.vis.data["storage"].create_tier_handlers(
+            self.vis.get_registered_domain(CAMERA_DOMAIN, "test")
+        )
         file_key = self._store_file(0, b"segment")
 
         response = self.fetch(

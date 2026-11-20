@@ -81,7 +81,6 @@ import { useShallow } from "zustand/react/shallow";
 import { useCameraStore } from "components/camera/useCameraStore";
 import { useSubscribeTimespans } from "hooks/UseSubscribeTimespans";
 import { useCameras } from "lib/api/cameras";
-import { BLANK_IMAGE } from "lib/helpers";
 import {
   DATE_FORMAT,
   getDayjs,
@@ -666,13 +665,13 @@ export const calculateWidth = (
 export const getSrc = (event: types.CameraEvent) => {
   switch (event.type) {
     case "recording":
-      return event.thumbnail_path;
+      return event.thumbnail_url;
     case "object":
     case "face_recognition":
     case "image_classification":
     case "license_plate_recognition":
     case "motion":
-      return event.snapshot_path || BLANK_IMAGE;
+      return event.snapshot_url;
     default:
       return event satisfies never;
   }

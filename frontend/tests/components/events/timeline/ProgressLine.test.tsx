@@ -1,5 +1,6 @@
 import { act, render } from "@testing-library/react";
 import Hls from "hls.js";
+import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ProgressLine } from "components/events/timeline/ProgressLine";
@@ -29,12 +30,15 @@ describe("ProgressLine", () => {
     const getBounds = vi
       .spyOn(container, "getBoundingClientRect")
       .mockReturnValue({ height: 1000 } as DOMRect);
+    const onCommit = vi.fn();
     const { container: root } = render(
-      <ProgressLine
-        containerRef={{ current: container }}
-        startRef={{ current: start }}
-        endRef={{ current: end }}
-      />,
+      <Profiler id="progress-line" onRender={onCommit}>
+        <ProgressLine
+          containerRef={{ current: container }}
+          startRef={{ current: start }}
+          endRef={{ current: end }}
+        />
+      </Profiler>,
     );
     const line = root.firstElementChild as HTMLElement;
     // The player's media is attached by polling
@@ -42,6 +46,7 @@ describe("ProgressLine", () => {
       vi.advanceTimersByTime(100);
     });
     getBounds.mockClear();
+    onCommit.mockClear();
 
     media.dispatchEvent(new Event("timeupdate"));
     media.dispatchEvent(new Event("timeupdate"));
@@ -51,5 +56,6 @@ describe("ProgressLine", () => {
     expect(line.style.visibility).toBe("visible");
     expect(line.textContent).not.toBe("");
     expect(getBounds).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
   });
 });

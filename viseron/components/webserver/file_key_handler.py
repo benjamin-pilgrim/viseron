@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import tornado.web
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
-from viseron.components.storage.models import Files
+from viseron.components.storage.files import resolve_file_id
+from viseron.components.storage.models import FileKeyAliases, Files
+from viseron.components.storage.util import is_transient_filesystem_error
 from viseron.components.webserver.static_file_handler import (
     AccessTokenStaticFileHandler,
 )
@@ -41,28 +44,29 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
         await super().prepare()
 
     def _resolve(self) -> str | None:
-        """Return the path of the lowest tier that has the file on disk.
-
-        Both the source and destination rows exist while a move is in flight. The
-        source is preferred since the destination can still be mid-copy.
-        """
+        """Resolve an authorized canonical or migrated key to a configured location."""
         # Convert the hexadecimal file key from the URL to an integer.
         file_key = int(self._encoded_file_key, 16)
         if file_key > MAX_FILE_KEY:
             return None
 
         with self._get_session() as session:
-            stmt = (
-                select(Files.path)
-                .where(Files.camera_identifier == self._camera_identifier)
-                .where(Files.file_key == file_key)
-                .order_by(Files.tier_id)
+            stmt = select(Files.id).where(
+                Files.camera_identifier == self._camera_identifier,
+                or_(
+                    Files.file_key == file_key,
+                    Files.id.in_(
+                        select(FileKeyAliases.file_id).where(
+                            FileKeyAliases.file_key == file_key
+                        )
+                    ),
+                ),
             )
-            paths = session.execute(stmt).scalars().all()
-        for path in paths:
-            if os.path.exists(path):
-                return path
-        return None
+            file_id = session.execute(stmt).scalars().first()
+        if file_id is None:
+            return None
+        resolved = resolve_file_id(self._get_session, self._storage, file_id)
+        return resolved.path if resolved else None
 
     async def get(
         self,
@@ -70,8 +74,18 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
         include_body: bool = True,  # noqa: FBT001, FBT002
     ) -> None:
         """Serve the file the key resolves to."""
-        resolved_path = await self.run_in_executor(self._resolve)
-        if resolved_path is None:
-            raise tornado.web.HTTPError(HTTPStatus.NOT_FOUND)
-        self.root = os.path.dirname(resolved_path)
-        await super().get(os.path.basename(resolved_path), include_body)
+        try:
+            resolved_path = await self.run_in_executor(self._resolve)
+            if resolved_path is None:
+                raise tornado.web.HTTPError(HTTPStatus.NOT_FOUND)
+            self.root = os.path.dirname(resolved_path)
+            await super().get(os.path.basename(resolved_path), include_body)
+        except OSError as error:
+            unavailable = (
+                isinstance(error, FileNotFoundError)
+                or error.errno in {errno.EINVAL, errno.ENOTDIR}
+                or is_transient_filesystem_error(error)
+            )
+            if unavailable and not self._headers_written:
+                raise tornado.web.HTTPError(HTTPStatus.NOT_FOUND) from error
+            raise

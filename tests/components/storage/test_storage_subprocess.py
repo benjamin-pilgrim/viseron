@@ -1,13 +1,24 @@
 """Test the storage subprocess helpers."""
 
 import datetime
+from itertools import count
 from queue import Empty, Queue
+from threading import Lock
+from unittest.mock import Mock
 
 import pytest
 
 from viseron.components.storage.storage_subprocess import (
     DataItem,
+    DataItemCopyFile,
+    DataItemDeleteFile,
+    DataItemMoveFile,
     DedupCheckQueue,
+    DedupFileQueue,
+    FileOperation,
+    FileOperationKey,
+    TierCheckWorker,
+    file_operation_key,
 )
 
 
@@ -147,3 +158,120 @@ class TestDedupCheckQueue:
 
         with pytest.raises(Empty):
             queue.get(timeout=0.01)
+
+
+def test_dedup_file_queue_coalesces_identical_queued_jobs() -> None:
+    """Identical queued work should retain both completions."""
+    queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
+    first = DataItemMoveFile(cmd="move_file", src="/src", dst="/dst", callback_id="1")
+    second = DataItemMoveFile(cmd="move_file", src="/src", dst="/dst", callback_id="2")
+
+    queue.put(first)
+    queue.put(second)
+
+    assert queue.qsize() == 1
+    job = queue.get_nowait()
+    assert job.callback_id == "1"
+    assert job.coalesced_callback_ids == ["2"]
+    with pytest.raises(Empty):
+        queue.get_nowait()
+
+
+def test_dedup_file_queue_keeps_distinct_operations() -> None:
+    """Different file operations should remain queued independently."""
+    queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
+    copy = DataItemCopyFile(cmd="copy_file", src="/src", dst="/dst")
+    move = DataItemMoveFile(cmd="move_file", src="/src", dst="/dst")
+    delete = DataItemDeleteFile(cmd="delete_file", src="/src")
+
+    queue.put(copy)
+    queue.put(move)
+    queue.put(delete)
+
+    assert queue.qsize() == 3
+    assert queue.get_nowait() is copy
+    assert queue.get_nowait() is move
+    assert queue.get_nowait() is delete
+
+
+def test_dedup_file_queue_keeps_callback_copy_jobs_distinct() -> None:
+    """Copy callbacks can gate different moves and must not collapse."""
+    queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
+    first = DataItemCopyFile(cmd="copy_file", src="/src", dst="/dst", callback_id="1")
+    second = DataItemCopyFile(cmd="copy_file", src="/src", dst="/dst", callback_id="2")
+
+    queue.put(first)
+    queue.put(second)
+
+    assert queue.qsize() == 2
+    assert queue.get_nowait() is first
+    assert queue.get_nowait() is second
+
+
+def _worker() -> TierCheckWorker:
+    worker = object.__new__(TierCheckWorker)
+    worker._callbacks = {}
+    worker._callbacks_lock = Lock()
+    worker._next_callback_id = count(1)
+    worker.input_queue = Queue()
+    return worker
+
+
+def test_pending_duplicate_callbacks_receive_publication_result() -> None:
+    """Both requesters receive the result of a single publication."""
+    worker = _worker()
+    pending = DedupFileQueue(file_operation_key)
+    callbacks = [Mock(), Mock()]
+    for callback in callbacks:
+        worker.send_command(
+            DataItemMoveFile(cmd="move_file", src="/a", dst="/b"), callback
+        )
+        pending.put(worker.input_queue.get_nowait())
+    publication = pending.get_nowait()
+    publication.published = True
+    publication.size = 17
+    worker.work_output(publication)
+    for callback in callbacks:
+        callback.assert_called_once()
+        assert callback.call_args.args[0].published
+        assert callback.call_args.args[0].size == 17
+    assert pending.qsize() == 0
+
+
+def test_in_flight_publication_keeps_its_callback() -> None:
+    """A later request cannot discard a publication already in progress."""
+    worker = _worker()
+    first_result, second_result = Mock(), Mock()
+    worker.send_command(
+        DataItemMoveFile(cmd="move_file", src="/a", dst="/b"), first_result
+    )
+    first = worker.input_queue.get_nowait()
+    worker.send_command(
+        DataItemMoveFile(cmd="move_file", src="/a", dst="/b"), second_result
+    )
+    first.published = True
+    worker.work_output(first)
+    first_result.assert_called_once()
+    assert first_result.call_args.args[0].published
+    second_result.assert_not_called()
+
+
+def test_capacity_defers_new_work_without_losing_accepted_result(monkeypatch) -> None:
+    """Saturation preserves the accepted callback and never enqueues the extra move."""
+    monkeypatch.setattr(
+        "viseron.components.storage.storage_subprocess.MAX_PENDING_CALLBACKS", 1
+    )
+    worker = _worker()
+    first_result, deferred_result = Mock(), Mock()
+    worker.send_command(
+        DataItemMoveFile(cmd="move_file", src="/a", dst="/b"), first_result
+    )
+    worker.send_command(
+        DataItemMoveFile(cmd="move_file", src="/c", dst="/d"), deferred_result
+    )
+    deferred_result.assert_called_once()
+    assert "retry" in deferred_result.call_args.args[0].error
+    first = worker.input_queue.get_nowait()
+    assert worker.input_queue.empty()
+    worker.work_output(first)
+    first_result.assert_called_once()

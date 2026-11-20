@@ -6,25 +6,26 @@ import datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select, update
 
-from tests.common import BaseTestWithRecordings
 from viseron.components.storage.const import (
     TIER_CATEGORY_TIMELAPSE,
     TIER_SUBCATEGORY_TIMELAPSE,
 )
-from viseron.components.storage.models import Files
+from viseron.components.storage.models import FileLocations, Files
 from viseron.components.storage.queries import (
     TimelapseFrame,
     TimelapseFrames,
     TimelapseSummary,
     get_recording_fragments,
-    get_timelapse_frame_paths,
     get_time_period_fragments,
     get_timelapse_days,
+    get_timelapse_frame_paths,
     get_timelapse_frames,
     get_timelapse_summary,
 )
+
+from tests.common import BaseTestWithRecordings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,18 +45,29 @@ class TestQueries(BaseTestWithRecordings):
             timestamp = self._now + datetime.timedelta(seconds=25)
             filename = f"{int(timestamp.timestamp())}.m4s"
             session.execute(
-                insert(Files).values(
+                update(Files)
+                .where(Files.id == 11)
+                .values(
                     tier_id=1,
                     tier_path="/tier2/",
-                    camera_identifier="test",
-                    category="recorder",
-                    subcategory="segments",
+                    path=f"/tier2/{filename}",
+                    directory="tier2",
+                    size=10,
+                    orig_ctime=timestamp,
+                    duration=5,
+                    created_at=created_at,
+                )
+            )
+            session.execute(
+                insert(FileLocations).values(
+                    file_id=11,
+                    tier_id=1,
+                    tier_path="/tier2/",
                     path=f"/tier2/{filename}",
                     directory="tier2",
                     filename=filename,
                     size=10,
-                    orig_ctime=timestamp,
-                    duration=5,
+                    state="available",
                     created_at=created_at,
                 )
             )
@@ -64,7 +76,7 @@ class TestQueries(BaseTestWithRecordings):
         files = get_recording_fragments(3, 5, self._get_db_session)
         assert len(files) == 4
         assert files[0].id == 9
-        assert files[1].id == 31
+        assert files[1].id == 11
         assert files[1].tier_id == 1
         assert files[2].id == 13
         assert files[3].id == 15
@@ -78,18 +90,29 @@ class TestQueries(BaseTestWithRecordings):
             timestamp = self._now + datetime.timedelta(seconds=25)
             filename = f"{int(timestamp.timestamp())}.m4s"
             session.execute(
-                insert(Files).values(
+                update(Files)
+                .where(Files.id == 11)
+                .values(
                     tier_id=1,
                     tier_path="/tier2/",
-                    camera_identifier="test",
-                    category="recorder",
-                    subcategory="segments",
+                    path=f"/tier2/{filename}",
+                    directory="tier2",
+                    size=10,
+                    orig_ctime=timestamp,
+                    duration=5,
+                    created_at=created_at,
+                )
+            )
+            session.execute(
+                insert(FileLocations).values(
+                    file_id=11,
+                    tier_id=1,
+                    tier_path="/tier2/",
                     path=f"/tier2/{filename}",
                     directory="tier2",
                     filename=filename,
                     size=10,
-                    orig_ctime=timestamp,
-                    duration=5,
+                    state="available",
                     created_at=created_at,
                 )
             )
@@ -98,7 +121,7 @@ class TestQueries(BaseTestWithRecordings):
             created_at = self._now + datetime.timedelta(seconds=500)
             timestamp = self._now + datetime.timedelta(seconds=500)
             filename = f"{int(timestamp.timestamp())}.m4s"
-            session.execute(
+            file_result = session.execute(
                 insert(Files).values(
                     tier_id=0,
                     tier_path="/tier1/",
@@ -111,6 +134,20 @@ class TestQueries(BaseTestWithRecordings):
                     size=10,
                     orig_ctime=timestamp,
                     duration=None,
+                    created_at=created_at,
+                )
+            )
+            file_id = file_result.inserted_primary_key[0]
+            session.execute(
+                insert(FileLocations).values(
+                    file_id=file_id,
+                    tier_id=0,
+                    tier_path="/tier1/",
+                    path=f"/tier1/{filename}",
+                    directory="tier1",
+                    filename=filename,
+                    size=10,
+                    state="available",
                     created_at=created_at,
                 )
             )
@@ -143,20 +180,39 @@ def _insert_timelapse_frame(
         _TIMELAPSE_EPOCH + offset, tz=datetime.timezone.utc
     )
     filename = f"{int(timestamp.timestamp())}.jpg"
+    directory = f"/tier{tier_id}/timelapse/{camera_identifier}"
+    path = f"{directory}/{filename}"
+    file_id = session.execute(
+        select(Files.id).where(Files.file_key == file_key)
+    ).scalar_one_or_none()
+    if file_id is None:
+        file_id = session.execute(
+            insert(Files)
+            .values(
+                file_key=file_key,
+                tier_id=tier_id,
+                tier_path=f"/tier{tier_id}/",
+                camera_identifier=camera_identifier,
+                category=category,
+                subcategory=TIER_SUBCATEGORY_TIMELAPSE,
+                path=path,
+                directory=directory,
+                filename=filename,
+                size=10,
+                orig_ctime=timestamp,
+            )
+            .returning(Files.id)
+        ).scalar_one()
     session.execute(
-        insert(Files).values(
-            file_key=file_key,
+        insert(FileLocations).values(
+            file_id=file_id,
             tier_id=tier_id,
             tier_path=f"/tier{tier_id}/",
-            camera_identifier=camera_identifier,
-            category=category,
-            subcategory=TIER_SUBCATEGORY_TIMELAPSE,
-            path=f"/tier{tier_id}/timelapse/{camera_identifier}/{filename}",
-            directory=f"/tier{tier_id}/timelapse/{camera_identifier}",
+            path=path,
+            directory=directory,
             filename=filename,
             size=10,
-            orig_ctime=timestamp,
-            duration=None,
+            state="available",
         )
     )
 

@@ -14,7 +14,9 @@ from sqlalchemy import insert
 from viseron.components.storage.const import (
     COMPONENT as STORAGE_COMPONENT,
     LATEST_SNAPSHOT_FILENAME,
+    TIER_CATEGORY_SNAPSHOTS,
 )
+from viseron.components.storage.files import upsert_file
 from viseron.components.storage.models import PostProcessorResults
 from viseron.const import INSERT, VISERON_SIGNAL_SHUTDOWN
 from viseron.domains import AbstractDomain
@@ -271,14 +273,30 @@ class AbstractPostProcessor(AbstractDomain):
         return snapshot_path
 
     def _insert_result(
-        self, domain: SupportedDomains, snapshot_path: str | None, data: dict[str, Any]
+        self,
+        domain: SupportedDomains,
+        snapshot_path: str | None,
+        data: dict[str, Any],
     ) -> None:
-        """Insert post processor result into database."""
+        """Insert face recognition result into database."""
+        snapshot_file_id = (
+            upsert_file(
+                self._storage.get_session,
+                self._storage,
+                self._camera.identifier,
+                TIER_CATEGORY_SNAPSHOTS,
+                domain,
+                snapshot_path,
+            )
+            if snapshot_path
+            else None
+        )
         with self._storage.get_session() as session:
             stmt = insert(PostProcessorResults).values(
                 camera_identifier=self._camera.identifier,
                 domain=domain,
                 snapshot_path=snapshot_path,
+                snapshot_file_id=snapshot_file_id,
                 data=data,
             )
             session.execute(stmt)

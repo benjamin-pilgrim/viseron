@@ -1,11 +1,10 @@
 import { Dayjs } from "dayjs";
 import Hls, { Events, HlsListeners } from "hls.js";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import {
   HlsErrorCodes,
-  LIVE_EDGE_DELAY,
   findClosestFragment,
   findFragmentByTimestamp,
   getSeekTarget,
@@ -13,12 +12,17 @@ import {
   useHlsStore,
   useReferencePlayerStore,
 } from "components/events/utils";
+import { seekMediaAndStartLoad } from "components/player/hlsplayer/utils";
 import useControlledInterval from "hooks/UseControlledInterval";
-import { sleep } from "lib/helpers";
 import { getDayjsFromDate } from "lib/helpers/dates";
 
-const SYNC_INTERVAL = 100; // Sync interval in milliseconds
-const MAX_DRIFT = 0.5; // Maximum allowed drift in seconds
+const SYNC_INTERVAL = 250;
+const IGNORE_DRIFT = 0.35;
+const RATE_NUDGE_DRIFT = 2;
+const HARD_SEEK_DRIFT = 4;
+const HARD_SEEK_COOLDOWN_MS = 3000;
+const MAX_RATE_NUDGE = 0.05;
+const LIVE_LATENCY_THRESHOLD_SECONDS = 15;
 
 interface SyncManagerProps {
   children: React.ReactNode;
@@ -35,22 +39,28 @@ function SyncManager({ children }: SyncManagerProps) {
   const {
     setReferencePlayer,
     isPlaying,
-    setIsPlaying,
     setIsLive,
+    isLive,
     isMuted,
+    playbackSpeed,
     requestedTimestamp,
     playingDateRef,
+    referencePlayer: currentReferencePlayer,
   } = useReferencePlayerStore(
     useShallow((state) => ({
       setReferencePlayer: state.setReferencePlayer,
       isPlaying: state.isPlaying,
-      setIsPlaying: state.setIsPlaying,
       setIsLive: state.setIsLive,
+      isLive: state.isLive,
       isMuted: state.isMuted,
+      playbackSpeed: state.playbackSpeed,
       requestedTimestamp: state.requestedTimestamp,
       playingDateRef: state.playingDateRef,
+      referencePlayer: state.referencePlayer,
     })),
   );
+  const lastHardSeekRef = useRef(new WeakMap<Hls, number>());
+
   const seekSafely = useCallback((player: Hls, referenceDate: Dayjs) => {
     if (!player.levels || player.levels.length === 0 || !player.media) {
       return false;
@@ -83,7 +93,7 @@ function SyncManager({ children }: SyncManagerProps) {
 
     for (let i = 0; i < seekable.length; i++) {
       if (seekTarget >= seekable.start(i) && seekTarget <= seekable.end(i)) {
-        player.media.currentTime = seekTarget;
+        seekMediaAndStartLoad(player, player.media, seekTarget);
         return true;
       }
     }
@@ -91,11 +101,70 @@ function SyncManager({ children }: SyncManagerProps) {
     return false;
   }, []);
 
-  const syncPlayers = useCallback(async () => {
-    if (requestedTimestamp === playingDateRef.current) {
-      await sleep(1000);
-    }
+  const setDriftCorrectionRate = useCallback(
+    (player: Hls, driftSeconds: number) => {
+      if (!player.media) {
+        return;
+      }
+      const nudge =
+        Math.min(Math.abs(driftSeconds) / RATE_NUDGE_DRIFT, 1) * MAX_RATE_NUDGE;
+      player.media.playbackRate =
+        driftSeconds > 0 ? playbackSpeed + nudge : playbackSpeed - nudge;
+    },
+    [playbackSpeed],
+  );
 
+  const correctDrift = useCallback(
+    (
+      player: React.MutableRefObject<Hls>,
+      referenceDate: Dayjs,
+      driftSeconds: number,
+    ) => {
+      if (!player.current.media) {
+        return;
+      }
+
+      const absDrift = Math.abs(driftSeconds);
+      if (absDrift <= IGNORE_DRIFT) {
+        player.current.media.playbackRate = playbackSpeed;
+        return;
+      }
+
+      if (absDrift < HARD_SEEK_DRIFT) {
+        setDriftCorrectionRate(player.current, driftSeconds);
+        return;
+      }
+
+      const now = performance.now();
+      const lastHardSeek = lastHardSeekRef.current.get(player.current) ?? 0;
+      if (now - lastHardSeek < HARD_SEEK_COOLDOWN_MS) {
+        setDriftCorrectionRate(player.current, driftSeconds);
+        return;
+      }
+
+      const seeked = seekSafely(player.current, referenceDate);
+      if (seeked) {
+        lastHardSeekRef.current.set(player.current, now);
+        player.current.media.playbackRate = playbackSpeed;
+        player.current.media
+          .play()
+          .then(() => {
+            setHlsRefsError(player, null);
+          })
+          .catch(() => {
+            // Ignore play errors
+          });
+      } else {
+        setHlsRefsError(
+          player,
+          translateErrorCode(HlsErrorCodes.TIMESPAN_MISSING),
+        );
+      }
+    },
+    [playbackSpeed, seekSafely, setDriftCorrectionRate, setHlsRefsError],
+  );
+
+  const syncPlayers = useCallback(async () => {
     const playersWithTime = hlsRefs.filter(
       (player): player is React.MutableRefObject<Hls> =>
         player.current !== null &&
@@ -111,6 +180,31 @@ function SyncManager({ children }: SyncManagerProps) {
     });
 
     if (!isPlaying) {
+      return;
+    }
+
+    if (playersWithTime.length === 1) {
+      const player = playersWithTime[0];
+      if (currentReferencePlayer !== player.current) {
+        setReferencePlayer(player.current);
+      }
+
+      const nextIsLive =
+        player.current.latency < LIVE_LATENCY_THRESHOLD_SECONDS;
+      if (isLive !== nextIsLive) {
+        setIsLive(nextIsLive);
+      }
+
+      playingDateRef.current = player.current.playingDate
+        ? getDayjsFromDate(player.current.playingDate).unix()
+        : requestedTimestamp;
+
+      if (
+        player.current.media &&
+        player.current.media.playbackRate !== playbackSpeed
+      ) {
+        player.current.media.playbackRate = playbackSpeed;
+      }
       return;
     }
 
@@ -131,40 +225,31 @@ function SyncManager({ children }: SyncManagerProps) {
 
     // Sync all players to the reference player
     if (referencePlayer) {
-      setReferencePlayer(referencePlayer.current);
-      setIsLive(referencePlayer.current.latency < LIVE_EDGE_DELAY * 1.5);
-      setIsPlaying(true);
+      if (currentReferencePlayer !== referencePlayer.current) {
+        setReferencePlayer(referencePlayer.current);
+      }
+      const nextIsLive =
+        referencePlayer.current.latency < LIVE_LATENCY_THRESHOLD_SECONDS;
+      if (isLive !== nextIsLive) {
+        setIsLive(nextIsLive);
+      }
       playingDateRef.current = referencePlayer.current.playingDate
         ? getDayjsFromDate(referencePlayer.current.playingDate).unix()
         : requestedTimestamp;
       playersWithTime.forEach((player) => {
+        if (player.current.media) {
+          player.current.media.playbackRate = playbackSpeed;
+        }
         if (player !== referencePlayer) {
+          const referenceDate = getDayjsFromDate(
+            referencePlayer.current.playingDate!,
+          );
           const timeDiff =
-            (getDayjsFromDate(referencePlayer.current.playingDate!).valueOf() -
+            (referenceDate.valueOf() -
               getDayjsFromDate(player.current.playingDate!).valueOf()) /
             1000;
 
-          if (Math.abs(timeDiff) > MAX_DRIFT) {
-            const seeked = seekSafely(
-              player.current,
-              getDayjsFromDate(referencePlayer.current.playingDate!),
-            );
-            if (seeked && player.current.media) {
-              player.current.media
-                .play()
-                .then(() => {
-                  setHlsRefsError(player, null);
-                })
-                .catch(() => {
-                  // Ignore play errors
-                });
-            } else {
-              setHlsRefsError(
-                player,
-                translateErrorCode(HlsErrorCodes.TIMESPAN_MISSING),
-              );
-            }
-          }
+          correctDrift(player, referenceDate, timeDiff);
         }
       });
     } else {
@@ -240,7 +325,11 @@ function SyncManager({ children }: SyncManagerProps) {
           closestFragment.programDateTime &&
           playerToPlay.current.media
         ) {
-          playerToPlay.current.media.currentTime = closestFragment.start;
+          seekMediaAndStartLoad(
+            playerToPlay.current,
+            playerToPlay.current.media,
+            closestFragment.start,
+          );
         }
         if (playerToPlay.current.media) {
           playerToPlay.current.media
@@ -256,14 +345,16 @@ function SyncManager({ children }: SyncManagerProps) {
     }
   }, [
     hlsRefs,
+    correctDrift,
+    currentReferencePlayer,
+    isLive,
     isMuted,
     isPlaying,
+    playbackSpeed,
     playingDateRef,
     requestedTimestamp,
-    seekSafely,
     setHlsRefsError,
     setIsLive,
-    setIsPlaying,
     setReferencePlayer,
   ]);
 
@@ -272,8 +363,10 @@ function SyncManager({ children }: SyncManagerProps) {
   useEffect(() => {
     const errorListeners: [Hls, HlsListeners[Events.ERROR]][] = [];
     hlsRefs.forEach((player) => {
-      if (player.current) {
+      const hls = player.current;
+      if (hls) {
         const onError: HlsListeners[Events.ERROR] = (_event, data) => {
+          if (player.current !== hls) return;
           // Dont pause if this is the only playing player
           // console.warn("SyncManager: Error event", data);
           if (
@@ -307,8 +400,8 @@ function SyncManager({ children }: SyncManagerProps) {
             player.current!.media.pause();
           }
         };
-        player.current.on(Hls.Events.ERROR, onError);
-        errorListeners.push([player.current, onError]);
+        hls.on(Hls.Events.ERROR, onError);
+        errorListeners.push([hls, onError]);
       }
     });
 

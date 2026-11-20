@@ -18,7 +18,7 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_TIMELAPSE,
     TIMELAPSE_SEGMENT_ENCODER,
 )
-from viseron.components.storage.models import Files
+from viseron.components.storage.models import FileLocations, Files
 from viseron.components.storage.timelapse_segments import (
     SegmentRequest,
     TimelapseSegmentBusyError,
@@ -60,8 +60,9 @@ class TestTimelapseApiHandler(TestAppBaseNoAuth):
                     EPOCH + offset, tz=datetime.timezone.utc
                 )
                 filename = f"{EPOCH + offset}.jpg"
-                session.execute(
-                    insert(Files).values(
+                file_id = session.execute(
+                    insert(Files)
+                    .values(
                         file_key=file_key,
                         tier_id=0,
                         tier_path="/segments/",
@@ -74,6 +75,19 @@ class TestTimelapseApiHandler(TestAppBaseNoAuth):
                         size=10,
                         orig_ctime=timestamp,
                         duration=None,
+                    )
+                    .returning(Files.id)
+                ).scalar_one()
+                session.execute(
+                    insert(FileLocations).values(
+                        file_id=file_id,
+                        tier_id=0,
+                        tier_path="/segments/",
+                        path=f"/segments/timelapse/test/{filename}",
+                        directory="/segments/timelapse/test",
+                        filename=filename,
+                        size=10,
+                        state="available",
                     )
                 )
             session.commit()

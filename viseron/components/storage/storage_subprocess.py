@@ -10,9 +10,10 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable
+from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Generic, Literal, TypeAlias, TypeVar
 
 import psutil
 import setproctitle
@@ -26,19 +27,19 @@ from viseron.watchdog.thread_watchdog import RestartableThread, ThreadWatchDog
 
 if TYPE_CHECKING:
     import datetime
-    from collections.abc import Callable
 
     import numpy as np
 
     from viseron import Viseron
 
 LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
+K = TypeVar("K", bound=Hashable)
 
-# Upper bound on the parent's pending-callback dict. check_tier jobs are sent
-# with a callback, but DedupCheckQueue drops superseded jobs in the subprocess
-# so those jobs never produce a reply and their callbacks would otherwise stay
-# in _callbacks forever. Evicting the oldest entries FIFO past this cap keeps
-# the dict bounded; a lost entry only means a future reply becomes a no-op pop.
+# Upper bound on the parent's pending-callback dict. check_tier callbacks are
+# deduped in the parent by throttle_key to mirror DedupCheckQueue, but keep a
+# hard cap as a final guard if the subprocess takes longer to reply than callers
+# can enqueue callback-backed file operations.
 MAX_PENDING_CALLBACKS = 10_000
 
 
@@ -69,6 +70,8 @@ class DataItem:
     callback_id: str | None = None
     data: np.ndarray | None = None
     error: str | None = None
+    deferred: bool = False
+    force: bool = False
 
     @property
     def throttle_key(self) -> str:
@@ -88,7 +91,32 @@ class DataItemMoveFile:
     src: str
     dst: str
     callback_id: str | None = None
+    coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
+    deferred: bool = False
+    moved: bool = False
+    published: bool = False
+    source_missing: bool = False
+    source_removed: bool = False
+    source_remove_error: str | None = None
+    size: int | None = None
+
+
+@dataclass
+class DataItemCopyFile:
+    """Data item to be processed by the worker for copying files."""
+
+    cmd: Literal["copy_file"]
+    src: str
+    dst: str
+    callback_id: str | None = None
+    coalesced_callback_ids: list[str] = field(default_factory=list)
+    error: str | None = None
+    deferred: bool = False
+    copied: bool = False
+    published: bool = False
+    source_missing: bool = False
+    size: int | None = None
 
 
 @dataclass
@@ -98,7 +126,23 @@ class DataItemDeleteFile:
     cmd: Literal["delete_file"]
     src: str
     callback_id: str | None = None
+    coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
+    deferred: bool = False
+
+
+FileOperation: TypeAlias = DataItemCopyFile | DataItemDeleteFile | DataItemMoveFile
+FileOperationKey: TypeAlias = tuple[str, str, str | None, str | None]
+
+
+def file_operation_key(item: FileOperation) -> FileOperationKey:
+    """Return queue dedupe key for a file operation."""
+    return (
+        item.cmd,
+        item.src,
+        item.dst if isinstance(item, (DataItemCopyFile, DataItemMoveFile)) else None,
+        item.callback_id if isinstance(item, DataItemCopyFile) else None,
+    )
 
 
 class DedupCheckQueue:
@@ -125,8 +169,7 @@ class DedupCheckQueue:
     hit MAX_PENDING_CALLBACKS. ``data=None`` makes the reply a no-op for
     ``on_check_tier_result``, which returns early on a ``None`` payload.
 
-    ``file_queue`` is intentionally left as a plain ``Queue``: move_file and
-    delete_file are per-file destructive operations and must not be dropped.
+    File operations use a separate queue and share results across pending duplicates.
     """
 
     def __init__(
@@ -177,20 +220,64 @@ class DedupCheckQueue:
             return len(self._items)
 
 
+class DedupFileQueue(Generic[T, K]):
+    """FIFO queue that dedupes queued items by caller-provided key."""
+
+    def __init__(self, key_func: Callable[[T], K]) -> None:
+        self._key_func = key_func
+        self._items: OrderedDict[K, T] = OrderedDict()
+        self._cond = threading.Condition()
+
+    def put(self, item: T) -> None:
+        """Coalesce identical pending work and retain each completion."""
+        with self._cond:
+            key = self._key_func(item)
+            existing = self._items.get(key)
+            if existing is not None:
+                if item.callback_id is not None:
+                    existing.coalesced_callback_ids.append(item.callback_id)
+                return
+            self._items[key] = item
+            self._cond.notify()
+
+    def get(self, timeout: float | None = None) -> T:
+        """Pop the oldest item, blocking up to timeout seconds."""
+        with self._cond:
+            end_time = None if timeout is None else time.monotonic() + timeout
+            while not self._items:
+                if end_time is None:
+                    self._cond.wait()
+                else:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        raise Empty
+                    self._cond.wait(remaining)
+            _, item = self._items.popitem(last=False)
+            return item
+
+    def get_nowait(self) -> T:
+        """Pop the oldest item without blocking."""
+        with self._cond:
+            if not self._items:
+                raise Empty
+            _, item = self._items.popitem(last=False)
+            return item
+
+    def qsize(self) -> int:
+        """Return the number of queued items."""
+        with self._cond:
+            return len(self._items)
+
+
 class TierCheckWorker(SubProcessWorker):
     """Check tiers in a separate subprocess."""
 
     def __init__(self, vis: Viseron, cpulimit: int | None, workers: int) -> None:
         self._cpulimit = cpulimit
         self._workers = workers
-        # OrderedDict so the oldest pending callback can be evicted FIFO once
-        # MAX_PENDING_CALLBACKS is reached. send_command (caller thread) and
-        # work_output (subprocess output thread) both mutate _callbacks, so all
-        # access is guarded by _callbacks_lock to keep the insert+len+popitem
-        # sequence atomic against concurrent pops.
-        self._callbacks: OrderedDict[
-            str, Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]
-        ] = OrderedDict()
+        self._callbacks: dict[
+            str, Callable[[DataItem | FileOperation], None] | None
+        ] = {}
         self._callbacks_lock = threading.Lock()
         # Monotonic callback ids. str(id(callback)) is unsafe here: bound
         # methods like self.on_check_tier_result are created lazily on each
@@ -218,50 +305,37 @@ class TierCheckWorker(SubProcessWorker):
 
     def send_command(
         self,
-        item: DataItem | DataItemMoveFile | DataItemDeleteFile,
-        callback: Callable[[DataItem | DataItemMoveFile | DataItemDeleteFile], None]
-        | None,
+        item: DataItem | FileOperation,
+        callback: Callable[[DataItem | FileOperation], None] | None,
     ) -> None:
         """Send command to the subprocess."""
-        evicted: str | None = None
-        if callback is not None:
-            item.callback_id = str(next(self._next_callback_id))
-            with self._callbacks_lock:
-                self._callbacks[item.callback_id] = callback
-                if len(self._callbacks) > MAX_PENDING_CALLBACKS:
-                    evicted, _ = self._callbacks.popitem(last=False)
-        if evicted is not None:
-            # Means the subprocess is taking longer to reply than we can
-            # generate new jobs. The evicted callback's reply will later
-            # surface as a benign "No callback found" miss in work_output.
-            LOGGER.warning(
-                "Pending callbacks exceeded %d, evicted oldest id=%s; "
-                "its reply will be dropped when it arrives",
-                MAX_PENDING_CALLBACKS,
-                evicted,
-            )
-        self.input_queue.put(item)
-
-    def work_output(
-        self, item: DataItem | DataItemMoveFile | DataItemDeleteFile
-    ) -> None:
-        """Perform work on output item from child process."""
-        if not item.callback_id:
-            return
-
         with self._callbacks_lock:
-            callback = self._callbacks.pop(item.callback_id, None)
-        if callback:
+            if len(self._callbacks) < MAX_PENDING_CALLBACKS:
+                item.callback_id = str(next(self._next_callback_id))
+                self._callbacks[item.callback_id] = callback
+                self.input_queue.put_nowait(item)
+                return
+        LOGGER.warning("Storage worker at capacity, deferring %s", item.cmd)
+        item.error = "Storage worker at capacity; retry on the next tier check"
+        item.deferred = True
+        if callback is not None:
             callback(item)
-        else:
-            # Expected when the callback was FIFO-evicted in send_command
-            # because MAX_PENDING_CALLBACKS was exceeded; logged at DEBUG so
-            # it doesn't spam under sustained load.
-            LOGGER.debug(
-                "No callback found for id=%s cmd=%s",
-                item.callback_id,
-                item.cmd,
-            )
+
+    def work_output(self, item: DataItem | FileOperation) -> None:
+        """Release admission and report a result to every requester."""
+        callback_ids = [item.callback_id]
+        if not isinstance(item, DataItem):
+            callback_ids.extend(item.coalesced_callback_ids)
+        for callback_id in callback_ids:
+            if callback_id is None:
+                continue
+            with self._callbacks_lock:
+                callback = self._callbacks.pop(callback_id, None)
+            if callback is not None:
+                try:
+                    callback(replace(item, callback_id=callback_id))
+                except Exception:
+                    LOGGER.exception("Storage callback failed for %s", item.cmd)
 
 
 def setup_logger(loglevel: str) -> None:
@@ -328,8 +402,8 @@ def initializer(cpulimit: int | None) -> None:
 
 def worker_task_files(
     worker: Worker,
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-    output_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
+    file_queue: DedupFileQueue[FileOperation, FileOperationKey],
+    output_queue: Queue[FileOperation],
 ) -> None:
     """Worker thread that only processes file operation commands."""
     while True:
@@ -346,15 +420,15 @@ def worker_task_files(
 def worker_task_mixed(
     worker: Worker,
     check_queue: DedupCheckQueue,
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
-    output_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile],
+    file_queue: DedupFileQueue[FileOperation, FileOperationKey],
+    output_queue: Queue[DataItem | FileOperation],
     name: str,
 ) -> None:
     """Worker thread that prioritizes file operations but also handles check_tier.
 
     This ensures that file operations are not blocked by slow check_tier jobs.
     """
-    job: DataItem | DataItemDeleteFile | DataItemMoveFile
+    job: DataItem | FileOperation
     while True:
         try:
             try:
@@ -370,9 +444,9 @@ def worker_task_mixed(
 
 
 def dispatcher_task(
-    process_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile],
+    process_queue: Queue[DataItem | FileOperation],
     check_queue: DedupCheckQueue,
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile],
+    file_queue: DedupFileQueue[FileOperation, FileOperationKey],
 ) -> None:
     """Dispatcher thread routing jobs to dedicated queues.
 
@@ -388,7 +462,7 @@ def dispatcher_task(
         try:
             if job.cmd == "check_tier":
                 check_queue.put(job)
-            elif job.cmd in ("move_file", "delete_file"):
+            elif job.cmd in ("copy_file", "move_file", "delete_file"):
                 file_queue.put(job)
             else:
                 LOGGER.debug("Unknown command %s", job.cmd)
@@ -401,8 +475,8 @@ def main() -> None:
     parser = get_parser()
     args = parser.parse_args()
     setup_logger(args.loglevel)
-    process_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
-    output_queue: Queue[DataItem | DataItemDeleteFile | DataItemMoveFile]
+    process_queue: Queue[DataItem | FileOperation]
+    output_queue: Queue[DataItem | FileOperation]
     process_queue, output_queue = connect(
         "127.0.0.1", int(args.manager_port), args.manager_authkey
     )
@@ -423,7 +497,7 @@ def main() -> None:
     LOGGER.debug(f"Starting {args.workers} worker threads")
 
     check_queue = DedupCheckQueue(output_queue)
-    file_queue: Queue[DataItemDeleteFile | DataItemMoveFile] = Queue()
+    file_queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
 
     dispatcher = RestartableThread(
         name="storage_subprocess.dispatcher",

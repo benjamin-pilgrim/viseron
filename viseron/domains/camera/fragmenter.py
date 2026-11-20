@@ -24,10 +24,12 @@ from viseron.components.storage.const import (
 )
 from viseron.components.storage.models import FilesMeta
 from viseron.components.storage.queries import get_time_period_fragments
+from viseron.components.storage.util import (
+    EventCheckTier,
+)
 from viseron.const import CAMERA_SEGMENT_DURATION, TEMP_DIR, VISERON_SIGNAL_SHUTDOWN
 from viseron.domains.camera.const import CONFIG_FFMPEG_LOGLEVEL, CONFIG_RECORDER
 from viseron.domains.camera.fragmenter_process import FragmenterWork
-from viseron.events import EventEmptyData
 from viseron.helpers.child_process_context import get_child_process_context
 from viseron.helpers.child_process_worker import ChildProcessWorker
 from viseron.helpers.logs import LogPipe
@@ -43,6 +45,38 @@ if TYPE_CHECKING:
     from viseron.domains.camera import AbstractCamera
 
 FRAGMENTER_DRAIN_TIMEOUT = CAMERA_SEGMENT_DURATION * 2
+
+# ENOSPC is storage-wide, not camera-local. Keep pressure recovery single-flight
+# so multiple cameras do not stampede cleanup/tier-check jobs while space is low.
+STORAGE_PRESSURE_RECOVERY_LOCK = threading.Lock()
+
+
+def recover_from_storage_pressure(
+    vis: Viseron,
+    storage: Storage,
+    camera_identifier: str,
+    logger: logging.Logger,
+) -> None:
+    """Run storage pressure recovery once across all cameras."""
+    if STORAGE_PRESSURE_RECOVERY_LOCK.acquire(blocking=False):
+        try:
+            vis.dispatch_event(
+                EVENT_CHECK_TIER.format(
+                    camera_identifier=camera_identifier,
+                    tier_id=0,
+                    category=TIER_CATEGORY_RECORDER,
+                    subcategory=TIER_SUBCATEGORY_SEGMENTS,
+                ),
+                EventCheckTier(force=True),
+                store=False,
+            )
+            storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_FILES)
+            storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_DB_FILES)
+            storage.cleanup_manager.run_job(CleanupJobNames.ZERO_SIZE_FILES)
+        finally:
+            STORAGE_PRESSURE_RECOVERY_LOCK.release()
+    else:
+        logger.debug("Storage pressure recovery already in progress")
 
 
 class FragmenterSubProcessWorker(ChildProcessWorker):
@@ -61,6 +95,7 @@ class FragmenterSubProcessWorker(ChildProcessWorker):
         self._storage = storage
         self._camera = camera
         self._worker_event = get_child_process_context().Event()
+        self._metadata_ack = get_child_process_context().Value("Q", 0)
         self._drained = threading.Event()
         self.on_metadata = metadata_callback
         # Fragmenter owns the stop so it can drain pending segments first
@@ -74,6 +109,7 @@ class FragmenterSubProcessWorker(ChildProcessWorker):
                 camera.timelapse_folder,
                 camera.temp_timelapse_folder,
                 self._worker_event,
+                self._metadata_ack,
             ),
             stop_on_shutdown=False,
         )
@@ -97,22 +133,16 @@ class FragmenterSubProcessWorker(ChildProcessWorker):
             return
 
         if item.get("error") == "no_space_left":
-            self._vis.dispatch_event(
-                EVENT_CHECK_TIER.format(
-                    camera_identifier=self._camera.identifier,
-                    tier_id=0,
-                    category=TIER_CATEGORY_RECORDER,
-                    subcategory=TIER_SUBCATEGORY_SEGMENTS,
-                ),
-                EventEmptyData(),
-                store=False,
+            recover_from_storage_pressure(
+                self._vis, self._storage, self._camera.identifier, self._logger
             )
-            self._storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_FILES)
 
+        if "discard_metadata" in item:
+            self._storage.temporary_files_meta.pop(item["discard_metadata"], None)
         if "path" in item:
             self.on_metadata(item)
-
-        self._worker_event.set()
+            self._metadata_ack.value = item["metadata_request"]
+            self._worker_event.set()
 
 
 class Fragmenter:
@@ -131,6 +161,7 @@ class Fragmenter:
         if camera.temp_timelapse_folder is not None:
             os.makedirs(camera.temp_timelapse_folder, exist_ok=True)
         self._storage.ignore_file("init.mp4")
+        self._storage.ignore_file("init-*.mp4")
 
         self._log_pipe_ffmpeg = LogPipe(
             logging.getLogger(f"{self.__module__}.{camera.identifier}.ffmpeg"),
@@ -197,7 +228,9 @@ class Fragmenter:
     def _on_metadata_from_worker(self, item) -> None:
         """Update temporary_files_meta with metadata from subprocess."""
         self._storage.temporary_files_meta[item["path"]] = FilesMeta(
-            orig_ctime=item["orig_ctime"], duration=item["duration"]
+            orig_ctime=item["orig_ctime"],
+            duration=item["duration"],
+            hls_init_hash=item.get("hls_init_hash"),
         )
 
     def _fragment_command(self) -> None:
@@ -314,13 +347,20 @@ def get_skipped_segment_count(fragments: list[Fragment], skip_boundary: float) -
     return 0
 
 
+def discontinuity_in_fragments(prev_fragment: Fragment, fragment: Fragment) -> bool:
+    """Check if there is an HLS discontinuity between two fragments."""
+    return gap_in_fragments(prev_fragment, fragment) or (
+        prev_fragment.init_file != fragment.init_file
+    )
+
+
 def generate_playlist(
     fragments: list[Fragment],
     init_file: str,
     media_sequence: int = 0,
+    discontinuity_sequence: int = 0,
     target_duration: int | None = None,
     *,
-    discontinuity_sequence: int = 0,
     end: bool = False,
     file_directive: bool = False,
     can_skip_until: float | None = None,
@@ -361,13 +401,27 @@ def generate_playlist(
     playlist.append("#EXT-X-INDEPENDENT-SEGMENTS")
     if skipped:
         playlist.append(f"#EXT-X-SKIP:SKIPPED-SEGMENTS={skipped}")
-    playlist.append(f'#EXT-X-MAP:URI="{_get_file_path(init_file, file_directive)}"')
 
-    # Compare against the last skipped fragment so a gap right after it is kept
-    prev_fragment: Fragment | None = fragments[skipped - 1] if skipped else None
+    prev_fragment = fragments[skipped - 1] if skipped else None
+    prev_init_file = None
+    if skipped and (fragments[skipped].init_file or init_file) == (
+        prev_fragment.init_file or init_file
+    ):
+        prev_init_file = prev_fragment.init_file or init_file
+        playlist.append(
+            f'#EXT-X-MAP:URI="{_get_file_path(prev_init_file, file_directive)}"'
+        )
     for fragment in fragments[skipped:]:
-        if prev_fragment and gap_in_fragments(prev_fragment, fragment):
+        fragment_init_file = fragment.init_file or init_file
+        if prev_fragment and (
+            gap_in_fragments(prev_fragment, fragment)
+            or (prev_fragment.init_file or init_file) != fragment_init_file
+        ):
             playlist.append("#EXT-X-DISCONTINUITY")
+        if prev_init_file != fragment_init_file:
+            playlist.append(
+                f'#EXT-X-MAP:URI="{_get_file_path(fragment_init_file, file_directive)}"'
+            )
         program_date_time = fragment.creation_time.replace(
             tzinfo=datetime.timezone.utc
         ).isoformat(timespec="milliseconds")
@@ -375,6 +429,7 @@ def generate_playlist(
         playlist.append(f"#EXTINF:{fragment.duration},")
         playlist.append(_get_file_path(fragment.path, file_directive))
         prev_fragment = fragment
+        prev_init_file = fragment_init_file
     if end:
         playlist.append("#EXT-X-ENDLIST")
     return "\n".join(playlist)
@@ -388,6 +443,7 @@ class Fragment:
     path: str
     duration: float
     creation_time: datetime.datetime
+    init_file: str | None = None
 
 
 class Timespan(TypedDict):

@@ -86,7 +86,7 @@ describe("PlayerCard", () => {
           // Refs are registered before and after their Hls instance is alive
           { current: null },
           { current: { media: null } },
-          { current: { media } },
+          { current: { media, startLoad: vi.fn() } },
         ] as never,
       });
       renderWithContext(<PlayerCard />);
