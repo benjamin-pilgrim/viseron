@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import errno
 import hashlib
+import json
 import logging
 import os
 import re
@@ -17,10 +18,11 @@ import shutil
 import subprocess as sp
 import tempfile
 import time
+from bisect import bisect_right
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import psutil
-from path import Path
 
 from viseron.components.storage.util import copy_file_atomic, move_file_atomic
 from viseron.domains.camera.const import MP4BOX_PATH
@@ -50,7 +52,9 @@ def _get_open_files(path: str, process: psutil.Process) -> list[str]:
 def _get_mp4_files_to_fragment(path: str) -> list[str]:
     """Get mp4 files that are not in use by ffmpeg/gstreamer."""
     mp4_files = [
-        file for file in Path(path).walkfiles() if file.endswith((".mp4", ".m4s"))
+        file
+        for file in Path(path).iterdir()
+        if file.suffix in (".mp4", ".m4s") and file.is_file()
     ]
     files_in_use = ["init.mp4"]
     for process in psutil.process_iter():
@@ -148,6 +152,7 @@ class FragmenterWork(ChildProcessWork):
         self._temp_timelapse_folder = temp_timelapse_folder
         self._worker_event = worker_event
         self._metadata_ack = metadata_ack
+        self._last_attempted_fragment = ""
         self._logger = logging.getLogger(fragmenter_logger_names(camera_identifier)[0])
         self._log_pipe: LogPipe
 
@@ -172,12 +177,28 @@ class FragmenterWork(ChildProcessWork):
         self._logger.debug(
             f"Checking for new segments to fragment in {self.temp_segments_folder}"
         )
-        mp4s = sorted(_get_mp4_files_to_fragment(self.temp_segments_folder))
-        if cmd == "fragment":
-            mp4s = mp4s[:5]
+        pending_dir = Path(self.temp_segments_folder) / ".pending_fragments"
+        pending = set()
+        if pending_dir.is_dir():
+            for directory in pending_dir.iterdir():
+                if (directory / "segment").is_file():
+                    pending.add(directory.name)
+                elif directory.is_dir():
+                    shutil.rmtree(directory, ignore_errors=True)
+        mp4s = sorted(
+            pending.union(_get_mp4_files_to_fragment(self.temp_segments_folder))
+        )
+        if cmd == "fragment" and mp4s:
+            # Resume after the last attempted file even when a failed input
+            # remains on disk. Wrap around so retained files are retried.
+            start = bisect_right(mp4s, self._last_attempted_fragment)
+            mp4s = (mp4s[start:] + mp4s[:start])[:5]
+            self._last_attempted_fragment = mp4s[-1]
         for mp4 in mp4s:
             self._logger.debug(f"Processing {mp4}")
-            if mp4.split(".")[1] == "m4s":
+            if mp4 in pending:
+                self._publish_pending_fragment(mp4)
+            elif mp4.endswith(".m4s"):
                 self._handle_m4s(mp4)
             else:
                 self._handle_mp4(mp4)
@@ -238,20 +259,20 @@ class FragmenterWork(ChildProcessWork):
             init_path, segment_path, tmp_frame_path, frame_path, orig_ctime
         )
 
-    def _segment_hook(self, file: str, orig_ctime: datetime.datetime) -> None:
-        """Perform per fragment tasks before moving fragment to storage.
-
-        Currently only used for extracting timelapse frames from fragments.
-        """
+    def _segment_hook(
+        self,
+        file: str,
+        init_path: str,
+        segment_path: str,
+        orig_ctime: datetime.datetime,
+    ) -> None:
+        """Extract a timelapse frame from a staged encoder fragment."""
         if self._timelapse_folder is None or self._temp_timelapse_folder is None:
             return
 
         frame_filename = os.path.splitext(os.path.basename(file))[0] + ".jpg"
         tmp_frame_path = os.path.join(self._temp_timelapse_folder, frame_filename)
         frame_path = os.path.join(self._timelapse_folder, frame_filename)
-        init_path = os.path.join(self.temp_segments_folder, "init.mp4")
-        segment_path = os.path.join(self.temp_segments_folder, file)
-
         self._extract_timelapse_frame(
             init_path, segment_path, tmp_frame_path, frame_path, orig_ctime
         )
@@ -327,11 +348,14 @@ class FragmenterWork(ChildProcessWork):
                 "metadata_request": request_id,
             }
         )
-        if (
-            self._worker_event.wait(timeout=1)
-            and self._metadata_ack.value == request_id
-        ):
-            return True
+        deadline = time.monotonic() + 1
+        while True:
+            self._worker_event.clear()
+            if self._metadata_ack.value == request_id:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._worker_event.wait(timeout=remaining):
+                break
         self.output_queue.put({"discard_metadata": path})
         self._logger.warning("Metadata acknowledgement timed out for %s", path)
         return False
@@ -400,18 +424,35 @@ class FragmenterWork(ChildProcessWork):
             encoding="utf-8",
         ).read()
 
+    def _discard_fragment(self, path: Path) -> None:
+        """Remove an input that cannot be parsed."""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            self._logger.exception("Could not discard unparseable fragment %s", path)
+
     def _handle_mp4(self, file: str) -> None:
         """Fragment and publish an MP4, retaining the input on publish failure."""
+        source = Path(self.temp_segments_folder) / file
         stem = file.split(".", maxsplit=1)[0]
         outdir = os.path.join(self.temp_segments_folder, stem)
         try:
-            if not self._mp4box_command(file):
+            try:
+                if not self._mp4box_command(file):
+                    self._discard_fragment(source)
+                    return
+                extinf = _extract_extinf_number(
+                    self._read_m3u8_mp4box(file), "clip_1.m4s"
+                )
+                orig_ctime = _get_orig_ctime(file, None)
+            except (FileNotFoundError, ValueError):
+                self._logger.exception("Failed to parse %s", file)
+                self._discard_fragment(source)
                 return
-            extinf = _extract_extinf_number(self._read_m3u8_mp4box(file), "clip_1.m4s")
             if not extinf:
                 self._logger.error("Failed to get extinf for %s", file)
+                self._discard_fragment(source)
                 return
-            orig_ctime = _get_orig_ctime(file, None)
             self._segment_hook_mp4box(file, orig_ctime)
             if self._publish_segment(
                 os.path.join(outdir, "clip_init.mp4"),
@@ -420,28 +461,69 @@ class FragmenterWork(ChildProcessWork):
                 orig_ctime,
                 extinf,
             ):
-                os.remove(os.path.join(self.temp_segments_folder, file))
-        except (OSError, ValueError):
+                source.unlink(missing_ok=True)
+        except OSError:
             self._logger.exception("Failed to fragment %s", file)
         finally:
             shutil.rmtree(outdir, ignore_errors=True)
 
     def _handle_m4s(self, file: str) -> None:
-        """Publish an encoder fragment with its matching init file."""
+        """Take ownership before FFmpeg can expire the fragment or its metadata."""
+        source = Path(self.temp_segments_folder) / file
         try:
-            m3u8 = self._read_m3u8()
-            extinf = _extract_extinf_number(m3u8, file)
+            try:
+                m3u8 = self._read_m3u8()
+                extinf = _extract_extinf_number(m3u8, file)
+                orig_ctime = _get_orig_ctime(
+                    file, _extract_program_date_time(m3u8, file)
+                )
+            except (FileNotFoundError, ValueError):
+                self._logger.exception("Failed to parse %s", file)
+                self._discard_fragment(source)
+                return
             if not extinf:
                 self._logger.error("Failed to get extinf for %s", file)
+                self._discard_fragment(source)
                 return
-            orig_ctime = _get_orig_ctime(file, _extract_program_date_time(m3u8, file))
-            self._segment_hook(file, orig_ctime)
-            self._publish_segment(
-                os.path.join(self.temp_segments_folder, "init.mp4"),
-                os.path.join(self.temp_segments_folder, file),
-                os.path.join(self.segments_folder, file),
-                orig_ctime,
-                extinf,
+
+            pending = self._pending_fragment(file)
+            pending.mkdir(parents=True, exist_ok=True)
+            init_src = Path(self.temp_segments_folder) / "init.mp4"
+            try:
+                shutil.copyfile(init_src, pending / "init")
+                with open(pending / "metadata", "w", encoding="utf-8") as metadata:
+                    json.dump((orig_ctime.isoformat(), extinf), metadata)
+                # The segment's presence marks a complete package. If staging is
+                # interrupted before this rename, the encoder's file is unchanged.
+                os.replace(source, pending / "segment")
+            except OSError:
+                shutil.rmtree(pending, ignore_errors=True)
+                raise
+            self._segment_hook(
+                file, str(pending / "init"), str(pending / "segment"), orig_ctime
             )
+            self._publish_pending_fragment(file)
+        except OSError as error:
+            self._logger.warning("Failed to stage segment %s: %s", file, error)
+            if error.errno == errno.ENOSPC:
+                self.output_queue.put({"error": "no_space_left"})
+
+    def _pending_fragment(self, file: str) -> Path:
+        return Path(self.temp_segments_folder) / ".pending_fragments" / file
+
+    def _publish_pending_fragment(self, file: str) -> None:
+        """Retry with the immutable init and timing from the original playlist."""
+        pending = self._pending_fragment(file)
+        try:
+            with open(pending / "metadata", encoding="utf-8") as metadata:
+                orig_ctime, duration = json.load(metadata)
+            if self._publish_segment(
+                str(pending / "init"),
+                str(pending / "segment"),
+                os.path.join(self.segments_folder, file),
+                datetime.datetime.fromisoformat(orig_ctime),
+                duration,
+            ):
+                shutil.rmtree(pending)
         except (OSError, ValueError):
-            self._logger.exception("Failed to process segment %s", file)
+            self._logger.exception("Failed to process staged segment %s", file)

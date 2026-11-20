@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import errno
-import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import tornado.web
 from sqlalchemy import or_, select
 
-from viseron.components.storage.files import resolve_file_id
+from viseron.components.storage.files import ResolvedFile, resolve_file_id
 from viseron.components.storage.models import FileKeyAliases, Files
 from viseron.components.storage.util import is_transient_filesystem_error
+from viseron.components.webserver.api.v1.files import serve_resolved_file
 from viseron.components.webserver.static_file_handler import (
     AccessTokenStaticFileHandler,
 )
@@ -43,7 +43,7 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
         self._camera_identifier, self._encoded_file_key = self.path_args[0].split("/")
         await super().prepare()
 
-    def _resolve(self) -> str | None:
+    def _resolve(self) -> ResolvedFile | None:
         """Resolve an authorized canonical or migrated key to a configured location."""
         # Convert the hexadecimal file key from the URL to an integer.
         file_key = int(self._encoded_file_key, 16)
@@ -65,8 +65,11 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
             file_id = session.execute(stmt).scalars().first()
         if file_id is None:
             return None
-        resolved = resolve_file_id(self._get_session, self._storage, file_id)
-        return resolved.path if resolved else None
+        return resolve_file_id(self._get_session, self._storage, file_id)
+
+    def response_error(self, status_code: HTTPStatus, reason: str) -> None:
+        """Return a static media error with the requested status."""
+        raise tornado.web.HTTPError(status_code, reason=reason)
 
     async def get(
         self,
@@ -75,11 +78,12 @@ class FileKeyHandler(AccessTokenStaticFileHandler):
     ) -> None:
         """Serve the file the key resolves to."""
         try:
-            resolved_path = await self.run_in_executor(self._resolve)
-            if resolved_path is None:
+            resolved = await self.run_in_executor(self._resolve)
+            if resolved is None:
                 raise tornado.web.HTTPError(HTTPStatus.NOT_FOUND)
-            self.root = os.path.dirname(resolved_path)
-            await super().get(os.path.basename(resolved_path), include_body)
+            await serve_resolved_file(
+                self, resolved, include_body=include_body, cache_control="no-cache"
+            )
         except OSError as error:
             unavailable = (
                 isinstance(error, FileNotFoundError)

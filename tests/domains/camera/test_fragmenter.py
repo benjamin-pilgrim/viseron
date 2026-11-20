@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
@@ -504,6 +505,74 @@ class TestFragmenterWork:
                 assert file.read() == b"init"
 
 
+def test_delayed_ack_does_not_abort_the_next_fragment(tmp_path) -> None:
+    """An acknowledgement from an older request cannot reject the current one."""
+    init, src, dst = (tmp_path / name for name in ("init.mp4", "old.m4s", "new.m4s"))
+    init.write_bytes(b"init")
+    src.write_bytes(b"segment")
+    event = threading.Event()
+    ack = SimpleNamespace(value=0)
+    worker = FragmenterWork(
+        "test", str(tmp_path), str(tmp_path), None, None, event, ack
+    )
+    worker.output_queue = MagicMock()
+    request = []
+
+    def receive(item) -> None:
+        if "metadata_request" in item:
+            request.append(item["metadata_request"])
+
+    worker.output_queue.put.side_effect = receive
+
+    def signal(timeout: float) -> bool:
+        assert timeout > 0
+        ack.value = next(replies)(request[0])
+        return True
+
+    replies = iter((lambda value: value - 1, lambda value: value))
+    with patch.object(event, "wait", side_effect=signal):
+        assert worker._publish_segment(str(init), str(src), str(dst), utcnow(), 5.0)
+
+    assert dst.read_bytes() == b"segment"
+    assert not src.exists()
+    assert worker.output_queue.put.call_count == 1
+
+
+def test_encoder_fragment_retry_survives_playlist_rollover(tmp_path) -> None:
+    """A new child can publish the original segment and init after a lost ACK."""
+    staging, segments = tmp_path / "staging", tmp_path / "segments"
+    staging.mkdir()
+    segments.mkdir()
+    (staging / "42.m4s").write_bytes(b"segment")
+    (staging / "init.mp4").write_bytes(b"original init")
+    (staging / "index.m3u8").write_text("#EXTM3U\n#EXTINF:5,\n42.m4s\n")
+    worker = _fragmenter_work(str(staging), str(segments))
+    worker.output_queue = MagicMock()
+    with patch.object(worker._worker_event, "wait", return_value=False):
+        worker.work_input({"cmd": "fragment"})
+    assert not (segments / "42.m4s").exists()
+
+    (staging / "index.m3u8").unlink()
+    (staging / "init.mp4").write_bytes(b"replacement init")
+    worker = _fragmenter_work(str(staging), str(segments))
+    worker.output_queue = MagicMock()
+
+    def acknowledge(item) -> None:
+        worker._metadata_ack.value = item["metadata_request"]
+        worker._worker_event.set()
+
+    worker.output_queue.put.side_effect = acknowledge
+    worker.work_input({"cmd": "fragment"})
+
+    assert (segments / "42.m4s").read_bytes() == b"segment"
+    assert (segments / "init.mp4").read_bytes() == b"original init"
+    metadata = worker.output_queue.put.call_args.args[0]
+    assert metadata["duration"] == 5.0
+    assert metadata["orig_ctime"] == datetime.datetime.fromtimestamp(
+        42, tz=datetime.timezone.utc
+    )
+
+
 class TestFragmenter:
     """Tests for Fragmenter."""
 
@@ -542,7 +611,7 @@ def test_work_input(
     cmd: str, expected_handled: int, expected_result: dict | None
 ) -> None:
     """Drain fragments every pending segment and replies when done."""
-    work = MagicMock()
+    work = MagicMock(_last_attempted_fragment="", temp_segments_folder="/nonexistent")
     files = [f"{i}.m4s" for i in range(7)]
 
     with patch(
@@ -553,6 +622,45 @@ def test_work_input(
 
     assert result == expected_result
     assert work._handle_m4s.call_count == expected_handled
+
+
+def test_fragments_missing_from_playlist_are_discarded(tmp_path) -> None:
+    """Unparseable files leave staging and newer footage is published."""
+    staging = tmp_path / "staging"
+    segments = tmp_path / "segments"
+    staging.mkdir()
+    segments.mkdir()
+    for number in range(1, 7):
+        (staging / f"{number:02}.m4s").write_bytes(b"segment")
+    (staging / "init.mp4").write_bytes(b"init")
+    (staging / "index.m3u8").write_text("#EXTM3U\n#EXTINF:5,\n06.m4s\n")
+    work = _fragmenter_work(str(staging), str(segments))
+
+    def acknowledge(item) -> None:
+        work._metadata_ack.value = item["metadata_request"]
+        work._worker_event.set()
+
+    work.output_queue = MagicMock()
+    work.output_queue.put.side_effect = acknowledge
+    work.work_input({"cmd": "fragment"})
+    work.work_input({"cmd": "fragment"})
+
+    assert (segments / "06.m4s").read_bytes() == b"segment"
+    assert not list(staging.glob("*.m4s"))
+
+
+def test_unparseable_mp4_is_discarded(tmp_path) -> None:
+    """A failed MP4Box conversion cannot leave a broken input in staging."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    source = staging / "42.mp4"
+    source.write_bytes(b"invalid mp4")
+    worker = _fragmenter_work(str(staging), str(tmp_path / "segments"))
+    with patch.object(worker, "_mp4box_command", return_value=False):
+        worker.work_input({"cmd": "fragment"})
+
+    assert not source.exists()
+    assert not (tmp_path / "segments" / "42.m4s").exists()
 
 
 def test_worker_does_not_stop_on_shutdown_signal() -> None:
@@ -786,12 +894,14 @@ def test_extract_program_date_time() -> None:
     ],
 )
 def test_timelapse_frame_metadata_uses_segment_orig_ctime(
-    handler: str, file: str, m3u8: str, expected_orig_ctime: datetime.datetime
+    handler: str, file: str, m3u8: str, expected_orig_ctime: datetime.datetime, tmp_path
 ) -> None:
     """The frame is inserted with its segment's timestamp, not the DB insert time."""
+    (tmp_path / file).write_bytes(b"segment")
+    (tmp_path / "init.mp4").write_bytes(b"init")
     work = FragmenterWork(
         "test_camera",
-        "/tmp/temp",
+        str(tmp_path),
         "/segments",
         "/timelapse/test_camera",
         "/tmp/timelapse/test_camera",
@@ -812,7 +922,9 @@ def test_timelapse_frame_metadata_uses_segment_orig_ctime(
         patch.object(work, "_mp4box_command", return_value=True),
         patch.object(work, "_publish_segment") as publish,
         patch("viseron.domains.camera.fragmenter_process.sp.run") as mock_run,
-        patch("viseron.domains.camera.fragmenter_process.shutil", order.shutil),
+        patch(
+            "viseron.domains.camera.fragmenter_process.shutil.move", order.shutil.move
+        ),
         patch("viseron.domains.camera.fragmenter_process.os.remove"),
     ):
         mock_run.return_value.returncode = 0

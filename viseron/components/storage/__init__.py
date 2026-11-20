@@ -67,6 +67,7 @@ from viseron.components.storage.models import (
 )
 from viseron.components.storage.storage_subprocess import TierCheckWorker
 from viseron.components.storage.tier_handler import (
+    ArtifactRetryQueue,
     EventClipTierHandler,
     SegmentsTierHandler,
     SnapshotTierHandler,
@@ -335,6 +336,16 @@ class Storage:
         """Initialize storage component."""
         self._alembic_cfg = self._get_alembic_config()
         self.create_database()
+        self._vis.background_scheduler.add_job(
+            ArtifactRetryQueue(self._vis, self).drain,
+            "interval",
+            seconds=5,
+            id="storage-artifact-retries",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=None,
+            replace_existing=True,
+        )
         self.cleanup_manager.run_job(CleanupJobNames.FILE_REFERENCES)
 
         self._vis.listen_event(

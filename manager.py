@@ -17,7 +17,11 @@ class QueueManager(BaseManager):
 
 
 def start(
-    address: str, port: int, authkey: str, process_queue: Queue, output_queue: Queue
+    address: str,
+    port: int,
+    authkey: str,
+    get_process_queue: Callable[[], Queue],
+    output_queue: Queue,
 ) -> QueueManager:
     """Serve manager."""
 
@@ -29,7 +33,7 @@ def start(
         """
 
     # Set up queues
-    _QueueManager.register("get_process_queue", callable=lambda: process_queue)
+    _QueueManager.register("get_process_queue", callable=get_process_queue)
     _QueueManager.register("get_output_queue", callable=lambda: output_queue)
 
     # Start server

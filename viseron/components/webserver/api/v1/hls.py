@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import stat
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -376,7 +377,7 @@ class HlsAPIHandler(BaseAPIHandler):
         await serve_resolved_file(
             self,
             init_file,
-            cache_control="public, max-age=31536000, immutable",
+            cache_control="no-cache",
         )
 
 
@@ -431,26 +432,46 @@ def _get_init_file(
     camera: AbstractCamera | FailedCamera,
     tier_id: int,
 ) -> ResolvedFile | None:
-    """Get the init file for a camera tier."""
+    """Get the tier's init or the first available configured legacy init."""
     try:
-        tier_path = camera.tier_base_path(
-            tier_id,
-            TIER_CATEGORY_RECORDER,
-            TIER_SUBCATEGORY_SEGMENTS,
+        requested_path = camera.tier_base_path(
+            tier_id, TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_SEGMENTS
         )
     except ValueError:
         return None
 
+    if init := _read_tier_init_file(camera, requested_path):
+        return init
+
+    # Older upstream tiers moved segments without copying init.mp4. Preserve
+    # their playback fallback, while preferring a tier's own init when present.
+    candidate = 0
+    while True:
+        try:
+            tier_path = camera.tier_base_path(
+                candidate, TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_SEGMENTS
+            )
+        except ValueError:
+            return None
+        if candidate != tier_id and (init := _read_tier_init_file(camera, tier_path)):
+            return init
+        candidate += 1
+
+
+def _read_tier_init_file(
+    camera: AbstractCamera | FailedCamera, tier_path: str
+) -> ResolvedFile | None:
     init_path = os.path.normpath(
         os.path.join(
             os.path.join(tier_path, TIER_SUBCATEGORY_SEGMENTS, camera.identifier),
             "init.mp4",
         )
     )
-    if not os.path.isfile(init_path) or os.path.realpath(init_path) != os.path.join(
-        os.path.realpath(os.path.dirname(init_path)), "init.mp4"
-    ):
-        LOGGER.error("Could not find init.mp4 file for camera %s", camera.identifier)
+    try:
+        stat_result = os.stat(init_path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(stat_result.st_mode):
         return None
 
     return ResolvedFile(
@@ -459,7 +480,7 @@ def _get_init_file(
         category=TIER_CATEGORY_RECORDER,
         subcategory=TIER_SUBCATEGORY_SEGMENTS,
         path=init_path,
-        size=os.path.getsize(init_path),
+        size=stat_result.st_size,
     )
 
 

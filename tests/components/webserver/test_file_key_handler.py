@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import threading
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -143,6 +144,33 @@ class TestFileKeyHandler(FileKeyTestMixin, TestAppBaseNoAuth):
         response = self.fetch(url, headers={"Range": "bytes=1-3"})
         assert response.code == HTTPStatus.PARTIAL_CONTENT
         assert response.body == b"egm"
+
+    def test_media_io_runs_off_the_http_thread(self) -> None:
+        """A CIFS read must not consume the HTTP event loop."""
+        url = _url("test", self._store_file(0, b"segment"))
+        media_path = str(self._tmp_path / "tier0/segments/test/1.m4s")
+        http_thread = threading.get_ident()
+        read_threads = []
+        real_open = open
+
+        def tracked_open(path, *args, **kwargs):
+            file = real_open(path, *args, **kwargs)
+            if path == media_path:
+                read = file.read
+
+                def tracked_read(*read_args):
+                    read_threads.append(threading.get_ident())
+                    return read(*read_args)
+
+                file.read = tracked_read
+            return file
+
+        with patch("builtins.open", side_effect=tracked_open):
+            response = self.fetch(url)
+
+        assert response.body == b"segment"
+        assert read_threads
+        assert http_thread not in read_threads
 
     def test_prefers_source_while_both_copies_exist(self) -> None:
         """Test that the source is served while the destination may be mid-copy."""

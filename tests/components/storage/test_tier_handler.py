@@ -33,7 +33,10 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_OBJECT_DETECTOR,
     TIER_SUBCATEGORY_SEGMENTS,
 )
+from viseron.components.storage.files import upsert_file_at_location
 from viseron.components.storage.models import (
+    FileLocations,
+    FileLocationState,
     Files,
     FilesMeta,
     Motion,
@@ -47,6 +50,7 @@ from viseron.components.storage.storage_subprocess import (
     DataItemMoveFile,
 )
 from viseron.components.storage.tier_handler import (
+    ArtifactRetryQueue,
     SNAPSHOT_REFERENCE_MODELS,
     EventClipTierHandler,
     RetentionTierHandler,
@@ -243,7 +247,7 @@ def test_check_tier_force_bypasses_throttle() -> None:
 
 
 def test_move_file_callback_commits_published_move() -> None:
-    """A published destination should commit even when source cleanup failed."""
+    """Commit the published location before submitting removal of the source."""
     src = "/tier1/segments/camera/1.m4s"
     dst = "/tier2/segments/camera/1.m4s"
     session = MoveCallbackSession()
@@ -290,16 +294,16 @@ def test_move_file_callback_commits_published_move() -> None:
             cmd="move_file",
             src=src,
             dst=dst,
-            moved=True,
             published=True,
-            source_removed=False,
-            source_remove_error="unlink failed",
             size=7,
         )
     )
 
     assert session.committed is True
     assert session.rolled_back is False
+    cleanup = storage.tier_check_worker_send_command.call_args.args[0]
+    assert isinstance(cleanup, DataItemDeleteFile)
+    assert cleanup.src == src
     assert dst not in storage.temporary_files_meta
     assert vis.dispatch_event.called
 
@@ -486,6 +490,36 @@ def _get_tier_config(events: bool, continuous: bool) -> RecorderTier:
 
 class TestSegmentsTierHandler(BaseTestWithRecordings):
     """Test the SegmentsTierHandler class."""
+
+    def test_event_only_retention_submits_segment_deletion(
+        self, vis: MockViseron
+    ) -> None:
+        """An eligible event-only segment reaches the storage worker."""
+        camera = Mock(
+            identifier="test",
+            config={
+                CONFIG_RECORDER: {
+                    CONFIG_CONTINUOUS_RECORDING: False,
+                    CONFIG_SCHEDULE: None,
+                }
+            },
+        )
+        tier = _get_tier_config(events=True, continuous=False)
+        handler = SegmentsTierHandler(
+            vis, camera, 0, "recorder", "segments", tier, None
+        )
+        storage = handler._storage
+        storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+        data = np.array(
+            [(-1, "/segments/test/old.m4s", "/")],
+            dtype=[("recording_id", "i8"), ("path", "U128"), ("tier_path", "U128")],
+        )
+
+        handler._check_tier(self._get_db_session, data)
+
+        command = storage.tier_check_worker_send_command.call_args.args[0]
+        assert isinstance(command, DataItemDeleteFile)
+        assert command.src == "/segments/test/old.m4s"
 
     @pytest.mark.parametrize(
         ("tier", "data", "recordings_amount", "first_recording_id"),
@@ -776,6 +810,129 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 )
 
 
+def test_deferred_artifact_operations_survive_retry_queue_restart(
+    vis: MockViseron, db_storage: Mock, tmp_path: Path
+) -> None:
+    """The durable queue retains different operations for the same source."""
+    db_storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+    worker = db_storage.tier_check_worker_send_command
+    src = _create_file(str(tmp_path / "event_clips" / "test" / "clip.mp4"))
+    archive = str(tmp_path / "archive")
+    dst = f"{archive}/event_clips/test/clip.mp4"
+    tier_path = str(tmp_path)
+    upsert_file_at_location(
+        db_storage.get_session, "test", "recorder", "event_clips", 0, tier_path, src
+    )
+
+    def defer(item, callback) -> None:
+        item.deferred = True
+        callback(item)
+
+    worker.side_effect = defer
+    for next_tier in (Tier(path=archive), None, None):
+        handle_file(
+            vis,
+            db_storage.get_session,
+            db_storage,
+            "test",
+            0,
+            "recorder",
+            "event_clips",
+            Tier(path=tier_path),
+            next_tier,
+            src,
+            tier_path,
+            Mock(),
+        )
+
+    worker.reset_mock(side_effect=True)
+    retries = ArtifactRetryQueue(vis, db_storage)
+    now = utcnow() + datetime.timedelta(seconds=6)
+    with patch(
+        "viseron.components.storage.tier_handler.utcnow",
+        return_value=now,
+    ):
+        # A newly constructed queue can submit work stored by the earlier producer.
+        retries.drain()
+    sent_move = worker.call_args
+    move = sent_move.args[0]
+    assert isinstance(move, DataItemMoveFile)
+    assert (move.src, move.dst) == (src, dst)
+    sent_move.kwargs["callback"](
+        DataItemMoveFile(
+            cmd="move_file", src=src, dst=dst, published=True, size=os.stat(src).st_size
+        )
+    )
+    with db_storage.get_session() as session:
+        locations = dict(
+            session.execute(select(FileLocations.path, FileLocations.state)).all()
+        )
+    assert locations == {
+        src: FileLocationState.PENDING_DELETE.value,
+        dst: FileLocationState.AVAILABLE.value,
+    }
+    with patch(
+        "viseron.components.storage.tier_handler.utcnow",
+        return_value=now + datetime.timedelta(seconds=6),
+    ):
+        retries.drain()
+
+    assert worker.call_count == 3  # Move, source cleanup, and the original delete.
+    sent_delete = worker.call_args
+    assert isinstance(sent_delete.args[0], DataItemDeleteFile)
+    assert sent_delete.args[0].src == src
+    sent_delete.kwargs["callback"](sent_delete.args[0])
+    with patch(
+        "viseron.components.storage.tier_handler.utcnow",
+        return_value=now + datetime.timedelta(seconds=12),
+    ):
+        retries.drain()
+    assert worker.call_count == 3
+
+
+@pytest.mark.parametrize("move", [True, False])
+def test_deferred_work_keeps_location_after_tier_path_change(
+    move: bool, vis: MockViseron, db_storage: Mock, tmp_path: Path
+) -> None:
+    """A subsequent tier check can still find the file after rejected admission."""
+    db_storage.camera_requested_files_count = {"test": Mock(filenames=set())}
+    worker = db_storage.tier_check_worker_send_command
+    old_tier = str(tmp_path / "old")
+    src = _create_file(f"{old_tier}/snapshots/motion_detector/test/snapshot.jpg")
+    upsert_file_at_location(
+        db_storage.get_session, "test", "snapshots", "motion_detector", 0, old_tier, src
+    )
+
+    def defer(item, callback) -> None:
+        item.deferred = True
+        callback(item)
+
+    worker.side_effect = defer
+    db_storage.camera_tier_handlers = {}
+    handle_file(
+        vis,
+        db_storage.get_session,
+        db_storage,
+        "test",
+        0,
+        "snapshots",
+        "motion_detector",
+        Tier(path=str(tmp_path / "changed")),
+        Tier(path=str(tmp_path / "archive")) if move else None,
+        src,
+        old_tier,
+        Mock(),
+    )
+
+    assert worker.call_count == 1
+    with db_storage.get_session() as session:
+        location = session.scalar(
+            select(FileLocations).where(FileLocations.path == src)
+        )
+    assert location is not None
+    assert location.state == FileLocationState.AVAILABLE.value
+
+
 class TestCheckTierCallbackLifecycle:
     """Test that every check_tier request is matched by exactly one release."""
 
@@ -819,17 +976,26 @@ class TestCheckTierCallbackLifecycle:
         assert send.call_count == 1
 
     def test_capacity_deferral_schedules_a_new_check(self, vis: MockViseron) -> None:
-        """A deferred check is tried again even without more filesystem events."""
+        """A retry runs even when the scheduler wakes after the misfire window."""
         handler = self._make_tier_handler(vis)
         send = cast("Mock", handler._storage.tier_check_worker_send_command)
         handler.check_tier()
         item, callback = send.call_args.args
         item.deferred = True
-        with patch.object(vis.background_scheduler, "add_job") as add_job:
-            callback(item)
-
-        scheduled_func = add_job.call_args.args[0]
-        scheduled_func(**add_job.call_args.kwargs["kwargs"])
+        ran = threading.Event()
+        send.side_effect = lambda *_args: ran.set()
+        scheduler = vis.background_scheduler
+        scheduler.start(paused=True)
+        try:
+            with patch(
+                "viseron.components.storage.tier_handler.utcnow",
+                return_value=utcnow() - datetime.timedelta(seconds=10),
+            ):
+                callback(item)
+            scheduler.resume()
+            assert ran.wait(3)
+        finally:
+            scheduler.shutdown()
         assert send.call_count == 2
         assert send.call_args.args[0].force
 
@@ -1256,8 +1422,6 @@ def _start_move(
                 src=src,
                 dst=dst,
                 published=True,
-                moved=True,
-                source_removed=True,
                 size=os.stat(dst).st_size,
             )
         )

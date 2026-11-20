@@ -27,6 +27,8 @@ Media references point to logical files. The `file_locations` table tracks indiv
 
 The database is managed using `alembic`.
 
+Before upgrading an existing database to the file locations schema, stop Viseron and take a PostgreSQL backup. The migration merges duplicate physical file rows. To roll back, stop the upgraded instance, restore the backup, and start the previous version. An Alembic downgrade does not recreate the original physical rows or their key aliases. Keep the recordings on disk while taking the backup and restoring it.
+
 To create a new migration, you can run the following command:
 
 ```shell

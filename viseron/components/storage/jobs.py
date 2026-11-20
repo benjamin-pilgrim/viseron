@@ -167,13 +167,8 @@ def run_cleanup_job(
     job.work(CleanupJobRunner(config, kill_event))
 
 
-class BaseCleanupJob(ABC):
-    """Base class for cleanup jobs.
-
-    The work of a job runs in a child process created with the forkserver start method
-    to reduce memory usage. Anything the work needs from the running Viseron instance
-    is resolved into a CleanupJobConfig before the child process is started.
-    """
+class CleanupJob(ABC):
+    """Shared scheduling and cancellation state for cleanup jobs."""
 
     def __init__(
         self, vis: Viseron, storage: Storage, interval_trigger: IntervalTrigger
@@ -225,6 +220,14 @@ class BaseCleanupJob(ABC):
     def interval_trigger(self) -> IntervalTrigger:
         """Return the trigger interval for the cleanup job."""
         return self._interval_trigger
+
+    @abstractmethod
+    def run(self) -> None:
+        """Run the cleanup job."""
+
+
+class BaseCleanupJob(CleanupJob):
+    """Execute cleanup in a forkserver child using a configuration snapshot."""
 
     @staticmethod
     @abstractmethod
@@ -1180,7 +1183,7 @@ class OldEventsCleanup(BaseCleanupJob):
             )
 
 
-class FileReferencesRepair(BaseCleanupJob):
+class FileReferencesRepair(CleanupJob):
     """Repair stale file rows and missing file-id artifact references."""
 
     def __init__(
@@ -1210,7 +1213,7 @@ class FileReferencesRepair(BaseCleanupJob):
         return queued_file_ids
 
     def run(self) -> None:
-        """Run the repair job using multiprocessing."""
+        """Repair references in the parent using the live tier configuration."""
         with self.run_lock:
             if self.running:
                 return
@@ -1223,10 +1226,6 @@ class FileReferencesRepair(BaseCleanupJob):
             self._active_file_ids = None
             with self.run_lock:
                 self.running = False
-
-    @staticmethod
-    def work(runner: CleanupJobRunner) -> None:
-        """Reference repair uses the live tier configuration in the parent."""
 
     def log_progress(self, message: str) -> None:
         """Throttle repair progress logging."""
@@ -1496,7 +1495,7 @@ class CleanupManager:
 
     def __init__(self, vis: Viseron, storage: Storage) -> None:
         self._vis = vis
-        self.jobs: list[BaseCleanupJob] = [
+        self.jobs: list[CleanupJob] = [
             OrphanedFilesCleanup(vis, storage, CronTrigger(hour=0, jitter=3600)),
             OrphanedDatabaseFilesCleanup(
                 vis, storage, CronTrigger(hour=0, jitter=3600)

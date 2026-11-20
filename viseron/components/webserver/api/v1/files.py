@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import datetime
 import errno
 import hashlib
 import logging
 import mimetypes
 import os
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
 from http import HTTPStatus
+from typing import TYPE_CHECKING
 
 from tornado import iostream
 
@@ -19,6 +21,9 @@ from viseron.components.storage.files import (
 )
 from viseron.components.storage.util import is_transient_filesystem_error
 from viseron.components.webserver.api.handlers import BaseAPIHandler
+
+if TYPE_CHECKING:
+    from viseron.components.webserver.file_key_handler import FileKeyHandler
 
 LOGGER = logging.getLogger(__name__)
 __all__ = [
@@ -101,7 +106,7 @@ def _content_type(path: str) -> str:
 def _etag(path: str, size: int, mtime: float) -> str:
     """Return an ETag for a resolved file."""
     etag_base = f"{path}:{size}:{mtime}".encode()
-    return hashlib.sha256(etag_base).hexdigest()
+    return f'"{hashlib.sha256(etag_base).hexdigest()}"'
 
 
 def _file_is_unavailable(error: OSError) -> bool:
@@ -157,19 +162,17 @@ def _parse_range_header(range_header: str, size: int) -> tuple[int, int]:
 
 
 async def _write_file_range(
-    handler: BaseAPIHandler,
+    handler: BaseAPIHandler | FileKeyHandler,
     file_obj,
-    start: int,
-    end: int,
+    count: int,
 ) -> None:
-    """Write file bytes for the inclusive range."""
+    """Write a bounded number of bytes from the current file position."""
 
     def read_chunk(file_obj, bytes_to_read: int) -> bytes:
         return file_obj.read(min(CHUNK_SIZE, bytes_to_read))
 
     try:
-        file_obj.seek(start)
-        bytes_remaining = end - start + 1
+        bytes_remaining = count
         while bytes_remaining > 0:
             chunk = await handler.run_in_executor(read_chunk, file_obj, bytes_remaining)
             if not chunk:
@@ -188,9 +191,10 @@ async def _write_file_range(
 
 
 async def serve_resolved_file(
-    handler: BaseAPIHandler,
+    handler: BaseAPIHandler | FileKeyHandler,
     resolved_file: ResolvedFile,
     *,
+    include_body: bool = True,
     cache_control: str = "public, max-age=86400",
 ) -> None:
     """Serve a resolved file with basic static-file semantics."""
@@ -218,6 +222,26 @@ async def serve_resolved_file(
         return
 
     size = stat_result.st_size
+    handler.set_header("Etag", _etag(resolved_file.path, size, stat_result.st_mtime))
+    handler.set_header("Last-Modified", formatdate(stat_result.st_mtime, usegmt=True))
+    handler.set_header("Cache-Control", cache_control)
+    headers = handler.request.headers
+    not_modified = False
+    if "If-None-Match" in headers:
+        not_modified = handler.check_etag_header()
+    elif modified_since := headers.get("If-Modified-Since"):
+        try:
+            modified = parsedate_to_datetime(modified_since)
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=datetime.timezone.utc)
+            not_modified = int(stat_result.st_mtime) <= modified.timestamp()
+        except (ValueError, OverflowError):
+            pass
+    if not_modified:
+        handler.set_status(HTTPStatus.NOT_MODIFIED)
+        handler.finish()
+        return
+
     start = 0
     end = size - 1
     status = HTTPStatus.OK
@@ -238,7 +262,7 @@ async def serve_resolved_file(
         status = HTTPStatus.PARTIAL_CONTENT
 
     file_obj = None
-    if size:
+    if size and include_body:
         try:
             file_obj = await handler.run_in_executor(open, resolved_file.path, "rb")
             await handler.run_in_executor(file_obj.seek, start)
@@ -272,16 +296,13 @@ async def serve_resolved_file(
     content_length = end - start + 1 if size else 0
     handler.set_status(status)
     handler.set_header("Accept-Ranges", "bytes")
-    handler.set_header("Cache-Control", cache_control)
     handler.set_header("Content-Type", _content_type(resolved_file.path))
     handler.set_header("Content-Length", str(content_length))
-    handler.set_header("Etag", _etag(resolved_file.path, size, stat_result.st_mtime))
-    handler.set_header("Last-Modified", formatdate(stat_result.st_mtime, usegmt=True))
     if status == HTTPStatus.PARTIAL_CONTENT:
         handler.set_header("Content-Range", f"bytes {start}-{end}/{size}")
 
-    if size == 0:
+    if size == 0 or not include_body:
         handler.finish()
         return
     assert file_obj is not None  # noqa: S101
-    await _write_file_range(handler, file_obj, start, end)
+    await _write_file_range(handler, file_obj, content_length)

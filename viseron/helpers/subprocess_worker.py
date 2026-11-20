@@ -106,7 +106,11 @@ class SubProcessWorker(ABC):
                 input_item = self.input_queue.get(timeout=1)
             except Empty:
                 continue
-            pop_if_full(self._process_queue, input_item)
+            self.forward_input(input_item)
+
+    def forward_input(self, item) -> None:
+        """Forward an input to the child process queue."""
+        pop_if_full(self._process_queue, item)
 
     @abstractmethod
     def spawn_subprocess(self) -> RestartablePopen:
@@ -178,7 +182,7 @@ class Server:
             address=self.address,
             port=self.port,
             authkey=self.authkey,
-            process_queue=self.process_queue,
+            get_process_queue=lambda: self.process_queue,
             output_queue=self.output_queue,
         )
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -14,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import numpy as np
 from apscheduler.jobstores.base import ConflictingIdError
 from sqlalchemy import Delete, delete, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import NoResultFound
 from watchdog.events import (
     FileCreatedEvent,
@@ -52,6 +55,7 @@ from viseron.components.storage.files import (
     upsert_file_location,
 )
 from viseron.components.storage.models import (
+    DeferredArtifacts,
     FileLocations,
     FileLocationState,
     Files,
@@ -122,6 +126,9 @@ def _src_path(event: FileSystemEvent) -> str:
     given as bytes. Viseron always schedules str paths, so it is always a str.
     """
     return cast("str", event.src_path)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TierHandler(FileSystemEventHandler):
@@ -333,6 +340,7 @@ class TierHandler(FileSystemEventHandler):
                 run_date=utcnow() + timedelta(seconds=5),
                 kwargs={"force": True},
                 id=job_id,
+                misfire_grace_time=None,
             )
         except ConflictingIdError:
             pass
@@ -808,7 +816,7 @@ class SegmentsTierHandler(TierHandler):
                 file["path"],
                 file["tier_path"],
                 self._logger,
-                force_delete,
+                force_delete=force_delete,
                 next_tier_id=events_next_tier.tier_id if events_next_tier else None,
             )
             processed_paths.append(file["path"])
@@ -1266,6 +1274,140 @@ def _retry_tier(
     handler._schedule_capacity_retry()
 
 
+def _defer_artifact(
+    get_session: Callable[..., Session],
+    camera_identifier: str,
+    subcategory: str,
+    src: str,
+    *,
+    dst: str | None = None,
+    dst_tier_id: int | None = None,
+    dst_tier_path: str | None = None,
+) -> None:
+    """Persist the exact move or delete without allocating a scheduler job."""
+    key = hashlib.sha256(
+        json.dumps((camera_identifier, subcategory, src, dst)).encode()
+    ).hexdigest()
+    with get_session() as session:
+        session.execute(
+            insert(DeferredArtifacts)
+            .values(
+                operation_key=key,
+                camera_identifier=camera_identifier,
+                subcategory=subcategory,
+                src=src,
+                dst=dst,
+                dst_tier_id=dst_tier_id,
+                dst_tier_path=dst_tier_path,
+                retry_at=utcnow() + timedelta(seconds=5),
+            )
+            .on_conflict_do_nothing(index_elements=[DeferredArtifacts.operation_key])
+        )
+        session.commit()
+
+
+class ArtifactRetryQueue:
+    """Drain durable artifact retries with a bounded number of requests in flight."""
+
+    def __init__(self, vis: Viseron, storage: Storage) -> None:
+        self._vis = vis
+        self._storage = storage
+        self._in_flight: dict[int, str] = {}
+        self._lock = threading.Lock()
+
+    def drain(self) -> None:
+        """Submit a batch of due artifacts to the storage worker."""
+        with self._lock:
+            busy_paths = set(self._in_flight.values())
+        limit = 64 - len(busy_paths)
+        if limit <= 0:
+            return
+
+        with self._storage.get_session() as session:
+            now = utcnow()
+            pending = list(
+                session.scalars(
+                    select(DeferredArtifacts)
+                    .where(DeferredArtifacts.retry_at <= now)
+                    .where(DeferredArtifacts.src.not_in(busy_paths))
+                    .order_by(DeferredArtifacts.retry_at, DeferredArtifacts.id)
+                    .limit(limit)
+                )
+            )
+            for operation in pending:
+                operation.retry_at = now + timedelta(seconds=5)
+            session.commit()
+
+        for operation in pending:
+            if operation.src in busy_paths:
+                continue
+            requested = self._storage.camera_requested_files_count.get(
+                operation.camera_identifier
+            )
+            if requested is not None and operation.src in requested.filenames:
+                continue
+            busy_paths.add(operation.src)
+            with self._lock:
+                self._in_flight[operation.id] = operation.src
+            try:
+                self._submit(operation)
+            except Exception:  # pylint: disable=broad-except
+                with self._lock:
+                    self._in_flight.pop(operation.id, None)
+                LOGGER.exception(
+                    "Could not submit artifact retry for %s", operation.src
+                )
+
+    def _submit(self, operation: DeferredArtifacts) -> None:
+        def complete(success: bool) -> None:
+            try:
+                if success:
+                    with self._storage.get_session() as session:
+                        session.execute(
+                            delete(DeferredArtifacts).where(
+                                DeferredArtifacts.id == operation.id
+                            )
+                        )
+                        session.commit()
+            finally:
+                with self._lock:
+                    self._in_flight.pop(operation.id, None)
+
+        if operation.dst is None:
+            delete_file(
+                self._storage,
+                operation.src,
+                callback=lambda item: complete(not item.deferred and not item.error),
+            )
+        else:
+            if operation.dst_tier_id is None or operation.dst_tier_path is None:
+                raise ValueError(
+                    f"Missing destination tier for artifact {operation.id}"
+                )
+            move_file(
+                self._vis,
+                self._storage,
+                self._storage.get_session,
+                operation.camera_identifier,
+                operation.dst_tier_id - 1,
+                TIER_CATEGORY_RECORDER,
+                operation.subcategory,
+                operation.src,
+                operation.dst,
+                operation.dst_tier_path,
+                LOGGER,
+                dst_tier_id=operation.dst_tier_id,
+                on_complete=complete,
+            )
+
+
+def _is_recording_artifact(category: str, subcategory: str) -> bool:
+    return category == TIER_CATEGORY_RECORDER and subcategory in (
+        TIER_SUBCATEGORY_EVENT_CLIPS,
+        TIER_SUBCATEGORY_THUMBNAILS,
+    )
+
+
 def handle_file(
     vis: Viseron,
     get_session: Callable[..., Session],
@@ -1288,11 +1430,16 @@ def handle_file(
         logger.debug("File %s is recently requested, skipping", path)
         return
 
-    stuck_row = False
     if force_delete or next_tier is None:
 
         def on_delete(item: DataItemDeleteFile) -> None:
-            if item.deferred:
+            if not item.deferred:
+                return
+            if _is_recording_artifact(curr_tier_category, curr_tier_subcategory):
+                _defer_artifact(
+                    get_session, camera_identifier, curr_tier_subcategory, path
+                )
+            else:
                 _retry_tier(
                     storage,
                     camera_identifier,
@@ -1302,54 +1449,41 @@ def handle_file(
                 )
 
         delete_file(storage, path, callback=on_delete)
-    else:
-        new_path = path.replace(tier_path, next_tier.path, 1)
-        if new_path == path:
-            logger.warning(
-                "Failed to move file %s to next tier, new path is the same as old. "
-                "Viseron tries to mitigate this, but it can happen if you recently "
-                "changed the tier paths or a previous move failed.",
-                path,
-            )
-            stuck_row = True
-        else:
-            move_file(
-                vis,
-                storage,
-                get_session,
-                camera_identifier,
-                curr_tier_id,
-                curr_tier_category,
-                curr_tier_subcategory,
-                path,
-                new_path,
-                next_tier.path,
-                logger,
-                **({"dst_tier_id": next_tier_id} if next_tier_id is not None else {}),
-            )
+        return
 
-    # Delete the file from the database if:
-    # - tier_path is not the same as curr_tier.path. This is an
-    #   indication that the tier configuration has changed and since the old
-    #   path is not monitored, the delete signal will not be received by
-    #   Viseron.
-    # - the move target equals the source (stuck_row). The row points at a
-    #   path this handler can never move or delete, so each tier-check pass
-    #   would re-process it and slowly leak SQLAlchemy connection objects in
-    #   the storage subprocess. Drop the row; OrphanedFilesCleanup will sweep
-    #   the on-disk file if it still exists.
-    if stuck_row or tier_path != curr_tier.path:
-        logger.debug(
-            "Deleting file %s from database since tier paths are different. "
-            "file tier_path: %s, current tier_path: %s, stuck_row: %s",
+    new_path = os.path.normpath(path.replace(tier_path, next_tier.path, 1))
+    if new_path == os.path.normpath(path):
+        logger.warning(
+            "Failed to move file %s to next tier, new path is the same as old. "
+            "Current tier path: %s. Recorded tier path: %s.",
             path,
-            tier_path,
             curr_tier.path,
-            stuck_row,
+            tier_path,
         )
+        # No move can be submitted for this row. OrphanedFilesCleanup can
+        # remove the on-disk file if it still exists.
         with get_session() as session:
             delete_file_location_by_path(session, path)
             session.commit()
+        return
+
+    # The worker and the move callback update locations once the filesystem
+    # operation succeeds. Until then the recorded path is needed for retries,
+    # even when it belongs to a previous tier configuration.
+    move_file(
+        vis,
+        storage,
+        get_session,
+        camera_identifier,
+        curr_tier_id,
+        curr_tier_category,
+        curr_tier_subcategory,
+        path,
+        new_path,
+        next_tier.path,
+        logger,
+        **({"dst_tier_id": next_tier_id} if next_tier_id is not None else {}),
+    )
 
 
 def delete_file(
@@ -1381,12 +1515,11 @@ def move_file(
     logger: logging.Logger,
     *,
     dst_tier_id: int | None = None,
+    on_complete: Callable[[bool], None] | None = None,
 ) -> None:
     """Move file from src to dst.
 
-    To avoid race conditions where a file is referenced at the same time as it is being
-    moved, causing a 404 in the browser, we copy the file to the new location and then
-    delete the old one.
+    Publish and commit the new location before requesting removal of the source.
     """
     dst_tier_id = curr_tier_id + 1 if dst_tier_id is None else dst_tier_id
     logger.debug("Moving file from %s to %s", src, dst)
@@ -1398,6 +1531,7 @@ def move_file(
                 select(Files)
                 .join(FileLocations, FileLocations.file_id == Files.id)
                 .where(FileLocations.path == src)
+                .where(FileLocations.state == FileLocationState.AVAILABLE.value)
             )
             res = session.execute(sel).scalar_one()
             file_id = res.id
@@ -1408,24 +1542,16 @@ def move_file(
             )
     except NoResultFound as error:
         logger.debug(f"Failed to find metadata for {src}: {error}")
-        with get_session() as session:
-            delete_file_location_by_path(session, src)
-            session.commit()
+        if on_complete is not None:
+            on_complete(True)
+            return
         delete_file(
             storage,
             src,
         )
         return
 
-    def _commit_published_move(item: DataItemMoveFile) -> None:
-        if item.size is None:
-            storage.temporary_files_meta.pop(dst, None)
-            logger.error(
-                "Published move from %s to %s did not report file size",
-                src,
-                dst,
-            )
-            return
+    def _commit_published_move(size: int) -> None:
         with get_session() as session:
             location_created = is_new_file_location(session, dst)
             upsert_file_location(
@@ -1434,17 +1560,14 @@ def move_file(
                 dst_tier_id,
                 dst_tier_path,
                 dst,
-                item.size,
+                size,
                 state=FileLocationState.AVAILABLE.value,
             )
-            if item.source_removed:
-                delete_file_location_by_path(session, src)
-            else:
-                delete_file_location_by_path(
-                    session,
-                    src,
-                    missing_state=FileLocationState.PENDING_DELETE.value,
-                )
+            delete_file_location_by_path(
+                session,
+                src,
+                missing_state=FileLocationState.PENDING_DELETE.value,
+            )
             session.execute(
                 update(Files)
                 .where(Files.id == file_id)
@@ -1454,7 +1577,7 @@ def move_file(
                     path=dst,
                     directory=os.path.dirname(dst),
                     filename=os.path.basename(dst),
-                    size=item.size,
+                    size=size,
                     orig_ctime=file_meta.orig_ctime,
                     duration=file_meta.duration,
                     hls_init_hash=file_meta.hls_init_hash,
@@ -1508,43 +1631,65 @@ def move_file(
             EventEmptyData(),
             store=False,
         )
-        if not item.source_removed:
-            logger.warning(
-                "Published %s to %s and committed database move, but source cleanup "
-                "did not complete: %s",
-                src,
-                dst,
-                item.source_remove_error,
-            )
+        # The pending location also lets periodic cleanup finish the move if
+        # this delete is deferred, interrupted or fails on an unavailable mount.
+        delete_file(storage, src)
 
     def _move_file_callback(item: DataItemMoveFile) -> None:
         if item.deferred:
-            _retry_tier(
-                storage,
-                camera_identifier,
-                curr_tier_id,
-                _curr_tier_category,
-                _curr_tier_subcategory,
-            )
+            storage.temporary_files_meta.pop(dst, None)
+            storage.temporary_moving_files.discard(src)
+            if on_complete is not None:
+                on_complete(False)
+            elif _is_recording_artifact(_curr_tier_category, _curr_tier_subcategory):
+                _defer_artifact(
+                    get_session,
+                    camera_identifier,
+                    _curr_tier_subcategory,
+                    src,
+                    dst=dst,
+                    dst_tier_id=dst_tier_id,
+                    dst_tier_path=dst_tier_path,
+                )
+            else:
+                _retry_tier(
+                    storage,
+                    camera_identifier,
+                    curr_tier_id,
+                    _curr_tier_category,
+                    _curr_tier_subcategory,
+                )
+            return
         if item.source_missing:
             storage.temporary_files_meta.pop(dst, None)
             moving_files = getattr(storage, "temporary_moving_files", None)
             if moving_files is not None:
                 moving_files.discard(src)
             logger.debug("Source file %s was missing when moving to %s", src, dst)
-            with get_session() as session:
-                delete_file_location_by_path(session, src)
-                session.commit()
+            success = False
+            try:
+                with get_session() as session:
+                    delete_file_location_by_path(session, src)
+                    session.commit()
+                success = True
+            finally:
+                if on_complete is not None:
+                    on_complete(success)
             return
-        if item.published:
-            _commit_published_move(item)
+        if item.published and item.size is not None:
+            success = False
+            try:
+                _commit_published_move(item.size)
+                success = True
+            finally:
+                if on_complete is not None:
+                    on_complete(success)
             return
-        if item.error or not item.moved:
-            storage.temporary_files_meta.pop(dst, None)
-            moving_files = getattr(storage, "temporary_moving_files", None)
-            if moving_files is not None:
-                moving_files.discard(src)
-            logger.error(f"Error moving file {src} to {dst}: {item.error}")
+        storage.temporary_files_meta.pop(dst, None)
+        storage.temporary_moving_files.discard(src)
+        logger.error("Error moving file %s to %s: %s", src, dst, item.error)
+        if on_complete is not None:
+            on_complete(False)
 
     def _send_segment_move() -> None:
         storage.temporary_files_meta[dst] = file_meta

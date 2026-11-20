@@ -2,6 +2,7 @@
 
 import datetime
 import os
+import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import NoResultFound
 
 from viseron.components.storage.check_tier import (
+    FILE_LOCK_SHARDS,
     FILES_DTYPE,
     Worker,
     copy_file_for_tier_worker,
@@ -21,10 +23,9 @@ from viseron.components.storage.check_tier import (
     get_recordings_to_move,
     load_recordings,
     load_tier,
-    move_file_for_tier_worker,
 )
 from viseron.components.storage.models import Recordings
-from viseron.components.storage.storage_subprocess import DataItem
+from viseron.components.storage.storage_subprocess import DataItem, DataItemMoveFile
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_active
 
@@ -122,95 +123,49 @@ def test_check_tier_force_bypasses_recent_throttle() -> None:
     worker._check_tier.assert_called_once_with(item)
 
 
+def _file_worker() -> Worker:
+    """Give file operations a lock without opening a database connection."""
+    worker = Worker.__new__(Worker)
+    worker._file_locks = [threading.Lock() for _ in range(FILE_LOCK_SHARDS)]
+    return worker
+
+
 class TestFileOperations:
     """Test destructive file operations."""
 
-    def test_move_file_destination_error_keeps_source_state(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    def test_move_publication_leaves_source_until_parent_commits(
+        self, tmp_path
     ) -> None:
-        """Destination failures must not delete source file or DB row."""
-        src = tmp_path / "src.m4s"
-        dst = tmp_path / "dst.m4s"
+        """Repeating a publication after a child restart still has its source."""
+        src, dst = tmp_path / "src.m4s", tmp_path / "dst.m4s"
         src.write_bytes(b"segment")
-        session = FakeSession()
+        for _ in range(2):
+            item = DataItemMoveFile(cmd="move_file", src=str(src), dst=str(dst))
+            _file_worker().work_input(item)
+            assert item.published
+            assert item.size == len(b"segment")
+            assert dst.read_bytes() == src.read_bytes() == b"segment"
 
-        def raise_oserror(_src: str, _dst: str) -> int:
-            raise OSError("destination unavailable")
-
-        monkeypatch.setattr(
-            "viseron.components.storage.check_tier.move_file_atomic",
-            raise_oserror,
-        )
-
-        with pytest.raises(OSError, match="destination unavailable"):
-            move_file_for_tier_worker(lambda: session, str(src), str(dst), MagicMock())
-
-        assert src.exists()
-        assert session.executed is False
-        assert session.committed is False
-
-    def test_move_file_missing_source_deletes_stale_db_row(self, tmp_path) -> None:
-        """Missing source means stale DB state, not a retryable move."""
-        src = tmp_path / "missing.m4s"
-        dst = tmp_path / "dst.m4s"
-        session = FakeSession()
-
-        result = move_file_for_tier_worker(
-            lambda: session, str(src), str(dst), MagicMock()
-        )
-
-        assert result.moved is False
-        assert result.published is False
-        assert result.source_missing is True
-        assert result.source_removed is False
-        assert result.source_remove_error is None
-        assert result.size is None
-        assert session.executed is True
-        assert session.committed is True
-
-    def test_move_file_source_remove_error_reports_published(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    def test_move_missing_source_does_not_claim_an_existing_destination(
+        self, tmp_path
     ) -> None:
-        """A failed source cleanup must still report the destination as published."""
-        src = tmp_path / "src.m4s"
+        """A move must prove publication using the requested source."""
         dst = tmp_path / "dst.m4s"
-        src.write_bytes(b"segment")
-        session = FakeSession()
-        real_remove = os.remove
-
-        def remove_with_source_error(path: str) -> None:
-            if path == str(src):
-                raise OSError("unlink failed")
-            real_remove(path)
-
-        monkeypatch.setattr(
-            "viseron.components.storage.util.os.remove",
-            remove_with_source_error,
+        dst.write_bytes(b"unrelated")
+        item = DataItemMoveFile(
+            cmd="move_file", src=str(tmp_path / "missing"), dst=str(dst)
         )
-
-        result = move_file_for_tier_worker(
-            lambda: session, str(src), str(dst), MagicMock()
-        )
-
-        assert result.moved is True
-        assert result.published is True
-        assert result.source_missing is False
-        assert result.source_removed is False
-        assert result.source_remove_error == "unlink failed"
-        assert result.size == len(b"segment")
-        assert src.exists()
-        assert dst.read_bytes() == b"segment"
-        assert session.executed is False
-        assert session.committed is False
+        _file_worker().work_input(item)
+        assert item.source_missing
+        assert not item.published
+        assert dst.read_bytes() == b"unrelated"
 
     def test_move_file_replace_error_after_publish_reports_published(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An ACK-lost replace should commit if the destination verifies."""
-        src = tmp_path / "src.m4s"
-        dst = tmp_path / "dst.m4s"
+        src, dst = tmp_path / "src.m4s", tmp_path / "dst.m4s"
         src.write_bytes(b"segment")
-        session = FakeSession()
         real_replace = os.replace
 
         def replace_then_error(src_path: str, dst_path: str) -> None:
@@ -221,21 +176,11 @@ class TestFileOperations:
             "viseron.components.storage.util.os.replace",
             replace_then_error,
         )
-
-        result = move_file_for_tier_worker(
-            lambda: session, str(src), str(dst), MagicMock()
-        )
-
-        assert result.moved is True
-        assert result.published is True
-        assert result.source_missing is False
-        assert result.source_removed is True
-        assert result.source_remove_error is None
-        assert result.size == len(b"segment")
-        assert not src.exists()
-        assert dst.read_bytes() == b"segment"
-        assert session.executed is False
-        assert session.committed is False
+        item = DataItemMoveFile(cmd="move_file", src=str(src), dst=str(dst))
+        _file_worker().work_input(item)
+        assert item.published
+        assert not item.source_missing
+        assert dst.read_bytes() == src.read_bytes() == b"segment"
 
     def test_delete_file_transient_error_keeps_db_row(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
@@ -258,28 +203,18 @@ class TestFileOperations:
         assert session.executed is False
         assert session.committed is False
 
-    def test_move_file_unavailable_parent_keeps_db_row(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Unavailable source/destination parents should not delete DB rows."""
+    def test_move_unavailable_destination_preserves_source(self, tmp_path) -> None:
+        """An unreachable destination cannot authorize source cleanup."""
         src = tmp_path / "src.m4s"
-        dst = tmp_path / "dst.m4s"
         src.write_bytes(b"segment")
-        session = FakeSession()
-
-        def raise_oserror(_path: str) -> None:
-            raise OSError("parent unavailable")
-
-        monkeypatch.setattr(
-            "viseron.components.storage.check_tier.raise_if_path_unavailable",
-            raise_oserror,
+        item = DataItemMoveFile(
+            cmd="move_file", src=str(src), dst=str(tmp_path / "missing" / "dst.m4s")
         )
-
-        with pytest.raises(OSError, match="parent unavailable"):
-            move_file_for_tier_worker(lambda: session, str(src), str(dst), MagicMock())
-
-        assert session.executed is False
-        assert session.committed is False
+        _file_worker().work_input(item)
+        assert item.error
+        assert not item.published
+        assert not item.source_missing
+        assert src.read_bytes() == b"segment"
 
     def test_copy_file_copies_without_removing_source(self, tmp_path) -> None:
         """Copying sidecars should publish dst and preserve src."""

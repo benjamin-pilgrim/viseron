@@ -5,9 +5,8 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import delete, func, insert, select, update
@@ -15,7 +14,6 @@ from sqlalchemy import delete, func, insert, select, update
 from viseron.components.storage.models import FileLocations, Files, Recordings
 from viseron.components.webserver.api.v1.hls import (
     HlsAPIHandler,
-    _get_init_file,
     count_files_removed,
     update_hls_client,
 )
@@ -405,6 +403,51 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
     def test_get_hls_playlist_time_period_date_not_today(self):
         """Test getting HLS playlist for a specific time period with date not today."""
         self._get_hls_playlist_time_period(0, None, "2023-10-01", 0, 1)
+
+    @pytest.fixture(autouse=True)
+    def _legacy_tier_roots(self, tmp_path):
+        self._tier_roots = [tmp_path / "first", tmp_path / "archive"]
+
+    def test_migrated_playlist_serves_first_tier_init(self) -> None:
+        """Upgraded recordings still play with their init in the first tier."""
+        init = self._tier_roots[0] / "segments" / "test" / "init.mp4"
+        init.parent.mkdir(parents=True)
+        init.write_bytes(b"legacy init")
+        with self._get_db_session() as session:
+            session.execute(
+                update(Files).where(Files.camera_identifier == "test").values(tier_id=1)
+            )
+            session.commit()
+        camera = MockCamera(identifier="test")
+
+        def tier_base_path(tier_id, *_):
+            if tier_id >= len(self._tier_roots):
+                raise ValueError("unknown tier")
+            return str(self._tier_roots[tier_id])
+
+        camera.tier_base_path.side_effect = tier_base_path
+        with (
+            patch.object(HlsAPIHandler, "_get_camera", return_value=camera),
+            patch.object(
+                HlsAPIHandler, "_get_session", side_effect=self._get_db_session
+            ),
+        ):
+            playlist = self.fetch("/api/v1/hls/test/1/index.m3u8")
+            assert playlist.code == 200
+            init_url = next(
+                line.split('"')[1]
+                for line in playlist.body.decode().splitlines()
+                if line.startswith("#EXT-X-MAP:")
+            )
+            response = self.fetch(init_url)
+            assert response.code == 200
+            assert response.body == b"legacy init"
+            assert response.headers["Cache-Control"] == "no-cache"
+            archive_init = self._tier_roots[1] / "segments" / "test" / "init.mp4"
+            archive_init.parent.mkdir(parents=True)
+            archive_init.write_bytes(b"archive init")
+            assert self.fetch(init_url).body == b"archive init"
+            assert self.fetch("/api/v1/hls/init/test/999.mp4").code == 404
 
     def _fetch_playlist(
         self,
@@ -798,22 +841,6 @@ def test_count_files_removed_all_files_changed():
         Fragment("file6", "file6", 1, utcnow()),
     ]
     assert count_files_removed(prev_list, curr_list) == 3
-
-
-def test_legacy_init_resolves_within_the_requested_tier(tmp_path: Path) -> None:
-    """A legacy URL returns the init for the requested tier only."""
-    directory = tmp_path / "segments" / "test"
-    directory.mkdir(parents=True)
-    init = directory / "init.mp4"
-    init.write_bytes(b"init")
-    camera = Mock(identifier="test")
-    camera.tier_base_path.return_value = str(tmp_path)
-    resolved = _get_init_file(camera, 1)
-    assert resolved is not None
-    assert resolved.path == str(init)
-    camera.tier_base_path.assert_called_once_with(1, "recorder", "segments")
-    init.unlink()
-    assert _get_init_file(camera, 1) is None
 
 
 def test_generate_playlist_emits_new_map_when_init_changes():

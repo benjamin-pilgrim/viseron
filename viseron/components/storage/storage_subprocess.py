@@ -94,11 +94,8 @@ class DataItemMoveFile:
     coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
     deferred: bool = False
-    moved: bool = False
     published: bool = False
     source_missing: bool = False
-    source_removed: bool = False
-    source_remove_error: str | None = None
     size: int | None = None
 
 
@@ -276,7 +273,11 @@ class TierCheckWorker(SubProcessWorker):
         self._cpulimit = cpulimit
         self._workers = workers
         self._callbacks: dict[
-            str, Callable[[DataItem | FileOperation], None] | None
+            str,
+            tuple[
+                DataItem | FileOperation,
+                Callable[[DataItem | FileOperation], None] | None,
+            ],
         ] = {}
         self._callbacks_lock = threading.Lock()
         # Monotonic callback ids. str(id(callback)) is unsafe here: bound
@@ -301,7 +302,35 @@ class TierCheckWorker(SubProcessWorker):
             name=self.subprocess_name,
             stdout=self._log_pipe,
             stderr=self._log_pipe,
+            before_restart=self.requeue_pending,
         )
+
+    def forward_input(self, item: DataItem | FileOperation) -> None:
+        """Forward only requests that still belong to the current child."""
+        with self._callbacks_lock:
+            if item.callback_id in self._callbacks:
+                self._process_queue.put_nowait(item)
+
+    def requeue_pending(self) -> None:
+        """Replay unanswered commands after the old process has exited."""
+        with self._callbacks_lock:
+            for queue in (self.input_queue, self._process_queue):
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except Empty:
+                        break
+            # A manager get() issued by the dead child can still be waiting.
+            # Only the replacement child should be able to consume the replay.
+            self._process_queue = Queue()
+            self._server.process_queue = self._process_queue
+            pending = self._callbacks
+            self._callbacks = {}
+            for item, callback in pending.values():
+                callback_id = str(next(self._next_callback_id))
+                request = replace(item, callback_id=callback_id)
+                self._callbacks[callback_id] = (request, callback)
+                self._process_queue.put_nowait(request)
 
     def send_command(
         self,
@@ -312,8 +341,9 @@ class TierCheckWorker(SubProcessWorker):
         with self._callbacks_lock:
             if len(self._callbacks) < MAX_PENDING_CALLBACKS:
                 item.callback_id = str(next(self._next_callback_id))
-                self._callbacks[item.callback_id] = callback
-                self.input_queue.put_nowait(item)
+                request = replace(item)
+                self._callbacks[item.callback_id] = (request, callback)
+                self.input_queue.put_nowait(request)
                 return
         LOGGER.warning("Storage worker at capacity, deferring %s", item.cmd)
         item.error = "Storage worker at capacity; retry on the next tier check"
@@ -330,8 +360,8 @@ class TierCheckWorker(SubProcessWorker):
             if callback_id is None:
                 continue
             with self._callbacks_lock:
-                callback = self._callbacks.pop(callback_id, None)
-            if callback is not None:
+                pending = self._callbacks.pop(callback_id, None)
+            if pending is not None and (callback := pending[1]) is not None:
                 try:
                     callback(replace(item, callback_id=callback_id))
                 except Exception:

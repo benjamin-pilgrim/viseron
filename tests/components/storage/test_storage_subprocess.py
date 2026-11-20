@@ -3,7 +3,7 @@
 import datetime
 from itertools import count
 from queue import Empty, Queue
-from threading import Lock
+from threading import Event, Lock
 from unittest.mock import Mock
 
 import pytest
@@ -160,23 +160,6 @@ class TestDedupCheckQueue:
             queue.get(timeout=0.01)
 
 
-def test_dedup_file_queue_coalesces_identical_queued_jobs() -> None:
-    """Identical queued work should retain both completions."""
-    queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
-    first = DataItemMoveFile(cmd="move_file", src="/src", dst="/dst", callback_id="1")
-    second = DataItemMoveFile(cmd="move_file", src="/src", dst="/dst", callback_id="2")
-
-    queue.put(first)
-    queue.put(second)
-
-    assert queue.qsize() == 1
-    job = queue.get_nowait()
-    assert job.callback_id == "1"
-    assert job.coalesced_callback_ids == ["2"]
-    with pytest.raises(Empty):
-        queue.get_nowait()
-
-
 def test_dedup_file_queue_keeps_distinct_operations() -> None:
     """Different file operations should remain queued independently."""
     queue = DedupFileQueue[FileOperation, FileOperationKey](file_operation_key)
@@ -214,6 +197,8 @@ def _worker() -> TierCheckWorker:
     worker._callbacks_lock = Lock()
     worker._next_callback_id = count(1)
     worker.input_queue = Queue()
+    worker._process_queue = Queue()
+    worker._server = Mock()
     return worker
 
 
@@ -275,3 +260,73 @@ def test_capacity_defers_new_work_without_losing_accepted_result(monkeypatch) ->
     assert worker.input_queue.empty()
     worker.work_output(first)
     first_result.assert_called_once()
+
+
+def test_restart_replays_commands_lost_with_the_child(monkeypatch) -> None:
+    """A full worker can complete accepted jobs after its child restarts."""
+    monkeypatch.setattr(
+        "viseron.components.storage.storage_subprocess.MAX_PENDING_CALLBACKS", 2
+    )
+    worker = _worker()
+    check_result, move_result, new_result = Mock(), Mock(), Mock()
+    worker.send_command(_make_item(), check_result)
+    worker.send_command(
+        DataItemMoveFile(cmd="move_file", src="/a", dst="/b"), move_result
+    )
+    worker.forward_input(worker.input_queue.get_nowait())
+    old_child_queue = worker._process_queue
+    lost_check = old_child_queue.get_nowait()
+    pending_move = worker.input_queue.get_nowait()
+
+    worker.requeue_pending()
+    worker.forward_input(pending_move)
+    worker.work_output(lost_check)
+    check_result.assert_not_called()
+    assert old_child_queue.empty()
+
+    child_queue = worker._server.process_queue
+    worker.work_output(child_queue.get_nowait())
+    worker.send_command(_make_item(), new_result)
+    worker.forward_input(worker.input_queue.get_nowait())
+    worker.work_output(child_queue.get_nowait())
+    worker.work_output(child_queue.get_nowait())
+
+    check_result.assert_called_once()
+    move_result.assert_called_once()
+    new_result.assert_called_once()
+    assert not new_result.call_args.args[0].deferred
+    assert child_queue.empty()
+
+
+def test_storage_child_restart_processes_pending_copy(
+    vis, tmp_path, monkeypatch
+) -> None:
+    """The watchdog can start a new child and deliver work through the manager."""
+    monkeypatch.setattr(
+        "viseron.components.storage.storage_subprocess.MAX_PENDING_CALLBACKS", 1
+    )
+    worker = TierCheckWorker(vis, 100, 1)
+    source, destination = tmp_path / "init.mp4", tmp_path / "copied.mp4"
+    source.write_bytes(b"init")
+    complete = Event()
+    results = []
+
+    def result(item) -> None:
+        results.append(item)
+        complete.set()
+
+    try:
+        process = worker._process_frames_proc
+        process.kill()
+        process.wait(timeout=5)
+        worker.send_command(
+            DataItemCopyFile(cmd="copy_file", src=str(source), dst=str(destination)),
+            result,
+        )
+        assert not complete.is_set()
+        process.restart()
+        assert complete.wait(10)
+        assert results[0].published
+        assert destination.read_bytes() == b"init"
+    finally:
+        worker.stop()

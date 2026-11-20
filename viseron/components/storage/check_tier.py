@@ -23,7 +23,6 @@ from viseron.components.storage.models import (
 )
 from viseron.components.storage.util import (
     copy_file_atomic,
-    move_file_atomic,
     raise_if_path_unavailable,
 )
 from viseron.const import CAMERA_SEGMENT_DURATION
@@ -80,18 +79,6 @@ RECORDINGS_FILES_DTYPE = np.dtype(
         ("tier_path", "U512"),
     ]
 )
-
-
-@dataclass(frozen=True)
-class FileMoveResult:
-    """Result of a worker file move."""
-
-    moved: bool
-    published: bool
-    source_missing: bool
-    source_removed: bool
-    source_remove_error: str | None
-    size: int | None
 
 
 @dataclass(frozen=True)
@@ -368,17 +355,11 @@ class Worker:
     def move_file(self, item: DataItemMoveFile) -> None:
         """Move file from source to destination."""
         with self._file_lock(item.src):
-            result = move_file_for_tier_worker(
-                self._get_session,
-                item.src,
-                item.dst,
-                LOGGER,
+            result = copy_file_for_tier_worker(
+                item.src, item.dst, LOGGER, allow_existing_destination=False
             )
-            item.moved = result.moved
             item.published = result.published
             item.source_missing = result.source_missing
-            item.source_removed = result.source_removed
-            item.source_remove_error = result.source_remove_error
             item.size = result.size
 
     def copy_file(self, item: DataItemCopyFile) -> None:
@@ -985,62 +966,12 @@ def delete_file(
         session.commit()
 
 
-def move_file_for_tier_worker(
-    get_session: Callable[..., Session],
-    src: str,
-    dst: str,
-    logger: logging.Logger,
-) -> FileMoveResult:
-    """Move file from src to dst.
-
-    To avoid race conditions where a file is referenced at the same time as it is being
-    moved, causing a 404 in the browser, we copy the file to the new location and then
-    delete the old one.
-    """
-    logger.debug("Moving file from %s to %s", src, dst)
-    raise_if_path_unavailable(src)
-    raise_if_path_unavailable(dst)
-    try:
-        result = move_file_atomic(src, dst)
-    except FileNotFoundError as error:
-        logger.debug(f"Failed to move file {src} to {dst}: {error}")
-        with get_session() as session:
-            delete_file_location_by_path(session, src)
-            session.commit()
-        return FileMoveResult(
-            moved=False,
-            published=False,
-            source_missing=True,
-            source_removed=False,
-            source_remove_error=None,
-            size=None,
-        )
-    except OSError as error:
-        logger.debug(f"Failed to move file {src} to {dst}: {error}")
-        raise error
-    if result.source_remove_error:
-        logger.warning(
-            "Published %s to %s but failed to remove source: %s",
-            src,
-            dst,
-            result.source_remove_error,
-        )
-    return FileMoveResult(
-        moved=result.published,
-        published=result.published,
-        source_missing=False,
-        source_removed=result.source_removed,
-        source_remove_error=str(result.source_remove_error)
-        if result.source_remove_error
-        else None,
-        size=result.size,
-    )
-
-
 def copy_file_for_tier_worker(
     src: str,
     dst: str,
     logger: logging.Logger,
+    *,
+    allow_existing_destination: bool = True,
 ) -> FileCopyResult:
     """Copy file from src to dst without removing src."""
     logger.debug("Copying file from %s to %s", src, dst)
@@ -1051,17 +982,12 @@ def copy_file_for_tier_worker(
     except FileNotFoundError as error:
         logger.debug("Failed to copy file %s to %s: %s", src, dst, error)
         try:
-            size = os.path.getsize(dst)
+            size = os.path.getsize(dst) if allow_existing_destination else None
         except FileNotFoundError:
-            return FileCopyResult(
-                copied=False,
-                published=False,
-                source_missing=True,
-                size=None,
-            )
+            size = None
         return FileCopyResult(
             copied=False,
-            published=True,
+            published=size is not None,
             source_missing=True,
             size=size,
         )

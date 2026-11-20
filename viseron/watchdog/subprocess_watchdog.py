@@ -11,6 +11,8 @@ from viseron.helpers import utcnow
 from viseron.watchdog import WatchDog
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from apscheduler.schedulers.background import BackgroundScheduler
 
     _Base = sp.Popen[bytes]
@@ -35,11 +37,13 @@ class RestartablePopen(_Base):
         register: bool = True,
         stage: str | None = VISERON_SIGNAL_SHUTDOWN,
         start_new_session: bool = True,
+        before_restart: Callable[[], None] | None = None,
         **kwargs,
     ) -> None:
         self._args = args
         self._name = name
         self._grace_period = grace_period
+        self._before_restart = before_restart
         self._kwargs = kwargs
         self._kwargs["start_new_session"] = start_new_session
         self._subprocess: sp.Popen | None = None
@@ -107,6 +111,8 @@ class RestartablePopen(_Base):
                 LOGGER.debug("Subprocess did not terminate, killing instead.")
                 self._subprocess.kill()
                 self._subprocess.communicate()
+        if self._before_restart is not None:
+            self._before_restart()
         self.start()
 
     def terminate(self) -> None:

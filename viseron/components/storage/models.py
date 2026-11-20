@@ -105,6 +105,22 @@ class Base(DeclarativeBase):
     type_annotation_map = {ColumnMeta: JSONB}
 
 
+class DeferredArtifacts(Base):
+    """Recording artifact operations waiting for the storage worker."""
+
+    __tablename__ = "deferred_artifacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    operation_key: Mapped[str] = mapped_column(String(64), unique=True)
+    camera_identifier: Mapped[str]
+    subcategory: Mapped[str]
+    src: Mapped[str]
+    dst: Mapped[str | None]
+    dst_tier_id: Mapped[int | None]
+    dst_tier_path: Mapped[str | None]
+    retry_at: Mapped[datetime.datetime] = mapped_column(UTCDateTime, index=True)
+
+
 FILE_KEY_SEQUENCE = Sequence("files_file_key_seq", metadata=Base.metadata)
 
 
