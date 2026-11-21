@@ -7,6 +7,8 @@ import logging
 import multiprocessing as mp
 import os
 import pwd
+import time
+import uuid
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
@@ -159,6 +161,27 @@ def unload(vis: Viseron) -> None:
     vis.data.pop(COMPONENT, None)
 
 
+def _get_current_result(
+    result_queue: Queue,
+    camera_identifier: str,
+    request_id: str,
+    submitted: float,
+) -> Any:
+    """Ignore expired requests without extending this frame's wait budget."""
+    deadline = submitted + 3
+    while (remaining := deadline - time.monotonic()) > 0:
+        item = result_queue.get(timeout=remaining)
+        if item.get("request_id") == request_id:
+            return item["result"]
+        LOGGER.debug(
+            "Discarding late detector result camera=%s expected=%s received=%s",
+            camera_identifier,
+            request_id,
+            item.get("request_id"),
+        )
+    raise Empty
+
+
 class LoadDarknetError(ViseronError):
     """Raised when failing to load Darknet network."""
 
@@ -242,6 +265,7 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
     ) -> None:
         LOGGER.debug("Using OpenCV DNN Darknet")
         BaseDarknet.__init__(self, vis, config)
+        self._worker_activity: dict[str, Any] | None = None
         self._process_initialization_done = mp.Event()
         self._process_initialization_error = mp.Event()
         SubProcessWorker.__init__(self, vis, f"{COMPONENT}.{CONFIG_OBJECT_DETECTOR}")
@@ -290,6 +314,8 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
     def detect(self, frame, camera_identifier, result_queue, min_confidence):
         """Run detection on frame."""
         self._result_queues[camera_identifier] = result_queue
+        request_id = uuid.uuid4().hex
+        submitted = time.monotonic()
         pop_if_full(
             self.input_queue,
             {
@@ -297,13 +323,33 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
                 "camera_identifier": camera_identifier,
                 "min_confidence": min_confidence,
                 "nms": self._nms,
+                "request_id": request_id,
+                "submitted": submitted,
             },
         )
         try:
-            item = result_queue.get(timeout=3)
+            return _get_current_result(
+                result_queue, camera_identifier, request_id, submitted
+            )
         except Empty:
+            activity = self._worker_activity
+            LOGGER.warning(
+                "Detector timeout camera=%s request=%s elapsed=%.3fs "
+                "input_queue=%s worker_exit=%s active=%s",
+                camera_identifier,
+                request_id,
+                time.monotonic() - submitted,
+                self.input_queue.qsize(),
+                self._process_frames_proc.poll(),
+                {
+                    "camera": activity["camera_identifier"],
+                    "request": activity["request_id"],
+                    "running_seconds": round(time.monotonic() - activity["started"], 3),
+                }
+                if activity
+                else None,
+            )
             return None
-        return item["result"]
 
     def work_output(self, item) -> None:
         """Put result into queue."""
@@ -317,6 +363,23 @@ class DarknetDNN(BaseDarknet, SubProcessWorker):
             self._process_initialization_error.set()
             self._process_initialization_done.set()
             return
+        if item.get("diagnostic") == "started":
+            self._worker_activity = item
+            return
+        if "finished" in item:
+            received = time.monotonic()
+            if received - item["submitted"] >= 1:
+                LOGGER.warning(
+                    "Slow detector result camera=%s request=%s queue=%.3fs "
+                    "inference=%.3fs delivery=%.3fs total=%.3fs",
+                    item["camera_identifier"],
+                    item["request_id"],
+                    item["started"] - item["submitted"],
+                    item["finished"] - item["started"],
+                    received - item["finished"],
+                    received - item["submitted"],
+                )
+            self._worker_activity = None
         pop_if_full(self._result_queues[item["camera_identifier"]], item)
 
     def post_process(self, detections, camera_resolution) -> list[DetectedObject]:
@@ -422,19 +485,23 @@ class DarknetNative(BaseDarknet, ChildProcessWorker):
     ):
         """Perform detection."""
         self._result_queues[camera_identifier] = result_queue
+        request_id = uuid.uuid4().hex
+        submitted = time.monotonic()
         pop_if_full(
             self.input_queue,
             {
+                "request_id": request_id,
                 "frame": frame,
                 "camera_identifier": camera_identifier,
                 "min_confidence": min_confidence,
             },
         )
         try:
-            item = result_queue.get(timeout=3)
+            return _get_current_result(
+                result_queue, camera_identifier, request_id, submitted
+            )
         except Empty:
             return None
-        return item["result"]
 
     def post_process(self, detections, camera_resolution) -> list[DetectedObject]:
         """Post process detections."""

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from queue import Empty
+from queue import Empty, Queue
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,11 +63,18 @@ def test_dnn_detect_does_not_block_without_result(
     get_side_effect: list[dict[str, str]] | type[Empty], expected: str | None
 ) -> None:
     """detect() gives up when the subprocess never answers."""
-    darknet = MagicMock(_result_queues={})
+    darknet = MagicMock(_result_queues={}, input_queue=Queue())
     result_queue = MagicMock()
-    result_queue.get.side_effect = get_side_effect
+
+    def receive(timeout):
+        assert 0 < timeout <= 3
+        if get_side_effect is Empty:
+            raise Empty
+        request = darknet.input_queue.get_nowait()
+        return {**request, "result": "detections"}
+
+    result_queue.get.side_effect = receive
 
     result = DarknetDNN.detect(darknet, MagicMock(), "camera", result_queue, 0.5)
 
     assert result == expected
-    result_queue.get.assert_called_once_with(timeout=3)

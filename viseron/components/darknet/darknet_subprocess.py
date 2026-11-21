@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+import time
 
 import cv2
 
@@ -136,7 +137,17 @@ def main() -> None:
     LOGGER.debug("Starting loop")
     while True:
         job = process_queue.get()
+        job["started"] = time.monotonic()
+        output_queue.put(
+            {
+                "diagnostic": "started",
+                "camera_identifier": job["camera_identifier"],
+                "request_id": job["request_id"],
+                "started": job["started"],
+            }
+        )
         darknet.work_input(job)
+        job["finished"] = time.monotonic()
         output_queue.put(job)
 
 
