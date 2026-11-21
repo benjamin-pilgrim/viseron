@@ -136,7 +136,7 @@ class SubprocessWatchDog(WatchDog):
             "interval",
             id="subprocess_watchdog",
             name="subprocess_watchdog",
-            seconds=15,
+            seconds=1,
             max_instances=1,
             coalesce=True,
             replace_existing=True,

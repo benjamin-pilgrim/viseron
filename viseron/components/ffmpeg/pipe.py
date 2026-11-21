@@ -112,6 +112,8 @@ class FFmpegPipe:
                 self.segment_process = RestartablePopen(
                     self._segment_command,
                     name=f"viseron.camera.{self._camera_identifier}.segments",
+                    # Recover track changes quickly, while bounding bad-start retries.
+                    grace_period=2,
                     stdin=sp.DEVNULL,
                     stdout=sp.PIPE,
                     stderr=self._log_pipe,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -64,12 +65,15 @@ def test_recording_with_fresh_database(
     image: str,
     artifact_dir: Path,
     boot_timeout: float,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Index and serve playable video before and after audio returns on a fresh DB."""
+    keep = request.config.getoption("--keep-container")
     name = helpers.unique_container_name("viseron-flv-recording")
     container = docker_client.containers.create(
         image,
         name=name,
+        ports={"8888/tcp": ("127.0.0.1", None)} if keep else {},
         environment={
             "PUID": str(os.getuid()),
             "PGID": str(os.getgid()),
@@ -109,7 +113,7 @@ def test_recording_with_fresh_database(
             container, r"Viseron initialized in [\d.]+ seconds", timeout=boot_timeout
         )
         # /config belongs solely to this new container; no existing cluster or media
-        # is mounted. Successful API playback therefore exercises fresh migrations.
+        # is mounted. API playback exercises fresh schema initialization and indexing.
         result = container.exec_run(
             ["python3", "/tmp/flv_recording_probe.py", "--start", str(start)]
         )
@@ -117,5 +121,35 @@ def test_recording_with_fresh_database(
         assert result.exit_code == 0, result.output.decode(errors="replace")
     finally:
         (artifact_dir / f"{name}.log").write_bytes(container.logs())
-        container.stop(timeout=15)
-        container.remove(force=True)
+        if keep:
+            container.reload()
+            port = container.attrs["NetworkSettings"]["Ports"]["8888/tcp"][0][
+                "HostPort"
+            ]
+            (artifact_dir / "browser-target.json").write_text(
+                json.dumps(
+                    {
+                        "container": name,
+                        "url": f"http://127.0.0.1:{port}",
+                        "start": start,
+                    }
+                )
+            )
+        else:
+            container.stop(timeout=15)
+            container.remove(force=True)
+
+
+def test_recorder_retry_and_shutdown(
+    image_container: Any, image_host: testinfra.host.Host
+) -> None:
+    """An exited recorder recovers promptly without a tight loop or shutdown restart."""
+    script = "recorder_retry_probe.py"
+    helpers.put_file(
+        image_container,
+        "/tmp",
+        script,
+        (Path(__file__).parent / "scripts" / script).read_bytes(),
+    )
+    result = image_host.run("env PYTHONPATH=/src python3 /tmp/recorder_retry_probe.py")
+    assert result.rc == 0, result.stdout + result.stderr
