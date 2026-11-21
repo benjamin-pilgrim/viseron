@@ -599,8 +599,15 @@ class TestAbstractRecorder:
         add_segment_to_session: Callable[[datetime.datetime, float], None],
         segment_offsets,
         expected,
+        tmp_path,
     ):
         """Handle different cases where segments are being concatenated."""
+        generated_clip = tmp_path / "generated.mp4"
+        generated_clip.write_bytes(b"exported footage")
+        recorder._camera.fragmenter.concatenate_fragments.return_value = str(
+            generated_clip
+        )
+        recorder._camera.event_clips_folder = str(tmp_path / "events")
         add_db_recording()
         recording = create_recording()
 
@@ -612,7 +619,6 @@ class TestAbstractRecorder:
 
         with (
             patch.object(recorder._storage, "get_session") as mock_get_session,
-            patch("shutil.move") as _,
             patch("viseron.domains.camera.recorder.sleep"),
         ):
             mock_get_session.return_value = get_db_session()
@@ -620,4 +626,11 @@ class TestAbstractRecorder:
             result = recorder._concatenate_fragments(recording)
 
             assert result == expected
-            assert result == expected
+            exported = list((tmp_path / "events").rglob("*.mp4"))
+            if expected is not None:
+                assert len(exported) == 1
+                assert exported[0].read_bytes() == b"exported footage"
+                assert not generated_clip.exists()
+            else:
+                assert exported == []
+                assert generated_clip.read_bytes() == b"exported footage"

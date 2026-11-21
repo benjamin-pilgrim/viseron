@@ -111,13 +111,15 @@ def copy_file_atomic(src: str, dst: str) -> int:
     src_size = os.path.getsize(src)
     tmp_dst = get_storage_temp_path(dst)
 
-    def validate_tmp_size() -> None:
-        tmp_size = os.path.getsize(tmp_dst)
-        if tmp_size != src_size:
-            raise OSError(
-                f"Copied file size mismatch for {src}: "
-                f"expected {src_size}, got {tmp_size}"
-            )
+    def verify_copy(path: str) -> None:
+        if os.path.getsize(path) != src_size:
+            raise OSError(f"Copied file size mismatch for {src}")
+        with open(src, "rb") as source, open(path, "rb") as destination:
+            while chunk := source.read(1024 * 1024):
+                if destination.read(len(chunk)) != chunk:
+                    raise OSError(f"Copied file contents mismatch for {src}")
+            if destination.read(1):
+                raise OSError(f"Copied file contents mismatch for {src}")
 
     try:
         with open(src, "rb") as src_file, open(tmp_dst, "wb") as dst_file:
@@ -125,7 +127,7 @@ def copy_file_atomic(src: str, dst: str) -> int:
             dst_file.flush()
             os.fsync(dst_file.fileno())
 
-        validate_tmp_size()
+        verify_copy(tmp_dst)
         try:
             os.replace(tmp_dst, dst)
         except OSError as replace_error:
@@ -134,12 +136,7 @@ def copy_file_atomic(src: str, dst: str) -> int:
             try:
                 if path_exists(tmp_dst) or os.path.getsize(dst) != src_size:
                     raise replace_error
-                with open(src, "rb") as source, open(dst, "rb") as destination:
-                    while chunk := source.read(1024 * 1024):
-                        if destination.read(len(chunk)) != chunk:
-                            raise replace_error
-                    if destination.read(1):
-                        raise replace_error
+                verify_copy(dst)
             except OSError as verify_error:
                 if verify_error is not replace_error:
                     raise replace_error from verify_error

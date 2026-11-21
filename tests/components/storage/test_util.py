@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from viseron.components.storage.util import (
+    copy_file_atomic,
     is_transient_filesystem_error,
     move_file_atomic,
     path_exists,
@@ -62,3 +63,37 @@ def test_failed_replace_preserves_source_with_same_size_destination(tmp_path) ->
     assert src.read_bytes() == b"new"
     assert dst.read_bytes() == b"old"
     assert set(tmp_path.iterdir()) == {src, dst}
+
+
+@pytest.mark.parametrize("operation", [copy_file_atomic, move_file_atomic])
+def test_same_size_corrupt_copy_is_rejected(tmp_path, operation):
+    """Corrupt bytes cannot authorize publication or source cleanup."""
+    source = tmp_path / "source.m4s"
+    destination = tmp_path / "destination" / "segment.m4s"
+    source.write_bytes(b"good footage")
+
+    def corrupt_copy(_source, target, **_kwargs):
+        target.write(b"bad! footage")
+
+    with patch("viseron.components.storage.util.shutil.copyfileobj", corrupt_copy):
+        with pytest.raises(OSError):
+            operation(str(source), str(destination))
+    assert source.read_bytes() == b"good footage"
+    assert not destination.exists()
+
+
+def test_lost_replace_acknowledgement_verifies_published_bytes(tmp_path):
+    """A successful rename with a lost reply still permits a verified move."""
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"recording")
+    replace = os.replace
+
+    def lose_acknowledgement(src, dst):
+        replace(src, dst)
+        raise OSError(errno.EIO, "reply lost")
+
+    with patch("os.replace", side_effect=lose_acknowledgement):
+        result = move_file_atomic(str(source), str(destination))
+    assert result.published and result.source_removed
+    assert destination.read_bytes() == b"recording"
+    assert not source.exists()

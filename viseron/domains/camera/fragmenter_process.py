@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
 TIMELAPSE_FFMPEG_TIMEOUT = 10
+RETAINED_FRAGMENT_WARNING_INTERVAL = 60
 
 
 def _get_open_files(path: str, process: psutil.Process) -> list[str]:
@@ -119,6 +120,58 @@ def _get_orig_ctime(
     )
 
 
+def _validate_fragment(path: str) -> None:
+    """Require finite, complete moof/mdat boxes in a finalized recorder fragment.
+
+    ENOSPC can leave an empty or partial file despite finalized HLS timing.
+    Read only box headers and seek over payloads; this checks container
+    completeness, not codec correctness. Finalized inputs must remain unchanged.
+    """
+    with open(path, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        offset = 0
+        pending_moof = False
+        has_media = False
+        while offset < before.st_size:
+            stream.seek(offset)
+            header_size = 8
+            header = stream.read(header_size)
+            if len(header) != header_size:
+                raise ValueError("truncated MP4 box header")
+            size = int.from_bytes(header[:4], "big")
+            kind = header[4:]
+            if size == 1:
+                extended_size = stream.read(header_size)
+                if len(extended_size) != header_size:
+                    raise ValueError("truncated extended MP4 box header")
+                size = int.from_bytes(extended_size, "big")
+                header_size *= 2
+            # Our finite FFmpeg/MP4Box fragments have explicit box sizes.
+            # A zero-sized box extends to EOF and cannot prove completeness.
+            if size < header_size or offset + size > before.st_size:
+                raise ValueError("incomplete or unfinalized MP4 box")
+            if kind == b"moof":
+                if pending_moof or size == header_size:
+                    raise ValueError("fragment has no complete movie fragment")
+                pending_moof = True
+            elif kind == b"mdat":
+                if not pending_moof or size == header_size:
+                    raise ValueError("fragment has no complete media payload")
+                has_media = True
+                pending_moof = False
+            offset += size
+        if not has_media or pending_moof:
+            raise ValueError("fragment lacks a complete moof/mdat pair")
+        after = os.fstat(stream.fileno())
+        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ValueError("fragment changed during completeness check")
+
+
 def fragmenter_logger_names(camera_identifier: str) -> tuple[str, str]:
     """Return the names of the loggers the fragmenter child process creates.
 
@@ -153,6 +206,7 @@ class FragmenterWork(ChildProcessWork):
         self._worker_event = worker_event
         self._metadata_ack = metadata_ack
         self._last_attempted_fragment = ""
+        self._last_retained_warning = float("-inf")
         self._logger = logging.getLogger(fragmenter_logger_names(camera_identifier)[0])
         self._log_pipe: LogPipe
 
@@ -233,7 +287,9 @@ class FragmenterWork(ChildProcessWork):
                 check=True,
             )
         except sp.CalledProcessError as err:
-            self._logger.error("MP4Box command failed", exc_info=err)
+            self._log_retained_fragment(
+                os.path.join(self.temp_segments_folder, file), err
+            )
             return False
         return True
 
@@ -360,6 +416,15 @@ class FragmenterWork(ChildProcessWork):
         self._logger.warning("Metadata acknowledgement timed out for %s", path)
         return False
 
+    def _log_retained_fragment(self, path: str, error: Exception) -> None:
+        """Keep retries visible without filling the disk with repeated warnings."""
+        now = time.monotonic()
+        if now - self._last_retained_warning >= RETAINED_FRAGMENT_WARNING_INTERVAL:
+            self._last_retained_warning = now
+            self._logger.warning("Retaining fragment %s: %s", path, error)
+        else:
+            self._logger.debug("Retaining fragment %s: %s", path, error)
+
     def _publish_segment(
         self,
         init_src: str,
@@ -370,6 +435,7 @@ class FragmenterWork(ChildProcessWork):
     ) -> bool:
         """Publish a segment only after its init and metadata are ready."""
         try:
+            _validate_fragment(src)
             with open(init_src, "rb") as init:
                 init_bytes = init.read()
             init_hash = hashlib.sha256(init_bytes).hexdigest()
@@ -396,9 +462,9 @@ class FragmenterWork(ChildProcessWork):
             except OSError:
                 self.output_queue.put({"discard_metadata": dst})
                 raise
-        except OSError as error:
-            self._logger.warning("Failed to publish segment %s: %s", dst, error)
-            if error.errno == errno.ENOSPC:
+        except (OSError, ValueError) as error:
+            self._log_retained_fragment(src, error)
+            if isinstance(error, OSError) and error.errno == errno.ENOSPC:
                 self.output_queue.put({"error": "no_space_left"})
             return False
         return True
@@ -424,13 +490,6 @@ class FragmenterWork(ChildProcessWork):
             encoding="utf-8",
         ).read()
 
-    def _discard_fragment(self, path: Path) -> None:
-        """Remove an input that cannot be parsed."""
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            self._logger.exception("Could not discard unparseable fragment %s", path)
-
     def _handle_mp4(self, file: str) -> None:
         """Fragment and publish an MP4, retaining the input on publish failure."""
         source = Path(self.temp_segments_folder) / file
@@ -439,19 +498,19 @@ class FragmenterWork(ChildProcessWork):
         try:
             try:
                 if not self._mp4box_command(file):
-                    self._discard_fragment(source)
+                    self._logger.debug("Retaining %s after failed remux", file)
                     return
                 extinf = _extract_extinf_number(
                     self._read_m3u8_mp4box(file), "clip_1.m4s"
                 )
                 orig_ctime = _get_orig_ctime(file, None)
-            except (FileNotFoundError, ValueError):
-                self._logger.exception("Failed to parse %s", file)
-                self._discard_fragment(source)
+            except (FileNotFoundError, ValueError) as error:
+                self._log_retained_fragment(str(source), error)
                 return
-            if not extinf:
-                self._logger.error("Failed to get extinf for %s", file)
-                self._discard_fragment(source)
+            if extinf is None or extinf <= 0:
+                self._log_retained_fragment(
+                    str(source), ValueError("no positive playlist duration")
+                )
                 return
             self._segment_hook_mp4box(file, orig_ctime)
             if self._publish_segment(
@@ -462,8 +521,8 @@ class FragmenterWork(ChildProcessWork):
                 extinf,
             ):
                 source.unlink(missing_ok=True)
-        except OSError:
-            self._logger.exception("Failed to fragment %s", file)
+        except OSError as error:
+            self._log_retained_fragment(str(source), error)
         finally:
             shutil.rmtree(outdir, ignore_errors=True)
 
@@ -477,15 +536,16 @@ class FragmenterWork(ChildProcessWork):
                 orig_ctime = _get_orig_ctime(
                     file, _extract_program_date_time(m3u8, file)
                 )
-            except (FileNotFoundError, ValueError):
-                self._logger.exception("Failed to parse %s", file)
-                self._discard_fragment(source)
+            except (FileNotFoundError, ValueError) as error:
+                self._log_retained_fragment(str(source), error)
                 return
-            if not extinf:
-                self._logger.error("Failed to get extinf for %s", file)
-                self._discard_fragment(source)
+            if extinf is None or extinf <= 0:
+                self._log_retained_fragment(
+                    str(source), ValueError("no positive playlist duration")
+                )
                 return
 
+            _validate_fragment(str(source))
             pending = self._pending_fragment(file)
             pending.mkdir(parents=True, exist_ok=True)
             init_src = Path(self.temp_segments_folder) / "init.mp4"
@@ -503,9 +563,9 @@ class FragmenterWork(ChildProcessWork):
                 file, str(pending / "init"), str(pending / "segment"), orig_ctime
             )
             self._publish_pending_fragment(file)
-        except OSError as error:
-            self._logger.warning("Failed to stage segment %s: %s", file, error)
-            if error.errno == errno.ENOSPC:
+        except (OSError, ValueError) as error:
+            self._log_retained_fragment(str(source), error)
+            if isinstance(error, OSError) and error.errno == errno.ENOSPC:
                 self.output_queue.put({"error": "no_space_left"})
 
     def _pending_fragment(self, file: str) -> Path:
@@ -525,5 +585,5 @@ class FragmenterWork(ChildProcessWork):
                 duration,
             ):
                 shutil.rmtree(pending)
-        except (OSError, ValueError):
-            self._logger.exception("Failed to process staged segment %s", file)
+        except (OSError, ValueError) as error:
+            self._log_retained_fragment(str(pending / "segment"), error)
