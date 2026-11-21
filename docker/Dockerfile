@@ -18,6 +18,30 @@ FROM roflcoopter/${ARCH}-wheels:${WHEELS_VERSION}-${UBUNTU_VERSION} AS wheels
 FROM ${GPAC_IMAGE} AS gpac
 FROM ${HAILO_IMAGE} AS hailo
 
+# Build the pinned relay with FLV source clocks and late-audio renegotiation.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go2rtc-patched
+ARG ARCH
+ARG GO2RTC_VERSION
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git clone --depth 1 --branch v${GO2RTC_VERSION} https://github.com/AlexxIT/go2rtc.git . \
+  && test "$(git rev-parse HEAD)" = b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
+COPY docker/go2rtc/flv-audio-timestamps.patch /tmp/flv-audio-timestamps.patch
+COPY docker/go2rtc/flv-audio-recovery.patch /tmp/flv-audio-recovery.patch
+RUN git apply /tmp/flv-audio-timestamps.patch \
+  && git apply /tmp/flv-audio-recovery.patch
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  go test ./pkg/aac -run '^TestRTPPay' \
+  && go test ./pkg/flv ./pkg/rtsp ./internal/streams/recoverytest \
+  && case "$ARCH" in \
+    amd64|amd64-cuda) PLATFORM=amd64 ;; \
+    armhf|rpi3) PLATFORM=arm ;; \
+    aarch64|jetson-nano) PLATFORM=arm64 ;; \
+    *) PLATFORM="$ARCH" ;; \
+  esac \
+  && CGO_ENABLED=0 GOOS=linux GOARCH=$PLATFORM go build -trimpath -o /go2rtc .
+
 # Install go2rtc
 FROM roflcoopter/${ARCH}-base:${BASE_VERSION}-${UBUNTU_VERSION} AS go2rtc-base
 ARG ARCH
@@ -34,12 +58,7 @@ RUN \
   && apt-get update && apt-get install -y --no-install-recommends \
   wget
 
-RUN if [ "$ARCH" = "amd64-cuda" ]; then PLATFORM="amd64"; \
-  elif [ "$ARCH" = "armhf" ] || [ "$ARCH" = "rpi3" ]; then PLATFORM="arm"; \
-  elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "jetson-nano" ]; then PLATFORM="arm64"; \
-  else PLATFORM="$ARCH"; fi \
-  && wget https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_$PLATFORM -O go2rtc \
-  && chmod +x /usr/local/bin/go2rtc
+COPY --from=go2rtc-patched /go2rtc /usr/local/bin/go2rtc
 
 WORKDIR /go2rtc
 RUN wget https://raw.githubusercontent.com/AlexxIT/go2rtc/refs/tags/v${GO2RTC_VERSION}/www/video-rtc.js -O video-rtc.js

@@ -11,6 +11,8 @@
 !manager.py
 !docker/ffmpeg_wrapper
 !docker/ffprobe_wrapper
+!docker/go2rtc/
+!docker/go2rtc/*.patch
 !requirements.txt
 !requirements_conflicts.txt
 !requirements_test.txt

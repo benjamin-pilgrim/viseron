@@ -491,10 +491,10 @@ class Stream:
             )
             return ["-c:a", "aac"]
 
-        if stream_audio_codec:
-            return ["-c:a", "copy"]
-
-        return ["-an"]
+        # A startup probe may miss temporarily absent audio. Allow FFmpeg to
+        # select available tracks on each reconnect; only an explicit null
+        # recorder audio codec above disables audio permanently.
+        return ["-c:a", "copy"]
 
     def recorder_video_filter_args(self) -> list[str] | list:
         """Return video filter arguments."""
