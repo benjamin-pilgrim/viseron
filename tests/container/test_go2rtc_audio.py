@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,7 +48,7 @@ def test_flv_audio_recording(
     """Keep source clocks, recover late audio, and retain video-only recordings."""
     source = Path(__file__).parent / "scripts" / script
     destination = f"/tmp/{script}"
-    helpers.put_abs(image_container, destination, source.read_bytes())
+    helpers.put_file(image_container, "/tmp", script, source.read_bytes())
     command = image_host.run(
         "env PATH=/ffmpeg/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=/src "
         "python3 %s --case %s" + (" --viseron-audio" if options else ""),
@@ -54,3 +56,66 @@ def test_flv_audio_recording(
         case,
     )
     assert command.rc == 0, f"{case}:\n{command.stdout}\n{command.stderr}"
+
+
+@pytest.mark.timeout(360)
+def test_recording_with_fresh_database(
+    docker_client: Any,
+    image: str,
+    artifact_dir: Path,
+    boot_timeout: float,
+) -> None:
+    """Index and serve playable video before and after audio returns on a fresh DB."""
+    name = helpers.unique_container_name("viseron-flv-recording")
+    container = docker_client.containers.create(
+        image,
+        name=name,
+        environment={
+            "PUID": str(os.getuid()),
+            "PGID": str(os.getgid()),
+            "TZ": "UTC",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+        },
+    )
+    directory = Path(__file__).parent
+    helpers.put_abs(
+        container,
+        "/config/config.yaml",
+        (directory / "configs" / "flv_recording.yaml").read_bytes(),
+    )
+    helpers.create_directories(
+        container,
+        "/recordings",
+        "/segments",
+        "/snapshots",
+        "/thumbnails",
+        "/event_clips",
+    )
+    for script in ("flv_camera_source.py", "flv_recording_probe.py"):
+        helpers.put_file(
+            container, "/tmp", script, (directory / "scripts" / script).read_bytes()
+        )
+    helpers.put_abs(
+        container,
+        "/etc/services.d/flv-source/run",
+        b"#!/bin/sh\nexec python3 /tmp/flv_camera_source.py\n",
+        mode=0o755,
+    )
+    start = int(time.time()) - 2
+    try:
+        container.start()
+        helpers.wait_for_log(
+            container, r"Viseron initialized in [\d.]+ seconds", timeout=boot_timeout
+        )
+        # /config belongs solely to this new container; no existing cluster or media
+        # is mounted. Successful API playback therefore exercises fresh migrations.
+        result = container.exec_run(
+            ["python3", "/tmp/flv_recording_probe.py", "--start", str(start)]
+        )
+        (artifact_dir / f"{name}-recording.txt").write_bytes(result.output)
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+    finally:
+        (artifact_dir / f"{name}.log").write_bytes(container.logs())
+        container.stop(timeout=15)
+        container.remove(force=True)

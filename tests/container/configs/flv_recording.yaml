@@ -1,0 +1,48 @@
+logger:
+  default_level: info
+storage:
+  recorder:
+    tiers:
+      - path: /
+        continuous:
+          max_age:
+            days: 1
+        events:
+          max_age:
+            days: 1
+go2rtc:
+  api:
+    listen: 127.0.0.1:1984
+  rtsp:
+    listen: 127.0.0.1:8554
+  webrtc:
+    listen: ""
+  streams:
+    late_audio: http://127.0.0.1:18080/late_audio
+    video_only: http://127.0.0.1:18080/video_only
+ffmpeg:
+  camera:
+    late_audio: &camera
+      name: Late audio
+      host: 127.0.0.1
+      port: 8554
+      path: /late_audio
+      stream_format: rtsp
+      width: 160
+      height: 120
+      fps: 20
+      codec: h264
+      audio_codec: null
+      hwaccel_args: []
+      record_only: true
+      recorder:
+        codec: copy
+        continuous_recording: true
+        timestamp_mode: source
+    video_only:
+      <<: *camera
+      name: Video only
+      path: /video_only
+nvr:
+  late_audio:
+  video_only:

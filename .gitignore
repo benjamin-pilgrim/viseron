@@ -24,6 +24,8 @@
 
 # Dockerstuff
 !/docker/
+!/docker/go2rtc/
+!/docker/go2rtc/*.patch
 !/docker/Dockerfile*
 !/docker/aarch64
 !/docker/aarch64/Dockerfile*
