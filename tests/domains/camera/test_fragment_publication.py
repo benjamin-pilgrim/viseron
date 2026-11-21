@@ -1,11 +1,13 @@
 """Incomplete media and unknown timing must not cause unsafe publication."""
 
+import errno
+import os
 import struct
 import time
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -125,3 +127,27 @@ def test_incomplete_fragment_retries_do_not_flood_warnings(
     work.work_input({"cmd": "drain"})
     assert len(caplog.records) == 2
     assert (staging / name).read_bytes() == b"truncated"
+
+
+def test_lost_staging_rename_reply_retains_package(tmp_path):
+    """An ambiguous rename preserves a retryable package with original timing."""
+    work, staging, archive = make_work(tmp_path)
+    source = staging / "42.m4s"
+    media = b"\x00\x00\x00\x09moofx\x00\x00\x00\x09mdaty"
+    source.write_bytes(media)
+    (staging / "index.m3u8").write_text("#EXTM3U\n#EXTINF:5,\n42.m4s\n")
+    replace = os.replace
+
+    def lose_reply(src, dst):
+        replace(src, dst)
+        if src == source:
+            raise OSError(errno.EIO, "rename reply lost")
+
+    with patch("os.replace", side_effect=lose_reply):
+        work.work_input({"cmd": "drain"})
+    assert any(p.read_bytes() == media for p in staging.rglob("*") if p.is_file())
+    (staging / "index.m3u8").unlink()
+    (staging / "init.mp4").write_bytes(b"replacement init")
+    work.work_input({"cmd": "drain"})
+    assert (archive / source.name).read_bytes() == media
+    assert (archive / "init.mp4").read_bytes() == b"init"

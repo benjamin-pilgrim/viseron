@@ -549,16 +549,13 @@ class FragmenterWork(ChildProcessWork):
             pending = self._pending_fragment(file)
             pending.mkdir(parents=True, exist_ok=True)
             init_src = Path(self.temp_segments_folder) / "init.mp4"
-            try:
-                shutil.copyfile(init_src, pending / "init")
-                with open(pending / "metadata", "w", encoding="utf-8") as metadata:
-                    json.dump((orig_ctime.isoformat(), extinf), metadata)
-                # The segment's presence marks a complete package. If staging is
-                # interrupted before this rename, the encoder's file is unchanged.
-                os.replace(source, pending / "segment")
-            except OSError:
-                shutil.rmtree(pending, ignore_errors=True)
-                raise
+            shutil.copyfile(init_src, pending / "init")
+            with open(pending / "metadata", "w", encoding="utf-8") as metadata:
+                json.dump((orig_ctime.isoformat(), extinf), metadata)
+            # The segment's presence marks a complete package. Leave it intact
+            # even if a successful rename loses its acknowledgement. A later
+            # worker retries complete packages and removes incomplete ones.
+            os.replace(source, pending / "segment")
             self._segment_hook(
                 file, str(pending / "init"), str(pending / "segment"), orig_ctime
             )
