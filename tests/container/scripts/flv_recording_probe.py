@@ -3,6 +3,8 @@
 import argparse
 import datetime
 import json
+import math
+import struct
 from itertools import pairwise
 import pathlib
 import re
@@ -95,6 +97,30 @@ def probe(camera, start, folder):
     return tracks
 
 
+def audio_rms(media):
+    """Measure decoded audio rather than infer silence from packet metadata."""
+    result = subprocess.run(
+        [
+            "/ffmpeg/bin/ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(media),
+            "-map",
+            "0:a:0",
+            "-f",
+            "f32le",
+            "-",
+        ],
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    samples = [value for (value,) in struct.iter_unpack("<f", result.stdout)]
+    assert len(samples) >= 16000, "expected at least a second of playable audio"
+    return math.sqrt(sum(value * value for value in samples) / len(samples))
+
+
 def main() -> None:
     """Require pre-audio video, recovered audio and continued video-only recording."""
     parser = argparse.ArgumentParser()
@@ -136,6 +162,16 @@ def main() -> None:
                         "tracks": late,
                     }
                     assert all(s.get("video", 0) >= 80 for s in during), during
+                    silent = during[0]
+                    recovered = after[0]
+                    silent_rms = audio_rms(
+                        pathlib.Path(folder) / f"late_audio-{late.index(silent)}.mp4"
+                    )
+                    recovered_rms = audio_rms(
+                        pathlib.Path(folder) / f"late_audio-{late.index(recovered)}.mp4"
+                    )
+                    assert silent_rms < 0.001, silent_rms
+                    assert recovered_rms > 0.02, recovered_rms
                     assert any(
                         s.get("audio", 0) > 0 and s.get("video", 0) > 0 for s in after
                     ), after
@@ -144,7 +180,18 @@ def main() -> None:
                     ), only
                     counts = json.loads(fetch("http://127.0.0.1:18080/stats"))
                     assert counts == {"late_audio": 1, "video_only": 1}, counts
-                    print(json.dumps({"tracks": result, "scenario": scenario}))  # noqa: T201
+                    print(  # noqa: T201
+                        json.dumps(
+                            {
+                                "tracks": result,
+                                "scenario": scenario,
+                                "audio_rms": {
+                                    "outage": silent_rms,
+                                    "recovered": recovered_rms,
+                                },
+                            }
+                        )
+                    )  # noqa: T201
                     return
                 time.sleep(1)
                 continue

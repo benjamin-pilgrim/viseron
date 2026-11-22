@@ -18,7 +18,7 @@ FROM roflcoopter/${ARCH}-wheels:${WHEELS_VERSION}-${UBUNTU_VERSION} AS wheels
 FROM ${GPAC_IMAGE} AS gpac
 FROM ${HAILO_IMAGE} AS hailo
 
-# Build the pinned relay with FLV source clocks and late-audio renegotiation.
+# Build the pinned relay with FLV source clocks and audio-outage recovery.
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go2rtc-patched
 ARG ARCH
 ARG GO2RTC_VERSION
@@ -28,8 +28,10 @@ RUN git clone --depth 1 --branch v${GO2RTC_VERSION} https://github.com/AlexxIT/g
   && test "$(git rev-parse HEAD)" = b5948cfb25404cc5cb37b166ecaa2dca20b11d4b
 COPY docker/go2rtc/flv-audio-timestamps.patch /tmp/flv-audio-timestamps.patch
 COPY docker/go2rtc/flv-audio-recovery.patch /tmp/flv-audio-recovery.patch
+COPY docker/go2rtc/flv-audio-continuity.patch /tmp/flv-audio-continuity.patch
 RUN git apply /tmp/flv-audio-timestamps.patch \
-  && git apply /tmp/flv-audio-recovery.patch
+  && git apply /tmp/flv-audio-recovery.patch \
+  && git apply /tmp/flv-audio-continuity.patch
 RUN --mount=type=cache,target=/go/pkg/mod \
   --mount=type=cache,target=/root/.cache/go-build \
   go test ./pkg/aac -run '^TestRTPPay' \

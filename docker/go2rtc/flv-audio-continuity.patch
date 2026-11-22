@@ -1,0 +1,248 @@
+diff --git a/pkg/flv/audio_continuity.go b/pkg/flv/audio_continuity.go
+new file mode 100644
+index 0000000..600dbfd
+--- /dev/null
++++ b/pkg/flv/audio_continuity.go
+@@ -0,0 +1,104 @@
++package flv
++
++import (
++	"bytes"
++	"encoding/hex"
++	"log"
++
++	"github.com/AlexxIT/go2rtc/pkg/aac"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++)
++
++// audioContinuity conceals an audio-only outage using the continuing video clock.
++// It never invents a clock while the whole camera is offline. Only standard
++// 1024-sample AAC-LC mono/stereo frames have a known compatible silence payload.
++// State belongs to Start's single reader goroutine, not to individual consumers.
++type audioContinuity struct {
++	configured, ready, videoSeen, outputSeen, filling bool
++	silence                                           []byte
++	rate                                              uint32
++	next, lastOutput, lastRealMS, lastVideoMS         uint32
++}
++
++func (s *audioContinuity) configure(receiver *core.Receiver, timestamp uint32) {
++	if s.configured || receiver == nil {
++		return
++	}
++	s.configured = true
++	codec := receiver.Codec
++	if codec.Name != core.CodecAAC || codec.ClockRate == 0 {
++		return
++	}
++	encoded := core.Between(codec.FmtpLine, "config=", ";")
++	config, err := hex.DecodeString(encoded)
++	if err != nil || (len(config) != 2 && (len(config) != 5 || !bytes.Equal(config[2:], []byte{0x56, 0xe5, 0x00}))) || config[0]>>3 != aac.TypeAACLC || config[1]&4 != 0 {
++		return
++	}
++	switch codec.Channels {
++	case 1:
++		s.silence = []byte{0x00, 0xc8, 0x00, 0x80, 0x23, 0x80}
++	case 2:
++		s.silence = []byte{0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80}
++	default:
++		return
++	}
++	s.rate = codec.ClockRate
++	s.ready = true
++	s.lastRealMS = timestamp
++	s.next = TimeToRTP(timestamp, s.rate)
++}
++
++func (s *audioContinuity) audio(receiver *core.Receiver, timestamp uint32) bool {
++	s.configure(receiver, timestamp)
++	if !s.ready {
++		return true
++	}
++	clock := TimeToRTP(timestamp, s.rate)
++	if s.filling && s.outputSeen && int32(clock-s.lastOutput) <= 0 {
++		// A packet arriving behind already-played concealment cannot be appended
++		// without rewinding the audio clock. Wait for current source audio instead.
++		return false
++	}
++	if s.filling {
++		log.Printf("[flv] source AAC audio recovered after silence concealment")
++	}
++	s.filling = false
++	s.outputSeen = true
++	s.lastOutput = clock
++	s.next = clock + aac.AUTime
++	s.lastRealMS = timestamp
++	return true
++}
++
++func (s *audioContinuity) video(receiver *core.Receiver, timestamp uint32) {
++	s.configure(receiver, timestamp)
++	if !s.ready {
++		return
++	}
++	if s.videoSeen && (int32(timestamp-s.lastVideoMS) <= 0 || timestamp-s.lastVideoMS > 1000) {
++		// Preserve a real camera discontinuity rather than backfilling a camera outage.
++		s.next = TimeToRTP(timestamp, s.rate)
++		s.lastRealMS = timestamp
++		s.outputSeen = false
++		s.filling = false
++	}
++	s.lastVideoMS = timestamp
++	s.videoSeen = true
++	if int32(timestamp-s.lastRealMS) <= 500 {
++		return
++	}
++	// Leave 250 ms for normal FLV interleaving/jitter. A returning real packet
++	// retains its original timestamp; silence only occupies the missing interval.
++	end := TimeToRTP(timestamp-250, s.rate)
++	for count := 0; int32(end-s.next) >= 0 && count < 256; count++ {
++		if !s.filling {
++			log.Printf("[flv] source AAC audio stalled; keeping video with silence")
++		}
++		s.filling = true
++		receiver.WriteRTP(&rtp.Packet{Header: rtp.Header{Timestamp: s.next}, Payload: s.silence})
++		s.lastOutput = s.next
++		s.outputSeen = true
++		s.next += aac.AUTime
++	}
++}
+diff --git a/pkg/flv/audio_continuity_test.go b/pkg/flv/audio_continuity_test.go
+new file mode 100644
+index 0000000..3fe2ceb
+--- /dev/null
++++ b/pkg/flv/audio_continuity_test.go
+@@ -0,0 +1,104 @@
++package flv
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"sort"
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++func TestAudioOutageKeepsVideoAndAudioClockMoving(t *testing.T) {
++	for _, wholeCamera := range []bool{false, true} {
++		for _, channels := range []byte{1, 2} {
++			for _, extended := range []bool{false, true} {
++				data := []byte{'F', 'L', 'V', 1, 0, 0, 0, 0, 9}
++				data = append(data, sourceTimestampTag(TagData, 0, []byte("onMetaData width audiocodecid"))...)
++				data = append(data, sourceTimestampTag(TagVideo, 0, []byte{0x17, 0, 0, 0, 0, 1, 0x42, 0, 0x1e, 0xff, 0xe1, 0, 2, 0x67, 0x42, 1, 0, 2, 0x68, 0xce})...)
++				config := []byte{0xaf, 0, 0x14, channels << 3}
++				if extended {
++					config = append(config, 0x56, 0xe5, 0x00)
++				}
++				data = append(data, sourceTimestampTag(TagAudio, 0, config)...)
++				type tag struct {
++					ts      uint32
++					kind    byte
++					payload []byte
++				}
++				var tags []tag
++				for ts := uint32(0); ts < 7000; ts += 50 {
++					if wholeCamera && ts >= 2000 && ts < 5000 {
++						continue
++					}
++					tags = append(tags, tag{ts, TagVideo, []byte{0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0x88}})
++				}
++				var real []uint32
++				for ts := uint32(0); ts < 7000; ts += 64 {
++					if ts >= 2000 && ts < 5000 {
++						continue
++					}
++					tags = append(tags, tag{ts, TagAudio, []byte{0xaf, 1, 0x11, 0x22}})
++					real = append(real, TimeToRTP(ts, 16000))
++				}
++				sort.SliceStable(tags, func(i, j int) bool { return tags[i].ts < tags[j].ts })
++				for _, tag := range tags {
++					data = append(data, sourceTimestampTag(tag.kind, tag.ts, tag.payload)...)
++				}
++				p, err := Open(bytes.NewReader(data))
++				if err != nil {
++					t.Fatal(err)
++				}
++				var audio []uint32
++				var originals []uint32
++				video := 0
++				for _, media := range p.GetMedias() {
++					track, err := p.GetTrack(media, media.Codecs[0])
++					if err != nil {
++						t.Fatal(err)
++					}
++					if media.Kind == core.KindAudio {
++						track.Input = func(pkt *core.Packet) {
++							audio = append(audio, pkt.Timestamp)
++							if bytes.Equal(pkt.Payload, []byte{0x11, 0x22}) {
++								originals = append(originals, pkt.Timestamp)
++							}
++						}
++					} else {
++						track.Input = func(*core.Packet) { video++ }
++					}
++				}
++				if err = p.Start(); !errors.Is(err, io.EOF) {
++					t.Fatal(err)
++				}
++				expectedVideo := 140
++				if wholeCamera {
++					expectedVideo = 80
++				}
++				if video != expectedVideo {
++					t.Fatalf("video lost: %d", video)
++				}
++				if len(originals) != len(real) {
++					t.Fatalf("real audio lost: %d of %d", len(originals), len(real))
++				}
++				for i, ts := range real {
++					if originals[i] != ts {
++						t.Fatalf("source audio retimed: %v != %v", originals, real)
++					}
++				}
++				if wholeCamera {
++					if len(audio) != len(real) {
++						t.Fatalf("camera outage concealed with invented audio: %d vs %d", len(audio), len(real))
++					}
++					continue
++				}
++				for i := 1; i < len(audio); i++ {
++					if delta := int32(audio[i] - audio[i-1]); delta <= 0 || delta > 16000/2 {
++						t.Fatalf("audio clock stalled or overlapped at channels=%d: %v", channels, audio)
++					}
++				}
++			}
++		}
++	}
++}
+diff --git a/pkg/flv/producer.go b/pkg/flv/producer.go
+index cd3bed8..c24061a 100644
+--- a/pkg/flv/producer.go
++++ b/pkg/flv/producer.go
+@@ -76,6 +76,7 @@ func (c *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
+ }
+ 
+ func (c *Producer) Start() error {
++	var continuity audioContinuity
+ 	for {
+ 		pkt, err := c.readPacket()
+ 		if err != nil {
+@@ -109,11 +110,15 @@ func (c *Producer) Start() error {
+ 				continue
+ 			}
+ 
++			if !continuity.audio(c.audio, pkt.Timestamp) {
++				continue
++			}
+ 			pkt.Timestamp = TimeToRTP(pkt.Timestamp, c.audio.Codec.ClockRate)
+ 			pkt.Payload = pkt.Payload[2:]
+ 			c.audio.WriteRTP(pkt)
+ 
+ 		case TagVideo:
++			continuity.video(c.audio, pkt.Timestamp)
+ 			if c.video == nil {
+ 				continue
+ 			}

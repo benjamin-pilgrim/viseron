@@ -87,6 +87,13 @@ def test_recording_with_fresh_database(
         },
     )
     directory = Path(__file__).parent
+    if replacement := os.environ.get("VISERON_SMOKE_GO2RTC_BINARY"):
+        helpers.put_abs(
+            container,
+            "/usr/local/bin/go2rtc",
+            Path(replacement).read_bytes(),
+            mode=0o755,
+        )
     helpers.put_abs(
         container,
         "/config/config.yaml",
@@ -115,6 +122,22 @@ def test_recording_with_fresh_database(
         mode=0o755,
     )
     start = int(time.time()) - 2
+
+    def write_browser_target() -> None:
+        container.reload()
+        port = container.attrs["NetworkSettings"]["Ports"]["8888/tcp"][0]["HostPort"]
+        (artifact_dir / "browser-target.json").write_text(
+            json.dumps(
+                {
+                    "container": name,
+                    "image": image,
+                    "url": f"http://127.0.0.1:{port}",
+                    "start": start,
+                    "audioDropout": audio_dropout,
+                }
+            )
+        )
+
     previous_timeout = docker_client.api.timeout
     docker_client.api.timeout = 180
     try:
@@ -122,6 +145,8 @@ def test_recording_with_fresh_database(
         helpers.wait_for_log(
             container, r"Viseron initialized in [\d.]+ seconds", timeout=boot_timeout
         )
+        if keep:
+            write_browser_target()
         # /config belongs solely to this new container; no existing cluster or media
         # is mounted. API playback exercises fresh schema initialization and indexing.
         result = container.exec_run(
@@ -134,21 +159,7 @@ def test_recording_with_fresh_database(
         docker_client.api.timeout = previous_timeout
         (artifact_dir / f"{name}.log").write_bytes(container.logs())
         if keep:
-            container.reload()
-            port = container.attrs["NetworkSettings"]["Ports"]["8888/tcp"][0][
-                "HostPort"
-            ]
-            (artifact_dir / "browser-target.json").write_text(
-                json.dumps(
-                    {
-                        "container": name,
-                        "image": image,
-                        "url": f"http://127.0.0.1:{port}",
-                        "start": start,
-                        "audioDropout": audio_dropout,
-                    }
-                )
-            )
+            write_browser_target()
         else:
             container.stop(timeout=15)
             container.remove(force=True)

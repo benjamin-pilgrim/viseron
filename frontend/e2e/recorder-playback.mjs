@@ -11,11 +11,21 @@ if (!targetPath)
 const root = process.argv[3] ?? path.dirname(path.resolve(targetPath));
 await fs.mkdir(root, { recursive: true });
 const target = JSON.parse(await fs.readFile(targetPath, "utf8"));
-const response = await fetch(
-  `${target.url}/api/v1/hls/late_audio/index.m3u8?start_timestamp=${target.start}&end_timestamp=${Math.floor(Date.now() / 1000)}`,
-);
-if (!response.ok) throw new Error(`playlist ${response.status}`);
-const playlist = await response.text();
+let playlist;
+const playlistDeadline = Date.now() + 30000;
+while (Date.now() < playlistDeadline) {
+  const response = await fetch(
+    `${target.url}/api/v1/hls/late_audio/index.m3u8?start_timestamp=${target.start}&end_timestamp=${Math.floor(Date.now() / 1000)}`,
+  );
+  const body = await response.text();
+  if (response.ok && body.includes("#EXTINF:")) {
+    playlist = body;
+    break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+}
+if (!playlist)
+  throw new Error("No recorded fragments available after 30 seconds");
 await fs.writeFile(`${root}/playlist.m3u8`, playlist);
 let init,
   initial,
