@@ -134,6 +134,7 @@ def test_recording_with_fresh_database(
                     "url": f"http://127.0.0.1:{port}",
                     "start": start,
                     "audioDropout": audio_dropout,
+                    "relayOverride": bool(replacement),
                 }
             )
         )

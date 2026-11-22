@@ -2,13 +2,16 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 
-// Usage: CHROMIUM_PATH=/usr/bin/chromium node e2e/recorder-playback.mjs browser-target.json [artifact-directory]
+// Usage: CHROMIUM_PATH=/usr/bin/chromium node e2e/recorder-playback.mjs browser-target.json [artifact-directory] [--live]
 const targetPath = process.argv[2];
+const expectLiveOutage = process.argv.includes("--live");
 if (!targetPath)
   throw new Error(
     "Pass browser-target.json from the retained fresh-database test",
   );
-const root = process.argv[3] ?? path.dirname(path.resolve(targetPath));
+const root =
+  process.argv.slice(3).find((argument) => argument !== "--live") ??
+  path.dirname(path.resolve(targetPath));
 await fs.mkdir(root, { recursive: true });
 const target = JSON.parse(await fs.readFile(targetPath, "utf8"));
 let playlist;
@@ -56,6 +59,8 @@ const page = await browser.newPage({
 });
 const report = {
   image: target.image,
+  relayOverride: target.relayOverride ?? false,
+  expectLiveOutage,
   boundary,
   audioDropout: target.audioDropout ?? false,
   firstTime,
@@ -167,7 +172,42 @@ try {
         (sample.wallTime - advancedAt) / 1000,
       );
   }
+  if (expectLiveOutage) {
+    const recordingPath = path.join(
+      path.dirname(path.resolve(targetPath)),
+      `${target.container}-recording.txt`,
+    );
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      try {
+        const recording = JSON.parse(await fs.readFile(recordingPath, "utf8"));
+        const start = recording.scenario?.started;
+        if (Number.isFinite(start)) {
+          report.outage = { start: start + 30, end: start + 50 };
+          break;
+        }
+      } catch {
+        // The recorder probe writes its result after audio has returned.
+      }
+      await page.waitForTimeout(1000);
+    }
+    report.playedDuringOutage =
+      report.outage !== undefined &&
+      report.samples.some(
+        (sample) =>
+          sample.wallTime / 1000 < report.outage.end &&
+          firstTime + sample.time > report.outage.start + 1 &&
+          sample.ready >= 2 &&
+          sample.frameGap < 2,
+      );
+    report.observedLiveOutage =
+      report.outage !== undefined &&
+      first.wallTime / 1000 < report.outage.start &&
+      last.wallTime / 1000 > report.outage.end &&
+      report.playedDuringOutage;
+  }
   report.passed =
+    (!expectLiveOutage || report.observedLiveOutage) &&
     report.pageErrors.length === 0 &&
     !report.console.some((x) => x.text.includes("HLSJS Error")) &&
     report.longestFreeze < 4 &&
