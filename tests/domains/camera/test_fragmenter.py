@@ -877,7 +877,7 @@ def test_extract_program_date_time() -> None:
 
 
 @pytest.mark.parametrize(
-    ("handler", "file", "m3u8", "expected_orig_ctime"),
+    ("handler", "file", "m3u8", "expected_orig_ctime", "expected_frame"),
     [
         pytest.param(
             "_handle_m4s",
@@ -886,19 +886,34 @@ def test_extract_program_date_time() -> None:
             datetime.datetime(
                 2024, 8, 8, 9, 59, 16, 199000, tzinfo=datetime.timezone.utc
             ),
+            "1723111156.jpg",
             id="encoder_program_date_time",
+        ),
+        pytest.param(
+            "_handle_m4s",
+            "1723111156_0000000003.m4s",
+            "#EXTINF:5.0,\n1723111156_0000000003.m4s\n",
+            datetime.datetime(2024, 8, 8, 9, 59, 16, tzinfo=datetime.timezone.utc),
+            "1723111156_0000000003.jpg",
+            id="sequenced_filename_epoch",
         ),
         pytest.param(
             "_handle_mp4",
             "1723111156.mp4",
             "#EXTINF:5.0,\nclip_1.m4s\n",
             datetime.datetime(2024, 8, 8, 9, 59, 16, tzinfo=datetime.timezone.utc),
+            "1723111156.jpg",
             id="mp4box_filename_epoch",
         ),
     ],
 )
 def test_timelapse_frame_metadata_uses_segment_orig_ctime(
-    handler: str, file: str, m3u8: str, expected_orig_ctime: datetime.datetime, tmp_path
+    handler: str,
+    file: str,
+    m3u8: str,
+    expected_orig_ctime: datetime.datetime,
+    expected_frame: str,
+    tmp_path,
 ) -> None:
     """The frame is inserted with its segment's timestamp, not the DB insert time."""
     (tmp_path / file).write_bytes(VALID_FRAGMENT)
@@ -934,14 +949,14 @@ def test_timelapse_frame_metadata_uses_segment_orig_ctime(
         mock_run.return_value.returncode = 0
         getattr(work, handler)(file)
 
-    frame_path = "/timelapse/test_camera/1723111156.jpg"
+    frame_path = f"/timelapse/test_camera/{expected_frame}"
     frame_metadata = order.output_queue.put.call_args.args[0]
     assert frame_metadata["path"] == frame_path
     assert frame_metadata["orig_ctime"] == expected_orig_ctime
     frame_meta = call.output_queue.put(frame_metadata)
     # The metadata must be registered before the file appears in the tier
     frame_move = call.shutil.move(
-        "/tmp/timelapse/test_camera/1723111156.jpg", frame_path
+        f"/tmp/timelapse/test_camera/{expected_frame}", frame_path
     )
     assert order.mock_calls.index(frame_meta) < order.mock_calls.index(frame_move)
     assert publish.call_args.args[-2] == expected_orig_ctime

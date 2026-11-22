@@ -1,5 +1,6 @@
 """Serve timed, synthetic camera streams for the full recorder integration test."""
 
+import argparse
 import http.server
 import itertools
 import json
@@ -12,6 +13,10 @@ import time
 
 def main() -> None:
     """Keep one video-only source and one late-audio source running until stopped."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audio-dropout", action="store_true")
+    args = parser.parse_args()
+    scenarios = {}
     with tempfile.TemporaryDirectory(prefix="flv-cameras-") as folder:
         fixture = pathlib.Path(folder) / "camera.flv"
         subprocess.run(
@@ -69,6 +74,13 @@ def main() -> None:
                 pass
 
             def do_GET(self):  # noqa: N802
+                if self.path == "/scenario":
+                    with lock:
+                        payload = json.dumps(scenarios).encode()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if self.path == "/stats":
                     with lock:
                         payload = json.dumps(counts).encode()
@@ -92,7 +104,10 @@ def main() -> None:
                         if tag[0] == 18:
                             tag = tag.replace(b"audiocodecid", b"xudiocodecid")
                     steady.append((timestamp, tag))
-                    if camera == "late_audio" and tag[0] == 8:
+                    if camera == "late_audio" and tag[0] == 8 and args.audio_dropout:
+                        if 30000 <= timestamp < 50000:
+                            continue
+                    elif camera == "late_audio" and tag[0] == 8:
                         if tag[12:13] == b"\x00":
                             timestamp = 15000
                         elif timestamp < 15000:
@@ -107,6 +122,11 @@ def main() -> None:
                 try:
                     self.wfile.write(header)
                     started = time.monotonic()
+                    with lock:
+                        scenarios[camera] = {
+                            "started": time.time(),
+                            "audio_dropout": args.audio_dropout,
+                        }
                     # AAC frames are 64 ms at this fixture's 16 kHz sample rate.
                     # Keep source clocks monotonic across loops; delay audio only
                     # on the first pass, rather than creating a recurring outage.

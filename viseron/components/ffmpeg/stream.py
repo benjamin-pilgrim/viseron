@@ -555,13 +555,13 @@ class Stream:
                 "-hls_list_size",
                 "10",
                 "-hls_flags",
-                "program_date_time+delete_segments",
+                "program_date_time+delete_segments+second_level_segment_index",
                 "-strftime",
                 "1",
                 "-hls_segment_filename",
                 os.path.join(
                     self._camera.temp_segments_folder,
-                    "%s.m4s",
+                    "%s_%%010d.m4s",
                 ),
             ]
             + self.encoder_codec_args()

@@ -34,6 +34,7 @@ ffmpeg:
       codec: h264
       audio_codec: null
       hwaccel_args: []
+      ffmpeg_loglevel: warning
       record_only: true
       recorder:
         codec: copy

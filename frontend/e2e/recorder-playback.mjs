@@ -30,7 +30,7 @@ for (const line of playlist.split("\n")) {
   if (line.startsWith("#EXTINF:"))
     offset += Number(line.slice(8).split(",")[0]);
 }
-if (boundary === undefined)
+if (boundary === undefined && !target.audioDropout)
   throw new Error("No init/track transition in playlist");
 const firstTime =
   Date.parse(playlist.match(/#EXT-X-PROGRAM-DATE-TIME:([^\n]+)/)[1]) / 1000;
@@ -47,6 +47,7 @@ const page = await browser.newPage({
 const report = {
   image: target.image,
   boundary,
+  audioDropout: target.audioDropout ?? false,
   firstTime,
   console: [],
   pageErrors: [],
@@ -110,7 +111,7 @@ try {
     { timeout: 45000 },
   );
   await page.screenshot({ path: `${root}/before.png` });
-  for (let i = 0; i < 35; i++) {
+  for (let i = 0; i < (target.audioDropout ? 65 : 35); i++) {
     const sample = await page
       .locator("video")
       .first()
@@ -162,20 +163,26 @@ try {
     report.longestFreeze < 4 &&
     report.maxFrameGap < 4 &&
     (last.audioBytes === null || last.audioBytes > 0) &&
-    first.time < boundary &&
-    last.time > boundary + 2 &&
+    (target.audioDropout
+      ? first.time < 10 && last.time > 55
+      : first.time < boundary && last.time > boundary + 2) &&
     last.frames > first.frames + 20 &&
     !last.error &&
-    new Set(
-      report.initRequests
-        .filter((x) => x.status === 200)
-        .map((x) => new URL(x.url).pathname),
-    ).size >= 2;
+    (target.audioDropout ||
+      new Set(
+        report.initRequests
+          .filter((x) => x.status === 200)
+          .map((x) => new URL(x.url).pathname),
+      ).size >= 2);
   if (!report.passed)
     throw new Error(
-      "Browser did not play the track/init transition without a prolonged freeze",
+      "Browser playback failed across the audio transition (see browser-report.json)",
     );
-  console.log("PASS browser playback crossed init/track change");
+  console.log(
+    target.audioDropout
+      ? "PASS browser playback continued through audio dropout and recovery"
+      : "PASS browser playback crossed init/track change",
+  );
 } finally {
   await fs.writeFile(
     `${root}/browser-report.json`,

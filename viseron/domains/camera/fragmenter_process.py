@@ -112,11 +112,12 @@ def _extract_program_date_time(
 def _get_orig_ctime(
     file: str, program_date_time: datetime.datetime | None
 ) -> datetime.datetime:
-    """Return the creation time of a segment named <epoch>.<ext>."""
+    """Use playlist timing, falling back to the epoch prefix of a segment name."""
     if program_date_time:
         return program_date_time
     return datetime.datetime.fromtimestamp(
-        int(file.split(".", maxsplit=1)[0]), tz=datetime.timezone.utc
+        int(file.split(".", maxsplit=1)[0].split("_", maxsplit=1)[0]),
+        tz=datetime.timezone.utc,
     )
 
 

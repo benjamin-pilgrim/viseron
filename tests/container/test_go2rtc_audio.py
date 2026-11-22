@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -59,6 +59,9 @@ def test_flv_audio_recording(
     assert command.rc == 0, f"{case}:\n{command.stdout}\n{command.stderr}"
 
 
+@pytest.mark.parametrize(
+    "audio_dropout", [False, True], ids=["late-audio", "audio-dropout"]
+)
 @pytest.mark.timeout(360)
 def test_recording_with_fresh_database(
     docker_client: Any,
@@ -66,6 +69,7 @@ def test_recording_with_fresh_database(
     artifact_dir: Path,
     boot_timeout: float,
     request: pytest.FixtureRequest,
+    audio_dropout: bool,
 ) -> None:
     """Index and serve playable video before and after audio returns on a fresh DB."""
     keep = request.config.getoption("--keep-container")
@@ -103,10 +107,16 @@ def test_recording_with_fresh_database(
     helpers.put_abs(
         container,
         "/etc/services.d/flv-source/run",
-        b"#!/bin/sh\nexec python3 /tmp/flv_camera_source.py\n",
+        (
+            "#!/bin/sh\nexec python3 /tmp/flv_camera_source.py"
+            + (" --audio-dropout" if audio_dropout else "")
+            + "\n"
+        ).encode(),
         mode=0o755,
     )
     start = int(time.time()) - 2
+    previous_timeout = docker_client.api.timeout
+    docker_client.api.timeout = 180
     try:
         container.start()
         helpers.wait_for_log(
@@ -116,10 +126,12 @@ def test_recording_with_fresh_database(
         # is mounted. API playback exercises fresh schema initialization and indexing.
         result = container.exec_run(
             ["python3", "/tmp/flv_recording_probe.py", "--start", str(start)]
+            + (["--audio-dropout"] if audio_dropout else [])
         )
         (artifact_dir / f"{name}-recording.txt").write_bytes(result.output)
         assert result.exit_code == 0, result.output.decode(errors="replace")
     finally:
+        docker_client.api.timeout = previous_timeout
         (artifact_dir / f"{name}.log").write_bytes(container.logs())
         if keep:
             container.reload()
@@ -133,6 +145,7 @@ def test_recording_with_fresh_database(
                         "image": image,
                         "url": f"http://127.0.0.1:{port}",
                         "start": start,
+                        "audioDropout": audio_dropout,
                     }
                 )
             )
@@ -153,4 +166,19 @@ def test_recorder_retry_and_shutdown(
         (Path(__file__).parent / "scripts" / script).read_bytes(),
     )
     result = image_host.run("env PYTHONPATH=/src python3 /tmp/recorder_retry_probe.py")
+    assert result.rc == 0, result.stdout + result.stderr
+
+
+def test_recorder_fragment_burst(
+    image_container: Any, image_host: testinfra.host.Host
+) -> None:
+    """Fragments flushed together must preserve all video."""
+    script = "recorder_fragment_burst.py"
+    helpers.put_file(
+        image_container,
+        "/tmp",
+        script,
+        (Path(__file__).parent / "scripts" / script).read_bytes(),
+    )
+    result = image_host.run("env PYTHONPATH=/src python3 /tmp/%s", script)
     assert result.rc == 0, result.stdout + result.stderr
