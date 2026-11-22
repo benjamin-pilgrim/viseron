@@ -1,4 +1,4 @@
-import Hls, { type HlsConfig } from "hls.js";
+import Hls, { type ErrorData, type HlsConfig } from "hls.js";
 import React from "react";
 
 import { getToken } from "lib/tokens";
@@ -163,6 +163,83 @@ export interface HlsErrorHandlerOptions {
   onReinitialize: () => void;
 }
 
+// A video-only fMP4 run and a muxed audio/video run require different MSE
+// buffer layouts. Keep the old buffer playable until the new run starts.
+function setupBufferLayoutRecovery(
+  hls: Hls,
+  hlsRef: React.MutableRefObject<Hls | null>,
+): (data: ErrorData) => boolean {
+  let activeBuffers = new Set<string>();
+  let incompatibleLayout = false;
+  let pending: { cancel: () => void } | null = null;
+
+  const cancel = () => {
+    pending?.cancel();
+    pending = null;
+  };
+  const reset = () => {
+    cancel();
+    activeBuffers.clear();
+    incompatibleLayout = false;
+  };
+  hls.on(Hls.Events.BUFFER_CREATED, (_event, data) => {
+    activeBuffers = new Set(Object.keys(data.tracks));
+  });
+  hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
+    incompatibleLayout =
+      activeBuffers.size > 0 &&
+      ["audio", "video", "audiovideo"].some(
+        (name) => name in data && !activeBuffers.has(name),
+      );
+  });
+  hls.on(Hls.Events.MEDIA_DETACHING, reset);
+  hls.on(Hls.Events.BUFFER_RESET, reset);
+  hls.on(Hls.Events.DESTROYING, reset);
+
+  return (data) => {
+    if (
+      !incompatibleLayout ||
+      data.details !== Hls.ErrorDetails.BUFFER_APPEND_ERROR
+    )
+      return false;
+    const media = hls.media;
+    const boundary = data.frag?.start;
+    if (!media || boundary === undefined || !Number.isFinite(boundary))
+      return false;
+    if (pending) return true;
+
+    const recover = (seeking = false) => {
+      if (hlsRef.current !== hls) {
+        cancel();
+        return;
+      }
+      if (!seeking && media.currentTime < boundary - 0.1 && !media.ended)
+        return;
+      const position = seeking
+        ? media.currentTime
+        : Math.max(media.currentTime, boundary);
+      const wasPlaying = !media.paused;
+      cancel();
+      hls.recoverMediaError();
+      seekMediaAndStartLoad(hls, media, position);
+      if (wasPlaying) media.play().catch(() => {});
+    };
+    const onTime = () => recover();
+    const onSeek = () => recover(true);
+    pending = {
+      cancel: () => {
+        media.removeEventListener("timeupdate", onTime);
+        media.removeEventListener("seeking", onSeek);
+      },
+    };
+    media.addEventListener("timeupdate", onTime);
+    media.addEventListener("seeking", onSeek);
+    hls.stopLoad();
+    recover();
+    return true;
+  };
+}
+
 // Sets up standardized error handling for an HLS.js instance.
 // Handles both recoverable and fatal errors with appropriate retry strategies.
 export function setupHlsErrorHandling(
@@ -206,8 +283,22 @@ export function setupHlsErrorHandling(
     }, 5000);
   };
 
+  const recoverLayout = setupBufferLayoutRecovery(hls, hlsRef);
+
   // Main error handler
   hls.on(Hls.Events.ERROR, (_event, data) => {
+    if (hlsRef.current !== hls) return;
+    // A seek intentionally cancels the previous request.
+    if (!data.fatal && data.details === Hls.ErrorDetails.INTERNAL_ABORTED)
+      return;
+    if (recoverLayout(data)) {
+      if (delayedRecoveryTimeoutRef.current) {
+        clearTimeout(delayedRecoveryTimeoutRef.current);
+        delayedRecoveryTimeoutRef.current = undefined;
+      }
+      setHlsRefsError(hlsRef, null);
+      return;
+    }
     // Check if this is an ignorable error
     if (!IGNORABLE_ERROR_DETAILS.has(data.details)) {
       console.log("HLSJS Error:", data);

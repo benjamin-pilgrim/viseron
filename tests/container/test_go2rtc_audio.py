@@ -130,6 +130,7 @@ def test_recording_with_fresh_database(
                 json.dumps(
                     {
                         "container": name,
+                        "image": image,
                         "url": f"http://127.0.0.1:{port}",
                         "start": start,
                     }

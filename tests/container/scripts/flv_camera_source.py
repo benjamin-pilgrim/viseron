@@ -82,6 +82,7 @@ def main() -> None:
                     return
                 with lock:
                     counts[camera] += 1
+                steady = []
                 selected = []
                 for timestamp, original in tags:
                     tag = original
@@ -90,7 +91,8 @@ def main() -> None:
                             continue
                         if tag[0] == 18:
                             tag = tag.replace(b"audiocodecid", b"xudiocodecid")
-                    elif tag[0] == 8:
+                    steady.append((timestamp, tag))
+                    if camera == "late_audio" and tag[0] == 8:
                         if tag[12:13] == b"\x00":
                             timestamp = 15000
                         elif timestamp < 15000:
@@ -105,9 +107,13 @@ def main() -> None:
                 try:
                     self.wfile.write(header)
                     started = time.monotonic()
+                    # AAC frames are 64 ms at this fixture's 16 kHz sample rate.
+                    # Keep source clocks monotonic across loops; delay audio only
+                    # on the first pass, rather than creating a recurring outage.
+                    period_ms = max(timestamp for timestamp, _tag in tags) + 64
                     for cycle in itertools.count():
-                        for timestamp, original in selected:
-                            timestamp += cycle * 60000
+                        for timestamp, original in selected if cycle == 0 else steady:
+                            timestamp += cycle * period_ms
                             delay = timestamp / 1000 - (time.monotonic() - started)
                             if delay > 0:
                                 time.sleep(delay)
