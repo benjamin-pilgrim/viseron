@@ -181,6 +181,37 @@ class MaxSize(Size):
     mb: float | None = Field(default=DEFAULT_MB, description=DESC_MAX_MB)
 
 
+class RecorderSize(Size):
+    """An absolute size or a percentage of the tier filesystem, per camera."""
+
+    percent: float | None = Field(
+        default=None,
+        gt=0,
+        le=100,
+        allow_inf_nan=False,
+        description="Percentage of total tier filesystem capacity, per camera.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_units(cls, value: Any) -> Any:
+        """Reject ambiguous units and booleans before numeric coercion."""
+        if isinstance(value, dict) and value.get("percent") is not None:
+            if isinstance(value["percent"], bool):
+                raise ValueError("Percentage must be a number")
+            if any(value.get(unit) is not None for unit in ("gb", "mb")):
+                raise ValueError("Use percent or gb/mb, not both")
+        return value
+
+
+class RecorderMinSize(RecorderSize, MinSize):
+    """Minimum retained recording size."""
+
+
+class RecorderMaxSize(RecorderSize, MaxSize):
+    """Maximum retained recording size."""
+
+
 class Age(ConfigModel):
     """An age. Days, hours and minutes are added together."""
 
@@ -287,6 +318,8 @@ class TierRetention(ConfigModel):
                 self.min_age.to_timedelta(),
                 self.min_size.to_bytes(),
                 self.max_age.to_timedelta(),
+                getattr(self.max_size, "percent", None),
+                getattr(self.min_size, "percent", None),
             )
         )
 
@@ -313,15 +346,66 @@ class Tier(ConfigModel):
     )
 
 
+class RecorderRetention(TierRetention):
+    """Recording retention with optional filesystem percentage sizes."""
+
+    min_size: Annotated[RecorderMinSize, NoneToDict] = Field(
+        default=DEFAULT_MIN_SIZE, validate_default=True, description=DESC_MIN_SIZE
+    )
+    max_size: Annotated[RecorderMaxSize, NoneToDict] = Field(
+        default=DEFAULT_MAX_SIZE, validate_default=True, description=DESC_MAX_SIZE
+    )
+
+
+class FullPolicy(ConfigModel):
+    """Choose emergency eviction priority; active events always stay protected."""
+
+    policy: Literal["oldest_first", "ordinary_first", "preserve_events"]
+
+
 class RecorderTier(Tier):
     """A recorder tier with separate rules for continuous and event recordings."""
 
-    continuous: Annotated[TierRetention, NoneToDict] = Field(
+    continuous: Annotated[RecorderRetention, NoneToDict] = Field(
         default=DEFAULT_CONTINUOUS, validate_default=True, description=DESC_CONTINUOUS
     )
-    events: Annotated[TierRetention, NoneToDict] = Field(
+    events: Annotated[RecorderRetention, NoneToDict] = Field(
         default=DEFAULT_EVENTS, validate_default=True, description=DESC_EVENTS
     )
+    promote_after: int | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        description=(
+            "Forward finalized footage after this many seconds, subject to "
+            "playback and pre-roll safety guards. Omit to use retention alone."
+        ),
+    )
+    promotion_batch_interval: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=(
+            "Quiet seconds after a completed verified promotion batch. "
+            "Space pressure flushes earlier. Requires promote_after."
+        ),
+    )
+    on_full: FullPolicy | None = Field(
+        default=None,
+        description=(
+            "Emergency policy when filesystem space or inodes run low. "
+            "Does not replace continuous/event retention limits."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_promotion(self) -> Self:
+        """Only explicit forwarding tiers may request batching."""
+        if self.promotion_batch_interval and self.promote_after is None:
+            raise ValueError("promotion_batch_interval requires promote_after")
+        if self.promote_after is not None and self.on_full is None:
+            self.on_full = FullPolicy(policy="preserve_events")
+        return self
 
 
 class SnapshotsTier(Tier, TierRetention):
@@ -587,6 +671,8 @@ def validate_tiers(config: dict[str, Any]) -> dict[str, Any]:
 
 def custom_convert(value) -> dict[str, str] | object:
     """Convert custom validators for the script gen_docs."""
+    if value is validate_recorder_size:
+        return {}
     if isinstance(value, CoerceEndsWithSlash):
         return {
             "type": "string",
@@ -611,9 +697,11 @@ class CoerceEndsWithSlash:
 
 def get_size_schema(
     age_type: Literal["min"] | Literal["max"],
+    *,
+    include_percent: bool = False,
 ) -> dict[vol.Optional, Maybe]:
     """Get size schema."""
-    return {
+    schema = {
         vol.Optional(
             CONFIG_GB,
             default=DEFAULT_GB,
@@ -625,6 +713,14 @@ def get_size_schema(
             description=DESC_MIN_MB if age_type == "min" else DESC_MAX_MB,
         ): Maybe(vol.Coerce(float)),
     }
+    if include_percent:
+        schema[
+            vol.Optional(
+                "percent",
+                description="Percentage of total tier filesystem capacity, per camera.",
+            )
+        ] = vol.All(vol.Coerce(float), vol.Range(min=0, max=100, min_included=False))
+    return schema
 
 
 def get_age_schema(
@@ -672,6 +768,31 @@ TIER_SCHEMA_BASE = vol.Schema(
             default=DEFAULT_MIN_AGE,
             description=DESC_MIN_AGE,
         ): get_age_schema("min"),
+    }
+)
+
+
+def validate_recorder_size(value: Any) -> Any:
+    """Apply the same unit checks before camera override coercion."""
+    try:
+        RecorderSize.model_validate(value)
+    except ValidationError as error:
+        raise vol.Invalid(format_validation_error(error)) from error
+    return value
+
+
+RECORDER_RETENTION_SCHEMA = TIER_SCHEMA_BASE.extend(
+    {
+        vol.Optional(
+            CONFIG_MAX_SIZE, default=DEFAULT_MAX_SIZE, description=DESC_MAX_SIZE
+        ): vol.All(
+            validate_recorder_size, get_size_schema("max", include_percent=True)
+        ),
+        vol.Optional(
+            CONFIG_MIN_SIZE, default=DEFAULT_MIN_SIZE, description=DESC_MIN_SIZE
+        ): vol.All(
+            validate_recorder_size, get_size_schema("min", include_percent=True)
+        ),
     }
 )
 
@@ -735,6 +856,23 @@ TIER_SCHEMA_SNAPSHOTS = TIER_SCHEMA_BASE.extend(
 
 TIER_SCHEMA_RECORDER = vol.Schema(
     {
+        vol.Optional(
+            "promote_after",
+            description=RecorderTier.model_fields["promote_after"].description,
+        ): Maybe(vol.All(int, vol.Range(min=0))),
+        vol.Optional(
+            "promotion_batch_interval",
+            description=RecorderTier.model_fields[
+                "promotion_batch_interval"
+            ].description,
+        ): vol.All(int, vol.Range(min=0)),
+        vol.Optional(
+            "on_full", description=RecorderTier.model_fields["on_full"].description
+        ): {
+            vol.Required("policy"): vol.In(
+                ("oldest_first", "ordinary_first", "preserve_events")
+            )
+        },
         vol.Required(
             CONFIG_PATH,
             description=DESC_PATH,
@@ -792,12 +930,12 @@ TIER_SCHEMA_RECORDER = vol.Schema(
             CONFIG_CONTINUOUS,
             default=DEFAULT_CONTINUOUS,
             description=DESC_CONTINUOUS,
-        ): vol.All(CoerceNoneToDict(), TIER_SCHEMA_BASE),
+        ): vol.All(CoerceNoneToDict(), RECORDER_RETENTION_SCHEMA),
         vol.Optional(
             CONFIG_EVENTS,
             default=DEFAULT_EVENTS,
             description=DESC_EVENTS,
-        ): vol.All(CoerceNoneToDict(), TIER_SCHEMA_BASE),
+        ): vol.All(CoerceNoneToDict(), RECORDER_RETENTION_SCHEMA),
     }
 )
 

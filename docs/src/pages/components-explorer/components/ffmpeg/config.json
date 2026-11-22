@@ -216,6 +216,52 @@
                         "values": [
                           [
                             {
+                              "type": "integer",
+                              "valueMin": 0,
+                              "name": "promote_after",
+                              "description": "Forward finalized footage after this many seconds, subject to playback and pre-roll safety guards. Omit to use retention alone.",
+                              "optional": true,
+                              "default": null
+                            },
+                            {
+                              "type": "integer",
+                              "valueMin": 0,
+                              "name": "promotion_batch_interval",
+                              "description": "Quiet seconds after a completed verified promotion batch. Space pressure flushes earlier. Requires promote_after.",
+                              "optional": true,
+                              "default": null
+                            },
+                            {
+                              "type": "map",
+                              "value": [
+                                {
+                                  "type": "select",
+                                  "options": [
+                                    {
+                                      "type": "constant",
+                                      "value": "oldest_first"
+                                    },
+                                    {
+                                      "type": "constant",
+                                      "value": "ordinary_first"
+                                    },
+                                    {
+                                      "type": "constant",
+                                      "value": "preserve_events"
+                                    }
+                                  ],
+                                  "name": "policy",
+                                  "description": null,
+                                  "required": true,
+                                  "default": null
+                                }
+                              ],
+                              "name": "on_full",
+                              "description": "Emergency policy when filesystem space or inodes run low. Does not replace continuous/event retention limits.",
+                              "optional": true,
+                              "default": null
+                            },
+                            {
                               "type": "string",
                               "name": "path",
                               "description": "Path to store files in. Cannot be <code>/tmp</code> or <code>/tmp/viseron</code>.",
@@ -301,52 +347,6 @@
                                   "type": "map",
                                   "value": [
                                     {
-                                      "type": "float",
-                                      "name": "gb",
-                                      "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    },
-                                    {
-                                      "type": "float",
-                                      "name": "mb",
-                                      "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    }
-                                  ],
-                                  "name": "min_size",
-                                  "description": "Minimum size of files to keep in this tier.",
-                                  "optional": true,
-                                  "default": {}
-                                },
-                                {
-                                  "type": "map",
-                                  "value": [
-                                    {
-                                      "type": "float",
-                                      "name": "gb",
-                                      "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    },
-                                    {
-                                      "type": "float",
-                                      "name": "mb",
-                                      "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    }
-                                  ],
-                                  "name": "max_size",
-                                  "description": "Maximum size of files to keep in this tier.",
-                                  "optional": true,
-                                  "default": {}
-                                },
-                                {
-                                  "type": "map",
-                                  "value": [
-                                    {
                                       "type": "integer",
                                       "name": "days",
                                       "description": "Max age in days.",
@@ -400,6 +400,70 @@
                                   ],
                                   "name": "min_age",
                                   "description": "Minimum age of files to keep in this tier.",
+                                  "optional": true,
+                                  "default": {}
+                                },
+                                {
+                                  "type": "map",
+                                  "value": [
+                                    {
+                                      "type": "float",
+                                      "name": "gb",
+                                      "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "name": "mb",
+                                      "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "valueMin": 0,
+                                      "valueMax": 100,
+                                      "name": "percent",
+                                      "description": "Percentage of total tier filesystem capacity, per camera.",
+                                      "optional": true,
+                                      "default": null
+                                    }
+                                  ],
+                                  "name": "max_size",
+                                  "description": "Maximum size of files to keep in this tier.",
+                                  "optional": true,
+                                  "default": {}
+                                },
+                                {
+                                  "type": "map",
+                                  "value": [
+                                    {
+                                      "type": "float",
+                                      "name": "gb",
+                                      "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "name": "mb",
+                                      "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "valueMin": 0,
+                                      "valueMax": 100,
+                                      "name": "percent",
+                                      "description": "Percentage of total tier filesystem capacity, per camera.",
+                                      "optional": true,
+                                      "default": null
+                                    }
+                                  ],
+                                  "name": "min_size",
+                                  "description": "Minimum size of files to keep in this tier.",
                                   "optional": true,
                                   "default": {}
                                 }
@@ -416,52 +480,6 @@
                                   "type": "map",
                                   "value": [
                                     {
-                                      "type": "float",
-                                      "name": "gb",
-                                      "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    },
-                                    {
-                                      "type": "float",
-                                      "name": "mb",
-                                      "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    }
-                                  ],
-                                  "name": "min_size",
-                                  "description": "Minimum size of files to keep in this tier.",
-                                  "optional": true,
-                                  "default": {}
-                                },
-                                {
-                                  "type": "map",
-                                  "value": [
-                                    {
-                                      "type": "float",
-                                      "name": "gb",
-                                      "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    },
-                                    {
-                                      "type": "float",
-                                      "name": "mb",
-                                      "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                                      "optional": true,
-                                      "default": null
-                                    }
-                                  ],
-                                  "name": "max_size",
-                                  "description": "Maximum size of files to keep in this tier.",
-                                  "optional": true,
-                                  "default": {}
-                                },
-                                {
-                                  "type": "map",
-                                  "value": [
-                                    {
                                       "type": "integer",
                                       "name": "days",
                                       "description": "Max age in days.",
@@ -515,6 +533,70 @@
                                   ],
                                   "name": "min_age",
                                   "description": "Minimum age of files to keep in this tier.",
+                                  "optional": true,
+                                  "default": {}
+                                },
+                                {
+                                  "type": "map",
+                                  "value": [
+                                    {
+                                      "type": "float",
+                                      "name": "gb",
+                                      "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "name": "mb",
+                                      "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "valueMin": 0,
+                                      "valueMax": 100,
+                                      "name": "percent",
+                                      "description": "Percentage of total tier filesystem capacity, per camera.",
+                                      "optional": true,
+                                      "default": null
+                                    }
+                                  ],
+                                  "name": "max_size",
+                                  "description": "Maximum size of files to keep in this tier.",
+                                  "optional": true,
+                                  "default": {}
+                                },
+                                {
+                                  "type": "map",
+                                  "value": [
+                                    {
+                                      "type": "float",
+                                      "name": "gb",
+                                      "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "name": "mb",
+                                      "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                                      "optional": true,
+                                      "default": null
+                                    },
+                                    {
+                                      "type": "float",
+                                      "valueMin": 0,
+                                      "valueMax": 100,
+                                      "name": "percent",
+                                      "description": "Percentage of total tier filesystem capacity, per camera.",
+                                      "optional": true,
+                                      "default": null
+                                    }
+                                  ],
+                                  "name": "min_size",
+                                  "description": "Minimum size of files to keep in this tier.",
                                   "optional": true,
                                   "default": {}
                                 }
@@ -2632,52 +2714,6 @@
                         "type": "map",
                         "value": [
                           {
-                            "type": "float",
-                            "name": "gb",
-                            "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                            "optional": true,
-                            "default": null
-                          },
-                          {
-                            "type": "float",
-                            "name": "mb",
-                            "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                            "optional": true,
-                            "default": null
-                          }
-                        ],
-                        "name": "min_size",
-                        "description": "Minimum size of files to keep in this tier.",
-                        "optional": true,
-                        "default": {}
-                      },
-                      {
-                        "type": "map",
-                        "value": [
-                          {
-                            "type": "float",
-                            "name": "gb",
-                            "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                            "optional": true,
-                            "default": null
-                          },
-                          {
-                            "type": "float",
-                            "name": "mb",
-                            "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                            "optional": true,
-                            "default": null
-                          }
-                        ],
-                        "name": "max_size",
-                        "description": "Maximum size of files to keep in this tier.",
-                        "optional": true,
-                        "default": {}
-                      },
-                      {
-                        "type": "map",
-                        "value": [
-                          {
                             "type": "integer",
                             "name": "days",
                             "description": "Max age in days.",
@@ -2731,6 +2767,70 @@
                         ],
                         "name": "min_age",
                         "description": "Minimum age of files to keep in this tier.",
+                        "optional": true,
+                        "default": {}
+                      },
+                      {
+                        "type": "map",
+                        "value": [
+                          {
+                            "type": "float",
+                            "name": "gb",
+                            "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "name": "mb",
+                            "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "valueMin": 0,
+                            "valueMax": 100,
+                            "name": "percent",
+                            "description": "Percentage of total tier filesystem capacity, per camera.",
+                            "optional": true,
+                            "default": null
+                          }
+                        ],
+                        "name": "max_size",
+                        "description": "Maximum size of files to keep in this tier.",
+                        "optional": true,
+                        "default": {}
+                      },
+                      {
+                        "type": "map",
+                        "value": [
+                          {
+                            "type": "float",
+                            "name": "gb",
+                            "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "name": "mb",
+                            "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "valueMin": 0,
+                            "valueMax": 100,
+                            "name": "percent",
+                            "description": "Percentage of total tier filesystem capacity, per camera.",
+                            "optional": true,
+                            "default": null
+                          }
+                        ],
+                        "name": "min_size",
+                        "description": "Minimum size of files to keep in this tier.",
                         "optional": true,
                         "default": {}
                       }
@@ -2747,52 +2847,6 @@
                         "type": "map",
                         "value": [
                           {
-                            "type": "float",
-                            "name": "gb",
-                            "description": "Min size in GB. Added together with <code>min_mb</code>.",
-                            "optional": true,
-                            "default": null
-                          },
-                          {
-                            "type": "float",
-                            "name": "mb",
-                            "description": "Min size in MB. Added together with <code>min_gb</code>.",
-                            "optional": true,
-                            "default": null
-                          }
-                        ],
-                        "name": "min_size",
-                        "description": "Minimum size of files to keep in this tier.",
-                        "optional": true,
-                        "default": {}
-                      },
-                      {
-                        "type": "map",
-                        "value": [
-                          {
-                            "type": "float",
-                            "name": "gb",
-                            "description": "Max size in GB. Added together with <code>max_mb</code>.",
-                            "optional": true,
-                            "default": null
-                          },
-                          {
-                            "type": "float",
-                            "name": "mb",
-                            "description": "Max size in MB. Added together with <code>max_gb</code>.",
-                            "optional": true,
-                            "default": null
-                          }
-                        ],
-                        "name": "max_size",
-                        "description": "Maximum size of files to keep in this tier.",
-                        "optional": true,
-                        "default": {}
-                      },
-                      {
-                        "type": "map",
-                        "value": [
-                          {
                             "type": "integer",
                             "name": "days",
                             "description": "Max age in days.",
@@ -2846,6 +2900,70 @@
                         ],
                         "name": "min_age",
                         "description": "Minimum age of files to keep in this tier.",
+                        "optional": true,
+                        "default": {}
+                      },
+                      {
+                        "type": "map",
+                        "value": [
+                          {
+                            "type": "float",
+                            "name": "gb",
+                            "description": "Max size in GB. Added together with <code>max_mb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "name": "mb",
+                            "description": "Max size in MB. Added together with <code>max_gb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "valueMin": 0,
+                            "valueMax": 100,
+                            "name": "percent",
+                            "description": "Percentage of total tier filesystem capacity, per camera.",
+                            "optional": true,
+                            "default": null
+                          }
+                        ],
+                        "name": "max_size",
+                        "description": "Maximum size of files to keep in this tier.",
+                        "optional": true,
+                        "default": {}
+                      },
+                      {
+                        "type": "map",
+                        "value": [
+                          {
+                            "type": "float",
+                            "name": "gb",
+                            "description": "Min size in GB. Added together with <code>min_mb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "name": "mb",
+                            "description": "Min size in MB. Added together with <code>min_gb</code>.",
+                            "optional": true,
+                            "default": null
+                          },
+                          {
+                            "type": "float",
+                            "valueMin": 0,
+                            "valueMax": 100,
+                            "name": "percent",
+                            "description": "Percentage of total tier filesystem capacity, per camera.",
+                            "optional": true,
+                            "default": null
+                          }
+                        ],
+                        "name": "min_size",
+                        "description": "Minimum size of files to keep in this tier.",
                         "optional": true,
                         "default": {}
                       }

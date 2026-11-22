@@ -309,9 +309,18 @@ def test_defaults() -> None:
             "tiers": [
                 {
                     **DEFAULT_TIER,
-                    "continuous": DEFAULT_RETENTION,
+                    "promote_after": None,
+                    "promotion_batch_interval": 0,
+                    "on_full": None,
+                    "continuous": {
+                        **DEFAULT_RETENTION,
+                        "min_size": {"gb": None, "mb": None, "percent": None},
+                        "max_size": {"gb": None, "mb": None, "percent": None},
+                    },
                     "events": {
                         **DEFAULT_RETENTION,
+                        "min_size": {"gb": None, "mb": None, "percent": None},
+                        "max_size": {"gb": None, "mb": None, "percent": None},
                         "max_age": {"days": 7, "hours": None, "minutes": None},
                     },
                 }

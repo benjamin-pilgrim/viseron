@@ -513,17 +513,10 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
-        assert files_to_move[0]["recording_id"] == -1
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["recording_id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["recording_id"] == 1
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[3]["recording_id"] == 1
-        assert files_to_move[3]["id"] == 7
-        assert files_to_move[4]["recording_id"] == -1
-        assert files_to_move[4]["id"] == 9
+        # The newest two events share segments: their union is 60 bytes.
+        # Only the oldest event crosses the 80-byte budget.
+        assert list(files_to_move["id"]) == [1, 3, 5, 7, 9, 23, 25, 27, 29]
+        assert list(files_to_move["recording_id"]) == [-1, 1, 1, 1, -1, -1, -1, -1, -1]
 
     def test_recordings_to_move_query_min_age(self) -> None:
         """Test recordings_to_move_query using max_bytes + min_age."""
@@ -589,25 +582,25 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
-        assert files_to_move[0]["recording_id"] == -1
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["recording_id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["recording_id"] == 1
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[3]["recording_id"] == 1
-        assert files_to_move[3]["id"] == 7
-        assert files_to_move[4]["recording_id"] == -1
-        assert files_to_move[4]["id"] == 9
+        # The retained newest event still owns the two shared segments
+        # at 35 and 40 seconds, even when the older event expires.
+        assert list(files_to_move["id"]) == [1, 3, 5, 7, 9, 11, 13, 23, 25, 27, 29]
+        assert list(files_to_move["recording_id"]) == [
+            -1,
+            1,
+            1,
+            1,
+            -1,
+            3,
+            3,
+            -1,
+            -1,
+            -1,
+            -1,
+        ]
 
     def test_recordings_to_move_query_min_bytes(self) -> None:
-        """Test recordings_to_move_query using max_age + min_bytes.
-
-        max_age only would return 13 segments, but min_bytes will make sure that
-        only the recordings that exceed a total storage space of 100 will be included,
-        for a total of 1 recording and 3 files to delete.
-        """
+        """Retain event footage below the 100-byte unique-file retention floor."""
         max_age_timestamp = (self._now + datetime.timedelta(seconds=26)).timestamp()
 
         files_data = load_tier(
@@ -633,21 +626,10 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 9
-        assert files_to_move[0]["recording_id"] == -1
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["recording_id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["recording_id"] == 1
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[3]["recording_id"] == 1
-        assert files_to_move[3]["id"] == 7
-        assert files_to_move[4]["recording_id"] == -1
-        assert files_to_move[4]["id"] == 9
-        assert files_to_move[5]["recording_id"] == -1
-        assert files_to_move[5]["id"] == 23
-        assert files_to_move[8]["recording_id"] == -1
-        assert files_to_move[8]["id"] == 29
+        # All three events occupy only 90 unique bytes, below the
+        # 100-byte floor. Only unassociated footage is disposable.
+        assert list(files_to_move["id"]) == [1, 9, 23, 25, 27, 29]
+        assert list(files_to_move["recording_id"]) == [-1, -1, -1, -1, -1, -1]
 
     def test_recordings_to_move_query_max_bytes_and_age(self) -> None:
         """Test recordings_to_move_query using max_bytes + max_age."""
@@ -675,29 +657,22 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
-        assert files_to_move[0]["recording_id"] == -1
-        assert files_to_move[0]["id"] == 1
-        assert files_to_move[1]["recording_id"] == 1
-        assert files_to_move[1]["id"] == 3
-        assert files_to_move[2]["recording_id"] == 1
-        assert files_to_move[2]["id"] == 5
-        assert files_to_move[3]["recording_id"] == 1
-        assert files_to_move[3]["id"] == 7
-        assert files_to_move[4]["recording_id"] == -1
-        assert files_to_move[4]["id"] == 9
-        assert files_to_move[5]["recording_id"] == 3
-        assert files_to_move[5]["id"] == 11
-        assert files_to_move[6]["recording_id"] == 3
-        assert files_to_move[6]["id"] == 13
-        assert files_to_move[7]["recording_id"] == 3
-        assert files_to_move[7]["id"] == 15
-        assert files_to_move[8]["recording_id"] == 3
-        assert files_to_move[8]["id"] == 17
-        assert files_to_move[9]["recording_id"] == -1
-        assert files_to_move[9]["id"] == 23
-        assert files_to_move[12]["recording_id"] == -1
-        assert files_to_move[12]["id"] == 29
+        # The 110-byte size budget retains the 90 unique event bytes.
+        # Age expiry removes older-only footage; newer shared footage stays.
+        assert list(files_to_move["id"]) == [1, 3, 5, 7, 9, 11, 13, 23, 25, 27, 29]
+        assert list(files_to_move["recording_id"]) == [
+            -1,
+            1,
+            1,
+            1,
+            -1,
+            3,
+            3,
+            -1,
+            -1,
+            -1,
+            -1,
+        ]
 
     def test_recordings_to_move_query_active_recording(self) -> None:
         """Test recordings_to_move_query where end_time is not set."""
@@ -730,7 +705,11 @@ class TestCheckTier(BaseTestWithRecordings):
             drain=False,
         )
 
-        assert len(files_to_move) == 13
+        # This fixture places later segments in the future: the open
+        # event covers the first segment at 5s. The unique event bytes stay
+        # under 80, leaving only eight unassociated segments eligible.
+        assert list(files_to_move["id"]) == [1, 5, 7, 9, 23, 25, 27, 29]
+        assert list(files_to_move["recording_id"]) == [-1, -1, -1, -1, -1, -1, -1, -1]
 
     def test_recordings_to_move_query_file_min_age_timestamp(self) -> None:
         """Test recordings_to_move_query using file_min_age_timestamp.

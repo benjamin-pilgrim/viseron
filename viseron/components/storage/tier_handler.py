@@ -66,6 +66,7 @@ from viseron.components.storage.models import (
     PostProcessorResults,
     Recordings,
 )
+from viseron.components.storage.promotion_batch import PromotionBatch
 from viseron.components.storage.storage_subprocess import (
     DataItem,
     DataItemCopyFile,
@@ -84,7 +85,11 @@ from viseron.components.storage.util import (
     is_storage_temp_file,
 )
 from viseron.components.webserver.const import COMPONENT as WEBSERVER_COMPONENT
-from viseron.const import VISERON_SIGNAL_LAST_WRITE, VISERON_SIGNAL_STOPPING
+from viseron.const import (
+    CAMERA_SEGMENT_DURATION,
+    VISERON_SIGNAL_LAST_WRITE,
+    VISERON_SIGNAL_STOPPING,
+)
 from viseron.domains.camera import FailedCamera
 from viseron.domains.camera.const import (
     CONFIG_CONTINUOUS_RECORDING,
@@ -108,6 +113,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.dml import ReturningDelete
     from watchdog.observers.api import BaseObserver
 
+    from viseron.components.storage.recording_policy import RecordingAction
     from viseron import Viseron
     from viseron.components.storage import Storage
     from viseron.components.storage.config import (
@@ -130,6 +136,7 @@ def _src_path(event: FileSystemEvent) -> str:
 
 
 LOGGER = logging.getLogger(__name__)
+PRESSURE_WARNING_INTERVAL = 60
 
 
 class TierHandler(FileSystemEventHandler):
@@ -215,6 +222,24 @@ class TierHandler(FileSystemEventHandler):
             )
             self._observer.start()
 
+        if (
+            category == "recorder"
+            and subcategory == "segments"
+            and (
+                getattr(tier, "promote_after", None) is not None
+                or getattr(tier, "on_full", None) is not None
+            )
+        ):
+            vis.background_scheduler.add_job(
+                self.check_tier,
+                "interval",
+                seconds=5,
+                kwargs={"force": True, "policy_only": True},
+                id=f"storage-policy-{camera.identifier}-{tier_id}",
+                max_instances=1,
+                coalesce=True,
+            )
+
     @property
     def tier(self) -> Tier:
         """Tier configuration."""
@@ -270,7 +295,7 @@ class TierHandler(FileSystemEventHandler):
         self._storage.cleanup_manager.run_job(CleanupJobNames.ORPHANED_FILES)
         self.check_tier(force=getattr(event.data, "force", False))
 
-    def check_tier(self, *, force: bool = False) -> None:
+    def check_tier(self, *, force: bool = False, policy_only: bool = False) -> None:
         """Check if file should be moved to next tier."""
         with self._check_tier_lock:
             if self._tier_check_in_progress:
@@ -293,8 +318,10 @@ class TierHandler(FileSystemEventHandler):
             self._tier_check_in_progress = True
 
         try:
+            item = self._create_dataitem(force=force)
+            item.policy_only = policy_only
             self._storage.tier_check_worker_send_command(
-                self._create_dataitem(force=force),
+                item,
                 self.on_check_tier_result,
             )
         except Exception:
@@ -327,7 +354,7 @@ class TierHandler(FileSystemEventHandler):
             )
             files_processed += 1
 
-    def _release_check_tier(self) -> None:
+    def _release_check_tier(self, *, advance_throttle: bool = True) -> None:
         """Advance the throttle and release the in-flight slot.
 
         The throttle is advanced on every reply, including no-op replies where
@@ -338,7 +365,8 @@ class TierHandler(FileSystemEventHandler):
         every file event send a fresh request.
         """
         with self._check_tier_lock:
-            self._time_of_last_call = utcnow()
+            if advance_throttle:
+                self._time_of_last_call = utcnow()
             self._tier_check_in_progress = False
 
     def _schedule_capacity_retry(self) -> None:
@@ -362,7 +390,7 @@ class TierHandler(FileSystemEventHandler):
     def on_check_tier_result(self, item: DataItem) -> None:
         """Handle the result of the check tier command."""
         if item.deferred:
-            self._release_check_tier()
+            self._release_check_tier(advance_throttle=not item.policy_only)
             self._schedule_capacity_retry()
             return
         if item.error:
@@ -371,8 +399,9 @@ class TierHandler(FileSystemEventHandler):
         # No payload to process: the subprocess throttled the job, a check was
         # already running for this camera, or the job was superseded in the dedup
         # queue. Release the slot immediately so the next event can send again.
-        if item.data is None or len(item.data) == 0:
-            self._release_check_tier()
+        if (item.data is None or len(item.data) == 0) and not item.recording_actions:
+            self._handle_recording_result(item)
+            self._release_check_tier(advance_throttle=not item.policy_only)
             return
 
         # Bind to a local so the closure below keeps the non-None narrowing.
@@ -381,12 +410,11 @@ class TierHandler(FileSystemEventHandler):
         def run() -> None:
             """Run in a thread to not block the output queue handler that calls this."""
             try:
-                self._check_tier(
-                    self._storage.get_session,
-                    data,
-                )
+                self._handle_recording_result(item)
+                if data is not None and len(data):
+                    self._check_tier(self._storage.get_session, data)
             finally:
-                self._release_check_tier()
+                self._release_check_tier(advance_throttle=not item.policy_only)
 
         try:
             RestartableThread(
@@ -400,8 +428,11 @@ class TierHandler(FileSystemEventHandler):
             ).start()
         except Exception:
             # The thread never started, so run()'s finally will not fire.
-            self._release_check_tier()
+            self._release_check_tier(advance_throttle=not item.policy_only)
             raise
+
+    def _handle_recording_result(self, item: DataItem) -> None:
+        """Handle optional recorder policy results in the recorder subclass."""
 
     def _process_events(self) -> None:
         while True:
@@ -665,6 +696,19 @@ class SegmentsTierHandler(TierHandler):
     def initialize(self) -> None:
         """Initialize recorder tier."""
         self._path = get_segments_path(self._tier, self._camera)
+        if not hasattr(self._storage, "promotion_batches"):
+            self._storage.promotion_batches = {}
+        self._promotion_batch = self._storage.promotion_batches.setdefault(
+            os.path.normpath(self._tier.path), PromotionBatch()
+        )
+        self._promotion_member = f"{self._camera.identifier}:{self._tier_id}"
+        if self._tier.promote_after is not None or self._tier.on_full is not None:
+            self._promotion_batch.enabled = True
+        if self._tier.promote_after is not None:
+            self._promotion_batch.register(
+                self._promotion_member, self._tier.promotion_batch_interval
+            )
+        self._last_pressure_warning = 0.0
 
         continuous = self._tier.continuous
         self._continuous_max_bytes = continuous.max_size.to_bytes()
@@ -706,16 +750,26 @@ class SegmentsTierHandler(TierHandler):
             self._events_min_age,
         ]
 
-        self._events_enabled = any(self._events_params)
+        self._size_percentages = {
+            name: size.percent
+            for name, size in (
+                ("max_bytes", continuous.max_size),
+                ("min_bytes", continuous.min_size),
+                ("events_max_bytes", events.max_size),
+                ("events_min_bytes", events.min_size),
+            )
+            if size.percent is not None
+        }
+        self._events_enabled = any(self._events_params) or events.enabled
         self._continuous_configured = (
-            any(self._continuous_params)
-            and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
-        )
+            any(self._continuous_params) or continuous.enabled
+        ) and self._camera.config[CONFIG_RECORDER][CONFIG_CONTINUOUS_RECORDING]
 
         if (
             self._next_tier is None
             and not any(self._events_params)
             and not any(self._continuous_params)
+            and not self._size_percentages
         ):
             self._logger.warning(
                 "Last recorder tier '%s' has no retention (max_age/max_size) "
@@ -754,6 +808,21 @@ class SegmentsTierHandler(TierHandler):
 
     def _create_dataitem(self, *, force: bool = False) -> DataItem:
         """Create a DataItem for the check tier command."""
+        targets = {}
+        cutoff, requested, destination_failed = self._promotion_batch.request()
+        if self._tier.promote_after is not None or self._tier.on_full is not None:
+            for kind in ("continuous", "events"):
+                target = find_next_tier_segments(
+                    self._storage, self._tier_id, self._camera, kind
+                )
+                if target is not None:
+                    targets[kind] = (target.tier_id, target.tier.path)
+            requested.extend(
+                self._storage.camera_requested_files_count[
+                    self._camera.identifier
+                ].filenames
+            )
+            requested.extend(self._storage.temporary_moving_files)
         return DataItem(
             cmd="check_tier",
             camera_identifier=self._camera.identifier,
@@ -782,7 +851,105 @@ class SegmentsTierHandler(TierHandler):
             continuous_schedule=self._continuous_schedule_entries(),
             continuous_schedule_timezone=self._continuous_schedule_timezone(),
             continuous_lookback_seconds=self._camera.recorder.lookback,
+            size_percentages=dict(self._size_percentages),
+            size_path=self._path,
+            promote_after=self._tier.promote_after,
+            promotion_cutoff=cutoff,
+            promotion_targets=targets,
+            on_full=self._tier.on_full.policy if self._tier.on_full else None,
+            requested_paths=requested,
+            destination_failed=destination_failed,
             force=force,
+        )
+
+    def _handle_recording_result(self, item: DataItem) -> None:
+        """Apply verified moves and guarded pressure deletions from the worker."""
+        if item.error:
+            return
+        for action in item.recording_actions:
+            if (
+                action.src
+                in self._storage.camera_requested_files_count[
+                    self._camera.identifier
+                ].filenames
+            ):
+                continue
+            if action.operation == "delete":
+                if (
+                    action.src in self._storage.temporary_moving_files
+                    or not self._promotion_batch.reserve(action.src)
+                ):
+                    continue
+
+                def deleted(result: DataItemDeleteFile, path=action.src) -> None:
+                    self._promotion_batch.finish(
+                        path, not result.error and not result.deferred
+                    )
+
+                try:
+                    self._send_pressure_delete(item, action.src, deleted)
+                except Exception:
+                    self._promotion_batch.finish(action.src, False)
+                    raise
+                continue
+            self._promote_recording_action(action)
+        self._promotion_batch.checked(
+            self._promotion_member, item.recording_batch_complete
+        )
+        if (
+            item.physical_pressure
+            and not item.recording_actions
+            and time.monotonic() - self._last_pressure_warning
+            >= PRESSURE_WARNING_INTERVAL
+        ):
+            self._logger.warning(
+                "Recording storage is full; protected footage retained under %s policy",
+                item.on_full,
+            )
+            self._last_pressure_warning = time.monotonic()
+
+    def _send_pressure_delete(
+        self, item: DataItem, path: str, callback: Callable[[DataItemDeleteFile], None]
+    ) -> None:
+        """Queue a guarded delete while holding the shared path reservation."""
+        self._storage.tier_check_worker_send_command(
+            DataItemDeleteFile(
+                cmd="delete_file",
+                src=path,
+                camera_identifier=self._camera.identifier,
+                recording_policy=item.on_full,
+                protect_after=utcnow()
+                - timedelta(
+                    seconds=max(
+                        CAMERA_SEGMENT_DURATION * 5,
+                        self._camera.recorder.lookback + CAMERA_SEGMENT_DURATION * 2,
+                    )
+                ),
+            ),
+            callback=callback,
+        )
+
+    def _promote_recording_action(self, action: RecordingAction) -> None:
+        """Forward through the existing verified move and publication callback."""
+        destination = os.path.normpath(
+            os.path.join(
+                action.destination_path, os.path.relpath(action.src, action.tier_path)
+            )
+        )
+        move_file(
+            self._vis,
+            self._storage,
+            self._storage.get_session,
+            self._camera.identifier,
+            self._tier_id,
+            "recorder",
+            "segments",
+            action.src,
+            destination,
+            action.destination_path,
+            self._logger,
+            dst_tier_id=action.destination_tier,
+            batch=self._promotion_batch,
         )
 
     @property
@@ -1430,6 +1597,13 @@ def _is_recording_artifact(category: str, subcategory: str) -> bool:
     )
 
 
+def _recording_batch(storage: Storage, root: str) -> PromotionBatch | None:
+    """Find an enabled policy's shared in-flight reservations."""
+    batches = getattr(storage, "promotion_batches", {})
+    batch = batches.get(os.path.normpath(root)) if isinstance(batches, dict) else None
+    return batch if isinstance(batch, PromotionBatch) and batch.enabled else None
+
+
 def handle_file(
     vis: Viseron,
     get_session: Callable[..., Session],
@@ -1452,9 +1626,14 @@ def handle_file(
         logger.debug("File %s is recently requested, skipping", path)
         return
 
+    batch = _recording_batch(storage, curr_tier.path)
     if force_delete or next_tier is None:
+        if batch is not None and not batch.reserve(path):
+            return
 
         def on_delete(item: DataItemDeleteFile) -> None:
+            if batch is not None:
+                batch.finish(path, not item.error and not item.deferred)
             if not item.deferred:
                 return
             if _is_recording_artifact(curr_tier_category, curr_tier_subcategory):
@@ -1470,7 +1649,12 @@ def handle_file(
                     curr_tier_subcategory,
                 )
 
-        delete_file(storage, path, callback=on_delete)
+        try:
+            delete_file(storage, path, callback=on_delete)
+        except Exception:
+            if batch is not None:
+                batch.finish(path, False)
+            raise
         return
 
     new_path = os.path.normpath(path.replace(tier_path, next_tier.path, 1))
@@ -1505,6 +1689,7 @@ def handle_file(
         next_tier.path,
         logger,
         **({"dst_tier_id": next_tier_id} if next_tier_id is not None else {}),
+        **({"batch": batch} if batch is not None else {}),
     )
 
 
@@ -1523,6 +1708,38 @@ def delete_file(
     )
 
 
+def _notify_move_failure(callback: Callable[[bool], None] | None) -> None:
+    """Release a caller's in-flight reservation when an init copy cannot finish."""
+    if callback is not None:
+        callback(False)
+
+
+def _reserve_move(
+    batch: PromotionBatch | None, path: str, callback: Callable[[bool], None] | None
+) -> tuple[bool, Callable[[bool], None] | None]:
+    """Share reservations between normal retention and emergency operations."""
+    if batch is None:
+        return True, callback
+    if not batch.reserve(path):
+        return False, callback
+
+    def complete(success: bool) -> None:
+        batch.finish(path, success)
+        if callback is not None:
+            callback(success)
+
+    return True, complete
+
+
+def _send_move_command(storage: Storage, item, callback, on_complete) -> None:
+    """Release the reservation if worker admission raises before a callback."""
+    try:
+        storage.tier_check_worker_send_command(item, callback=callback)
+    except Exception:
+        _notify_move_failure(on_complete)
+        raise
+
+
 def move_file(
     vis: Viseron,
     storage: Storage,
@@ -1538,6 +1755,7 @@ def move_file(
     *,
     dst_tier_id: int | None = None,
     on_complete: Callable[[bool], None] | None = None,
+    batch: PromotionBatch | None = None,
 ) -> None:
     """Move file from src to dst.
 
@@ -1571,6 +1789,10 @@ def move_file(
             storage,
             src,
         )
+        return
+
+    accepted, on_complete = _reserve_move(batch, src, on_complete)
+    if not accepted:
         return
 
     def _commit_published_move(size: int) -> None:
@@ -1730,7 +1952,8 @@ def move_file(
                     dst_tier_path, TIER_SUBCATEGORY_EVENT_CLIPS, camera_identifier
                 )
             )
-        storage.tier_check_worker_send_command(
+        _send_move_command(
+            storage,
             DataItemMoveFile(
                 cmd="move_file",
                 src=src,
@@ -1738,10 +1961,12 @@ def move_file(
                 destination_root=destination_root,
             ),
             callback=_move_file_callback,
+            on_complete=on_complete,
         )
 
     def _copy_init_callback(item: DataItemCopyFile) -> None:
         if item.deferred or item.retryable_error:
+            _notify_move_failure(on_complete)
             _retry_tier(
                 storage,
                 camera_identifier,
@@ -1770,6 +1995,7 @@ def move_file(
                 item.src,
                 item.dst,
             )
+            _notify_move_failure(on_complete)
             return
         logger.error(
             "Skipping move from %s to %s because recorder segment sidecar %s "
@@ -1780,6 +2006,7 @@ def move_file(
             item.dst,
             item.error,
         )
+        _notify_move_failure(on_complete)
 
     if (
         _curr_tier_category == TIER_CATEGORY_RECORDER
@@ -1799,13 +2026,15 @@ def move_file(
             # any segment directory the playlist references. Copy it before
             # committing the segment move so a later-tier segment never becomes
             # visible without its sidecar.
-            storage.tier_check_worker_send_command(
+            _send_move_command(
+                storage,
                 DataItemCopyFile(
                     cmd="copy_file",
                     src=src_init,
                     dst=dst_init,
                 ),
                 callback=_copy_init_callback,
+                on_complete=on_complete,
             )
             return
 

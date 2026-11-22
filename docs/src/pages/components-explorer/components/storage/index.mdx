@@ -97,6 +97,90 @@ For technical reasons it is very likely that there will be a few extra megabytes
 
 :::
 
+### Percentage limits and promotion batches
+
+Recorder tiers accept `percent` under `continuous` and `events`, in either
+`max_size` or `min_size`. Use a percentage greater than zero and at most 100,
+or use the existing `gb`/`mb` units; do not mix them in one size rule.
+Percentages use the total capacity reported by the tier filesystem, resolved
+in the storage worker on each check. For a NAS share this may be the capacity
+of its backing filesystem, rather than a share-specific quota.
+
+Each camera has its own continuous and event retention rules. Percentages
+are not a shared reservation or an additional combined tier ceiling. Continuous
+footage can overlap event footage; overlapping events count shared segment
+bytes only once. Leave room for other cameras and other data on the filesystem.
+
+For example, this forwards eligible RAM footage in batches to the archive:
+
+```yaml
+storage:
+  recorder:
+    tiers:
+      - path: /ram
+        promote_after: 0
+        promotion_batch_interval: 60
+        continuous:
+          max_size:
+            percent: 40
+        events:
+          max_size:
+            percent: 20
+        on_full:
+          policy: preserve_events
+      - path: /archive
+        continuous:
+          max_size:
+            percent: 40
+        events:
+          max_size:
+            percent: 20
+        on_full:
+          policy: preserve_events
+```
+
+`promote_after` enables forwarding independently of normal retention expiry.
+Footage must still pass the playback/pre-roll safety window: at least five
+segment durations, or the camera lookback plus two segment durations if longer.
+The default batch interval is zero. A positive interval requires `promote_after`.
+Cameras using the same storage root share a fixed batch cutoff and a quiet
+interval starting after the final verified transfer completes. If their batch
+intervals differ, the shortest applies. Checks run every five seconds.
+
+Crossing a configured size budget or running low on physical space/inodes
+flushes eligible footage earlier, bypassing the optional cache delay and batch
+interval while retaining the playback/pre-roll safety window. A healthy archive is preferred over emergency
+source deletion. Copies retain their sources until byte verification and the
+destination database commit succeed. Normal retention, metadata repair,
+playback and asset transfers can still access the archive between batches;
+batching does not guarantee drive standby.
+
+### Full-filesystem behaviour
+
+`on_full.policy` configures emergency segment eviction for a recorder tier:
+
+- `oldest_first`: delete the oldest eligible segments, including closed events.
+- `ordinary_first`: delete ordinary footage before closed-event footage.
+- `preserve_events`: delete ordinary footage, retaining all event footage.
+
+Active events, recently requested playback files and the pre-roll/playback
+safety window remain protected under every policy. Emergency deletion rechecks
+space and event ownership before each file, stopping once space recovers.
+The guard reacts to low free space and exhausted inodes. Before each emergency
+deletion it checks for a free-space reserve of at least 16 MiB or twice the
+candidate segment size, whichever is greater.
+
+An unavailable or full destination permits emergency eviction only when the
+source filesystem itself is under pressure. Exceeding a retention budget alone
+does not authorize this fallback. If only protected footage remains, recording
+can fail for lack of space until space becomes available; `preserve_events`
+does not sacrifice those events to keep recording.
+
+These policies supplement the separate retention rules. They do not override
+configured event expiry. Omit `on_full` to keep the existing retention-only
+behaviour. Enabling `promote_after` defaults its emergency policy to
+`preserve_events` unless another policy is explicitly selected.
+
 ### Continuous (24/7) recordings
 
 To allocate space for continuous recordings for **all** cameras you use the `continuous` configuration option for a tier.

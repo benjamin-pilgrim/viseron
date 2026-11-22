@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -20,6 +21,12 @@ from viseron.components.storage.models import (
     FileLocationState,
     Files,
     Recordings,
+)
+from viseron.components.storage.recording_policy import (
+    event_coverage,
+    event_fence,
+    filesystem_pressure,
+    plan_recording_actions,
 )
 from viseron.components.storage.util import (
     copy_file_atomic,
@@ -341,7 +348,45 @@ class Worker:
             self._checks_in_progress[item.camera_identifier] = True
 
         try:
-            self._check_tier(item)
+            if item.size_percentages:
+                if item.size_path is None:
+                    raise ValueError("Percentage retention requires a capacity path")
+                filesystem = os.statvfs(item.size_path)
+                capacity = filesystem.f_blocks * filesystem.f_frsize
+                if capacity <= 0:
+                    raise ValueError("Unknown filesystem capacity")
+                for name, percent in item.size_percentages.items():
+                    if name not in (
+                        "max_bytes",
+                        "min_bytes",
+                        "events_max_bytes",
+                        "events_min_bytes",
+                    ):
+                        raise ValueError("Unknown retention size field")
+                    setattr(
+                        item, name, max(1, int(Decimal(str(percent)) * capacity / 100))
+                    )
+            if not item.policy_only:
+                self._check_tier(item)
+            if item.promote_after is not None or item.on_full is not None:
+                item.recording_actions = []
+                plan_recording_actions(self._get_session, item)
+            if item.category == "recorder" and item.data is not None and len(item.data):
+                with self._get_session() as session:
+                    protected = list(
+                        session.scalars(
+                            select(FileLocations.path)
+                            .select_from(Files)
+                            .join(FileLocations, FileLocations.file_id == Files.id)
+                            .where(
+                                *self._tier_files_filter(item),
+                                event_coverage(active_only=True),
+                            )
+                        )
+                    )
+                protected.extend(action.src for action in item.recording_actions)
+                protected.extend(item.requested_paths)
+                item.data = item.data[~np.isin(item.data["path"], protected)]
         finally:
             LOGGER.debug(
                 "Execution took %.2f seconds for %s tier %s category %s subcategory %s",
@@ -352,7 +397,8 @@ class Worker:
                 item.subcategories[0],
             )
             with self._check_locks[item.camera_identifier]:
-                self._last_call[item.throttle_key] = utcnow().timestamp()
+                if not item.policy_only:
+                    self._last_call[item.throttle_key] = utcnow().timestamp()
                 self._checks_in_progress[item.camera_identifier] = False
 
     def move_file(self, item: DataItemMoveFile) -> None:
@@ -385,6 +431,48 @@ class Worker:
     def delete_file(self, item: DataItemDeleteFile) -> None:
         """Delete file."""
         with self._file_lock(item.src):
+            if item.recording_policy is not None:
+                with self._get_session() as session:
+                    event_fence(session, item.camera_identifier or "")
+                    row = session.execute(
+                        select(
+                            Files.orig_ctime,
+                            FileLocations.size,
+                            event_coverage().label("event"),
+                            event_coverage(active_only=True).label("active"),
+                        )
+                        .select_from(Files)
+                        .join(FileLocations, FileLocations.file_id == Files.id)
+                        .where(
+                            FileLocations.path == item.src,
+                            Files.camera_identifier == item.camera_identifier,
+                            Files.category == "recorder",
+                            Files.subcategory == "segments",
+                            FileLocations.state == FileLocationState.AVAILABLE.value,
+                        )
+                    ).first()
+                    if (
+                        row is None
+                        or row.active
+                        or (item.recording_policy == "preserve_events" and row.event)
+                        or (
+                            item.protect_after is not None
+                            and row.orig_ctime >= item.protect_after
+                        )
+                        or not filesystem_pressure(
+                            os.path.dirname(item.src), max(16 * 1024**2, row.size * 2)
+                        )
+                    ):
+                        item.deferred = True
+                        return
+                    delete_file(self._get_session, item.src, LOGGER)
+                    LOGGER.info(
+                        "Recording pressure deletion: camera=%s path=%s policy=%s",
+                        item.camera_identifier,
+                        item.src,
+                        item.recording_policy,
+                    )
+                return
             delete_file(
                 self._get_session,
                 item.src,
@@ -817,6 +905,7 @@ def get_recordings_to_move(
 
     recordings_size = np.zeros(len(recordings_data), dtype=np.int64)
     associated_files_data_list = []
+    associated_file_ids_set: set[int] = set()
 
     for i, recording in enumerate(recordings_data):
         if files_data.size > 0:
@@ -847,10 +936,11 @@ def get_recordings_to_move(
                         file_row["tier_path"],
                     )
                 )
-                current_recording_total_size += file_row["size"]
+                file_id = int(file_row["id"])
+                if file_id not in associated_file_ids_set:
+                    current_recording_total_size += file_row["size"]
+                    associated_file_ids_set.add(file_id)
         recordings_size[i] = current_recording_total_size
-
-    associated_file_ids_set = {tup[1] for tup in associated_files_data_list}
 
     other_files_data_list = []
     if files_data.size > 0:
@@ -913,8 +1003,16 @@ def get_recordings_to_move(
 
         if recording_indices_to_move.size > 0:
             moved_recording_ids = recordings_data[recording_indices_to_move]["id"]
+            retained_file_ids = {
+                int(row["id"])
+                for row in recordings_files
+                if row["recording_id"] >= 0
+                and row["recording_id"] not in moved_recording_ids
+            }
             # Select files associated with these moved recordings
             for r_file in recordings_files:
+                if int(r_file["id"]) in retained_file_ids:
+                    continue
                 if r_file["recording_id"] in moved_recording_ids:
                     if r_file["orig_ctime"] <= file_min_age_timestamp:
                         files_to_move_list.append(r_file)

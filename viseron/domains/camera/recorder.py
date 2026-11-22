@@ -22,6 +22,7 @@ from viseron.components.storage.const import (
 from viseron.components.storage.files import upsert_file
 from viseron.components.storage.models import Recordings
 from viseron.components.storage.queries import get_recording_fragments
+from viseron.components.storage.recording_policy import event_fence
 from viseron.components.storage.thumbnails import (
     recover_recording_thumbnail,
     upsert_thumbnail_file,
@@ -350,6 +351,7 @@ class AbstractRecorder(ABC, RecorderBase):
         start_time = utcnow()
 
         with self._storage.get_session() as session:
+            event_fence(session, self._camera.identifier)
             stmt = (
                 insert(Recordings)
                 .values(

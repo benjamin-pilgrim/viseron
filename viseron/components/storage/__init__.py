@@ -58,6 +58,7 @@ from viseron.components.storage.const import (
     CleanupJobNames,
 )
 from viseron.components.storage.jobs import CleanupManager
+from viseron.components.storage.promotion_batch import PromotionBatch
 from viseron.components.storage.models import (
     Base,
     Files,
@@ -279,6 +280,7 @@ class Storage:
 
         self.temporary_files_meta: dict[str, FilesMeta] = {}
         self.temporary_moving_files: set[str] = set()
+        self.promotion_batches: dict[str, PromotionBatch] = {}
 
         self.cleanup_manager = CleanupManager(vis, self)
         self.cleanup_manager.start()

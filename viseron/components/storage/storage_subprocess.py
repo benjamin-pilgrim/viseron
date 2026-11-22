@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from viseron import Viseron
+    from viseron.components.storage.recording_policy import RecordingAction
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -72,6 +73,18 @@ class DataItem:
     error: str | None = None
     deferred: bool = False
     force: bool = False
+    size_percentages: dict[str, float] = field(default_factory=dict)
+    size_path: str | None = None
+    promote_after: int | None = None
+    promotion_cutoff: datetime.datetime | None = None
+    promotion_targets: dict[str, tuple[int, str]] = field(default_factory=dict)
+    on_full: str | None = None
+    destination_failed: bool = False
+    requested_paths: list[str] = field(default_factory=list)
+    recording_actions: list[RecordingAction] = field(default_factory=list)
+    recording_batch_complete: bool = False
+    physical_pressure: bool = False
+    policy_only: bool = False
 
     @property
     def throttle_key(self) -> str:
@@ -129,6 +142,9 @@ class DataItemDeleteFile:
     coalesced_callback_ids: list[str] = field(default_factory=list)
     error: str | None = None
     deferred: bool = False
+    recording_policy: str | None = None
+    camera_identifier: str | None = None
+    protect_after: datetime.datetime | None = None
 
 
 FileOperation: TypeAlias = DataItemCopyFile | DataItemDeleteFile | DataItemMoveFile
