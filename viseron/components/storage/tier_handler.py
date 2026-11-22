@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     import numpy as np
     from sqlalchemy.orm import Session
     from sqlalchemy.sql.dml import ReturningDelete
+    from watchdog.observers.api import BaseObserver
 
     from viseron import Viseron
     from viseron.components.storage import Storage
@@ -189,17 +190,30 @@ class TierHandler(FileSystemEventHandler):
 
         self._logger.debug("Tier %s monitoring path: %s", tier_id, self._path)
         os.makedirs(self._path, exist_ok=True)
-        self._observer = (
-            PollingObserverVFS(stat=os.stat, listdir=os.scandir, polling_interval=1)
-            if tier.poll
-            else Observer()
-        )
-        self._observer.schedule(
-            self,
-            self._path,
-            recursive=True,
-        )
-        self._observer.start()
+        self._observer: BaseObserver | None = None
+        # With one writer per storage root, completed transfers commit archive
+        # locations directly. Startup reference repair probes known DB paths.
+        # Watching the archive would repeatedly enumerate all historical footage.
+        if not (
+            tier_id > 0
+            and category == TIER_CATEGORY_RECORDER
+            and subcategory == TIER_SUBCATEGORY_SEGMENTS
+        ):
+            self._observer = (
+                PollingObserverVFS(
+                    stat=os.stat,
+                    listdir=os.scandir,
+                    polling_interval=tier.poll_interval,
+                )
+                if tier.poll
+                else Observer()
+            )
+            self._observer.schedule(
+                self,
+                self._path,
+                recursive=True,
+            )
+            self._observer.start()
 
     @property
     def tier(self) -> Tier:
@@ -600,8 +614,9 @@ class TierHandler(FileSystemEventHandler):
             pending_update.join()
         self._event_queue.put(None)
         self._event_thread.join()
-        self._observer.stop()
-        self._observer.join()
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join()
 
 
 class RetentionTierHandler(TierHandler):

@@ -45,6 +45,7 @@ from .const import (
     CONFIG_FFMPEG_RECOVERABLE_ERRORS,
     CONFIG_FFPROBE_LOGLEVEL,
     CONFIG_FPS,
+    CONFIG_FPS_BEFORE_FILTERS,
     CONFIG_FRAME_TIMEOUT,
     CONFIG_GLOBAL_ARGS,
     CONFIG_HEIGHT,
@@ -79,6 +80,7 @@ from .const import (
     DEFAULT_FFMPEG_RECOVERABLE_ERRORS,
     DEFAULT_FFPROBE_LOGLEVEL,
     DEFAULT_FPS,
+    DEFAULT_FPS_BEFORE_FILTERS,
     DEFAULT_FRAME_TIMEOUT,
     DEFAULT_GLOBAL_ARGS,
     DEFAULT_HEIGHT,
@@ -107,6 +109,7 @@ from .const import (
     DESC_FFMPEG_RECOVERABLE_ERRORS,
     DESC_FFPROBE_LOGLEVEL,
     DESC_FPS,
+    DESC_FPS_BEFORE_FILTERS,
     DESC_FRAME_TIMEOUT,
     DESC_GLOBAL_ARGS,
     DESC_HEIGHT,
@@ -279,6 +282,11 @@ _camera_schema_with_stream = BASE_CAMERA_CONFIG_SCHEMA.extend(STREAM_SCEHMA_DICT
 
 CAMERA_SCHEMA = _camera_schema_with_stream.extend(
     {
+        vol.Optional(
+            CONFIG_FPS_BEFORE_FILTERS,
+            default=DEFAULT_FPS_BEFORE_FILTERS,
+            description=DESC_FPS_BEFORE_FILTERS,
+        ): bool,
         vol.Required(CONFIG_HOST, description=DESC_HOST): str,
         vol.Optional(
             CONFIG_USERNAME, default=DEFAULT_USERNAME, description=DESC_USERNAME

@@ -10,6 +10,7 @@ import pytest
 import voluptuous as vol
 from pydantic_core import PydanticCustomError
 
+from viseron.components.ffmpeg.camera import CAMERA_SCHEMA
 from viseron.components.storage import CONFIG_SCHEMA
 from viseron.components.storage.config import (
     MaxAge,
@@ -289,6 +290,7 @@ DEFAULT_RETENTION = {
 DEFAULT_TIER = {
     "path": "/",
     "poll": False,
+    "poll_interval": 1,
     "move_on_shutdown": False,
     "drain": False,
     "check_interval": {"days": 0, "hours": 0, "minutes": 1, "seconds": 0},
@@ -624,3 +626,22 @@ def test_validate_camera_tiers() -> None:
                 }
             }
         )
+
+
+@pytest.mark.parametrize("section", ["recorder", "snapshots"])
+@pytest.mark.parametrize("interval", [0.25, 30])
+def test_camera_storage_accepts_poll_interval(section, interval):
+    """Per-camera tiers accept the same polling intervals as global tiers."""
+    config = CAMERA_SCHEMA(
+        {
+            "host": "127.0.0.1",
+            "name": "Camera",
+            "port": 8554,
+            "path": "/camera",
+            "storage": {
+                section: {"tiers": [{"path": "/archive", "poll_interval": interval}]}
+            },
+        }
+    )
+    validate_tiers(config)
+    assert config["storage"][section]["tiers"][0]["poll_interval"] == interval

@@ -230,6 +230,14 @@
                               "default": false
                             },
                             {
+                              "type": "float",
+                              "valueMin": 0,
+                              "name": "poll_interval",
+                              "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                              "optional": true,
+                              "default": 1
+                            },
+                            {
                               "type": "boolean",
                               "name": "move_on_shutdown",
                               "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -667,6 +675,14 @@
                               "default": false
                             },
                             {
+                              "type": "float",
+                              "valueMin": 0,
+                              "name": "poll_interval",
+                              "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                              "optional": true,
+                              "default": 1
+                            },
+                            {
                               "type": "boolean",
                               "name": "move_on_shutdown",
                               "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -857,6 +873,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "float",
+                                  "valueMin": 0,
+                                  "name": "poll_interval",
+                                  "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1057,6 +1081,14 @@
                                   "default": false
                                 },
                                 {
+                                  "type": "float",
+                                  "valueMin": 0,
+                                  "name": "poll_interval",
+                                  "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                                  "optional": true,
+                                  "default": 1
+                                },
+                                {
                                   "type": "boolean",
                                   "name": "move_on_shutdown",
                                   "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1253,6 +1285,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "float",
+                                  "valueMin": 0,
+                                  "name": "poll_interval",
+                                  "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1453,6 +1493,14 @@
                                   "default": false
                                 },
                                 {
+                                  "type": "float",
+                                  "valueMin": 0,
+                                  "name": "poll_interval",
+                                  "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                                  "optional": true,
+                                  "default": 1
+                                },
+                                {
                                   "type": "boolean",
                                   "name": "move_on_shutdown",
                                   "description": "Move/delete files to the next tier when Viseron shuts down. Useful to not lose files when shutting down Viseron if using a RAM disk.",
@@ -1649,6 +1697,14 @@
                                   "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                                   "optional": true,
                                   "default": false
+                                },
+                                {
+                                  "type": "float",
+                                  "valueMin": 0,
+                                  "name": "poll_interval",
+                                  "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                                  "optional": true,
+                                  "default": 1
                                 },
                                 {
                                   "type": "boolean",
@@ -1853,6 +1909,14 @@
                               "description": "Poll the file system for new files. Much slower than non-polling but required for some file systems like NTFS mounts.",
                               "optional": true,
                               "default": false
+                            },
+                            {
+                              "type": "float",
+                              "valueMin": 0,
+                              "name": "poll_interval",
+                              "description": "Positive seconds between filesystem polls. Later recorder segment tiers use transfer metadata instead of recursive polling.",
+                              "optional": true,
+                              "default": 1
                             },
                             {
                               "type": "boolean",

@@ -32,6 +32,7 @@ from .const import (
     CONFIG_FFMPEG_RECOVERABLE_ERRORS,
     CONFIG_FFPROBE_LOGLEVEL,
     CONFIG_FPS,
+    CONFIG_FPS_BEFORE_FILTERS,
     CONFIG_GLOBAL_ARGS,
     CONFIG_HEIGHT,
     CONFIG_HOST,
@@ -583,7 +584,10 @@ class Stream:
         """Return filter arguments."""
         filters = self._config[CONFIG_VIDEO_FILTERS].copy()
         if self.output_fps < self.fps:
-            filters.append(f"fps={self.output_fps}")
+            if self._config.get(CONFIG_FPS_BEFORE_FILTERS, False):
+                filters.insert(0, f"fps={self.output_fps}")
+            else:
+                filters.append(f"fps={self.output_fps}")
 
         if filters:
             return [

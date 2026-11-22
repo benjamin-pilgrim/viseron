@@ -72,6 +72,13 @@ Viseron will not be able to detect new files and will not be able to gather file
 The first tier **cannot** be a network share/NTFS mount. Viseron will not be able to detect new files and will not be able to gather file metadata.
 The first tier should be a local disk or a RAM disk. The other tiers can be network shares/NTFS mounts.
 
+Use one active Viseron instance per storage root. Later recorder segment tiers
+are indexed by verified transfers and database reference repair rather than
+recursive filesystem watchers. Manage archived footage through Viseron;
+manually adding or deleting archived segments does not trigger watcher updates.
+`poll` and `poll_interval` still apply to first-tier segments, snapshots,
+thumbnails and event clips.
+
 :::
 
 When the `max_size` is hit the oldest files will be moved to the next tier.<br></br>

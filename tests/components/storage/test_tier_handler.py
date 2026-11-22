@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import errno
+import hashlib
 import logging
 import os
 import shutil
@@ -37,7 +38,11 @@ from viseron.components.storage.const import (
     TIER_SUBCATEGORY_OBJECT_DETECTOR,
     TIER_SUBCATEGORY_SEGMENTS,
 )
-from viseron.components.storage.files import upsert_file_at_location
+from viseron.components.storage.files import (
+    repair_file_locations,
+    resolve_file_id,
+    upsert_file_at_location,
+)
 from viseron.components.storage.models import (
     FileLocations,
     FileLocationState,
@@ -1515,7 +1520,7 @@ def _simulate_move(
     src_handler: TierHandler,
     dst_handler: TierHandler,
     filename: str,
-    observer_order: tuple[str, str],
+    observer_order: tuple[str, ...],
 ) -> None:
     """Run a move and both observers.
 
@@ -1535,6 +1540,7 @@ def _simulate_move(
 OBSERVER_ORDERS = [
     pytest.param(("created", "deleted"), id="created_first"),
     pytest.param(("deleted", "created"), id="deleted_first"),
+    pytest.param((), id="without_archive_notifications"),
 ]
 
 
@@ -1543,7 +1549,7 @@ def test_file_key_survives_move(
     vis: MockViseron,
     db_storage: Mock,
     tmp_path: Path,
-    observer_order: tuple[str, str],
+    observer_order: tuple[str, ...],
 ) -> None:
     """Test that the destination row inherits the file_key of the source row."""
     tier0, tier1 = _two_tiers(
@@ -1597,7 +1603,7 @@ def test_move_dispatches_file_created(
     vis: MockViseron,
     db_storage: Mock,
     tmp_path: Path,
-    observer_order: tuple[str, str],
+    observer_order: tuple[str, ...],
 ) -> None:
     """Test that the destination still announces the file once it is observed."""
     tier0, tier1 = _two_tiers(
@@ -1879,7 +1885,7 @@ def test_snapshot_references_follow_move(
     subcategory: str,
     model: SnapshotModel,
     values: dict[str, Any],
-    observer_order: tuple[str, str],
+    observer_order: tuple[str, ...],
 ) -> None:
     """Test that detector rows are re-pointed, not deleted, when a snapshot moves."""
     tier0, tier1 = _two_tiers(
@@ -1964,3 +1970,80 @@ def test_snapshot_references_untouched_on_move_failure(
     callback(DataItemMoveFile(cmd="move_file", src=src, dst=dst, error="boom"))
 
     assert _snapshot_paths(db_storage, model) == [src]
+
+
+def test_published_segment_recovery_uses_database_paths_without_archive_scan(
+    vis: MockViseron, db_storage: Mock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost move reply and volatile source loss retain the segment's public ID."""
+
+    ram = tmp_path / "ram"
+    nas = tmp_path / "nas"
+    src = ram / "segments" / "test" / "1.m4s"
+    dst = nas / "segments" / "test" / "1.m4s"
+    src.parent.mkdir(parents=True)
+    dst.parent.mkdir(parents=True)
+    src.write_bytes(b"verified camera segment")
+    init_bytes = b"matching init"
+    init_hash = hashlib.sha256(init_bytes).hexdigest()
+    source_init = src.parent / f"init-{init_hash}.mp4"
+    source_init.write_bytes(init_bytes)
+    published = upsert_file_at_location(
+        db_storage.get_session,
+        "test",
+        "recorder",
+        "segments",
+        0,
+        str(ram),
+        str(src),
+        duration=5.0,
+        hls_init_hash=init_hash,
+    )
+    assert published is not None
+    db_storage.camera_tier_handlers = {}
+    db_storage.configured_tier_paths.return_value = [str(ram), str(nas)]
+
+    def lose_segment_reply(item, callback):
+        Worker().work_input(item)
+        if not isinstance(item, DataItemMoveFile):
+            callback(item)
+
+    db_storage.tier_check_worker_send_command.side_effect = lose_segment_reply
+    move_file(
+        vis,
+        db_storage,
+        db_storage.get_session,
+        "test",
+        0,
+        "recorder",
+        "segments",
+        str(src),
+        str(dst),
+        str(nas),
+        logging.getLogger(__name__),
+    )
+    assert src.read_bytes() == dst.read_bytes()
+    src.unlink()  # A restarted instance has lost its volatile RAM tier.
+    source_init.unlink()
+
+    def forbidden_scan(_path):
+        raise AssertionError("recovery must probe known paths, not enumerate the NAS")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "scandir", forbidden_scan)
+        with db_storage.get_session() as session:
+            file = session.get(Files, published.file_id)
+            assert repair_file_locations(session, db_storage, file)
+            session.commit()
+        resolved = resolve_file_id(
+            db_storage.get_session, db_storage, published.file_id
+        )
+        assert resolved is not None
+        assert resolved.path == str(dst)
+        assert Path(resolved.path).read_bytes() == b"verified camera segment"
+    with db_storage.get_session() as session:
+        file = session.get(Files, published.file_id)
+        assert file.duration == 5.0
+        assert file.hls_init_hash == init_hash
+        assert (dst.parent / f"init-{init_hash}.mp4").read_bytes() == init_bytes
+        assert file.tier_id == 1

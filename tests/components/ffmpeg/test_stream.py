@@ -625,3 +625,35 @@ class TestStream:
                 },
             }
             assert stream.encoder_codec_args() == expected_cmd
+
+
+@pytest.mark.parametrize("before", [None, False, True])
+def test_detection_frame_reduction_order_leaves_recorder_unchanged(before):
+    """Detection can reduce expensive transforms without reducing saved video."""
+    options = {
+        "host": "127.0.0.1",
+        "port": 8554,
+        "path": "/camera",
+        "name": "Camera",
+        "width": 1920,
+        "height": 2560,
+        "fps": 30,
+        "codec": "h264",
+        "audio_codec": None,
+        "video_filters": ["transpose=1", "scale=1920:2560"],
+        "recorder": {"codec": "copy"},
+    }
+    if before is not None:
+        options["fps_before_filters"] = before
+    config = CAMERA_SCHEMA(options)
+    with patch.object(Stream, "create_symlink"):
+        stream = Stream(config, MockCamera(config=config), "test_camera")
+    stream.output_fps = 1
+    expected = (
+        ["fps=1", "transpose=1", "scale=1920:2560"]
+        if before
+        else ["transpose=1", "scale=1920:2560", "fps=1"]
+    )
+    assert stream.filter_args() == ["-vf", ",".join(expected)]
+    assert stream.encoder_codec_args() == ["-c:v", "copy"]
+    assert "-vf" not in stream.segment_args()

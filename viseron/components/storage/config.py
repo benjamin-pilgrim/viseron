@@ -35,6 +35,7 @@ from viseron.components.storage.const import (
     CONFIG_OBJECT_DETECTOR,
     CONFIG_PATH,
     CONFIG_POLL,
+    CONFIG_POLL_INTERVAL,
     CONFIG_RECORDER,
     CONFIG_SECONDS,
     CONFIG_SNAPSHOTS,
@@ -66,6 +67,7 @@ from viseron.components.storage.const import (
     DEFAULT_MOVE_ON_SHUTDOWN,
     DEFAULT_OBJECT_DETECTOR,
     DEFAULT_POLL,
+    DEFAULT_POLL_INTERVAL,
     DEFAULT_RECORDER,
     DEFAULT_RECORDER_TIERS,
     DEFAULT_SECONDS,
@@ -113,6 +115,7 @@ from viseron.components.storage.const import (
     DESC_OBJECT_DETECTOR,
     DESC_PATH,
     DESC_POLL,
+    DESC_POLL_INTERVAL,
     DESC_RECORDER,
     DESC_RECORDER_TIERS,
     DESC_SNAPSHOTS,
@@ -293,6 +296,12 @@ class Tier(ConfigModel):
 
     path: TierPath = Field(description=DESC_PATH)
     poll: bool = Field(default=DEFAULT_POLL, description=DESC_POLL)
+    poll_interval: float = Field(
+        default=DEFAULT_POLL_INTERVAL,
+        gt=0,
+        allow_inf_nan=False,
+        description=DESC_POLL_INTERVAL,
+    )
     move_on_shutdown: bool = Field(
         default=DEFAULT_MOVE_ON_SHUTDOWN, description=DESC_MOVE_ON_SHUTDOWN
     )
@@ -678,6 +687,11 @@ TIER_SCHEMA_SNAPSHOTS = TIER_SCHEMA_BASE.extend(
             description=DESC_POLL,
         ): bool,
         vol.Optional(
+            CONFIG_POLL_INTERVAL,
+            default=DEFAULT_POLL_INTERVAL,
+            description=DESC_POLL_INTERVAL,
+        ): vol.All(vol.Coerce(float), vol.Range(min=0, min_included=False)),
+        vol.Optional(
             CONFIG_MOVE_ON_SHUTDOWN,
             default=DEFAULT_MOVE_ON_SHUTDOWN,
             description=DESC_MOVE_ON_SHUTDOWN,
@@ -730,6 +744,11 @@ TIER_SCHEMA_RECORDER = vol.Schema(
             default=DEFAULT_POLL,
             description=DESC_POLL,
         ): bool,
+        vol.Optional(
+            CONFIG_POLL_INTERVAL,
+            default=DEFAULT_POLL_INTERVAL,
+            description=DESC_POLL_INTERVAL,
+        ): vol.All(vol.Coerce(float), vol.Range(min=0, min_included=False)),
         vol.Optional(
             CONFIG_MOVE_ON_SHUTDOWN,
             default=DEFAULT_MOVE_ON_SHUTDOWN,

@@ -91,6 +91,7 @@ DESC_COMPONENT = "Storage configuration."
 DEFAULT_COMPONENT: dict[str, Any] = {}
 CONFIG_PATH: Final = "path"
 CONFIG_POLL: Final = "poll"
+CONFIG_POLL_INTERVAL: Final = "poll_interval"
 CONFIG_MOVE_ON_SHUTDOWN: Final = "move_on_shutdown"
 CONFIG_DRAIN: Final = "drain"
 CONFIG_CHECK_INTERVAL: Final = "check_interval"
@@ -150,6 +151,7 @@ DEFAULT_LICENSE_PLATE_RECOGNITION: Final = None
 DEFAULT_MOTION_DETECTOR: Final = None
 
 DEFAULT_POLL = False
+DEFAULT_POLL_INTERVAL = 1
 DEFAULT_MOVE_ON_SHUTDOWN = False
 DEFAULT_DRAIN = False
 DEFAULT_CHECK_INTERVAL: Final = {
@@ -261,6 +263,10 @@ DESC_PATH = (
 DESC_POLL = (
     "Poll the file system for new files. "
     "Much slower than non-polling but required for some file systems like NTFS mounts."
+)
+DESC_POLL_INTERVAL = (
+    "Positive seconds between filesystem polls. Later recorder segment tiers "
+    "use transfer metadata instead of recursive polling."
 )
 DESC_MOVE_ON_SHUTDOWN = (
     "Move/delete files to the next tier when Viseron shuts down. "
