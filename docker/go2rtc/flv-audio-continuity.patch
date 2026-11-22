@@ -110,7 +110,7 @@ index 0000000..600dbfd
 +}
 diff --git a/pkg/flv/audio_continuity_test.go b/pkg/flv/audio_continuity_test.go
 new file mode 100644
-index 0000000..3fe2ceb
+index 0000000..d2a6d6f
 --- /dev/null
 +++ b/pkg/flv/audio_continuity_test.go
 @@ -0,0 +1,104 @@
@@ -156,7 +156,7 @@ index 0000000..3fe2ceb
 +						continue
 +					}
 +					tags = append(tags, tag{ts, TagAudio, []byte{0xaf, 1, 0x11, 0x22}})
-+					real = append(real, TimeToRTP(ts, 16000))
++					real = append(real, ts*16)
 +				}
 +				sort.SliceStable(tags, func(i, j int) bool { return tags[i].ts < tags[j].ts })
 +				for _, tag := range tags {
