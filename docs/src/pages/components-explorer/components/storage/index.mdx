@@ -79,6 +79,11 @@ manually adding or deleting archived segments does not trigger watcher updates.
 `poll` and `poll_interval` still apply to first-tier segments, snapshots,
 thumbnails and event clips.
 
+The first recorder tier must be available at startup. Later recorder tiers may
+be unavailable: recording continues locally, and transfers retry when the
+archive returns. Viseron creates camera directories inside an available tier
+root; it does not create a missing archive root as a substitute for a mount.
+
 :::
 
 When the `max_size` is hit the oldest files will be moved to the next tier.<br></br>
@@ -154,6 +159,11 @@ source deletion. Copies retain their sources until byte verification and the
 destination database commit succeed. Normal retention, metadata repair,
 playback and asset transfers can still access the archive between batches;
 batching does not guarantee drive standby.
+
+Prompt promotion also forwards closed-event thumbnails and clips, including
+clips created after their event ends. If a recording thumbnail disappears,
+requesting it regenerates a local thumbnail from retained footage. Without
+usable footage, the thumbnail request returns not found.
 
 ### Full-filesystem behaviour
 

@@ -422,6 +422,7 @@ class Worker:
                 item.src,
                 item.dst,
                 LOGGER,
+                destination_root=item.destination_root,
             )
             item.copied = result.copied
             item.published = result.published

@@ -83,6 +83,8 @@ from viseron.components.storage.util import (
     get_thumbnails_path,
     get_timelapse_path,
     is_storage_temp_file,
+    raise_if_directory_unavailable,
+    tier_destination_root,
 )
 from viseron.components.webserver.const import COMPONENT as WEBSERVER_COMPONENT
 from viseron.const import (
@@ -196,12 +198,27 @@ class TierHandler(FileSystemEventHandler):
         self._time_of_last_call = utcnow() - self._throttle_period
 
         self._logger.debug("Tier %s monitoring path: %s", tier_id, self._path)
-        os.makedirs(self._path, exist_ok=True)
         self._observer: BaseObserver | None = None
+        monitor_path = True
+        try:
+            if not self.first_tier and category == TIER_CATEGORY_RECORDER:
+                raise_if_directory_unavailable(
+                    tier_destination_root(tier.path, subcategory)
+                )
+            os.makedirs(self._path, exist_ok=True)
+        except OSError as error:
+            if self.first_tier:
+                raise
+            monitor_path = False
+            self._logger.warning(
+                "Tier %s unavailable at startup; transfers will retry: %s",
+                tier_id,
+                error,
+            )
         # With one writer per storage root, completed transfers commit archive
         # locations directly. Startup reference repair probes known DB paths.
         # Watching the archive would repeatedly enumerate all historical footage.
-        if not (
+        if monitor_path and not (
             tier_id > 0
             and category == TIER_CATEGORY_RECORDER
             and subcategory == TIER_SUBCATEGORY_SEGMENTS
@@ -943,7 +960,7 @@ class SegmentsTierHandler(TierHandler):
             self._camera.identifier,
             self._tier_id,
             "recorder",
-            "segments",
+            action.subcategory,
             action.src,
             destination,
             action.destination_path,
@@ -1281,26 +1298,24 @@ class ThumbnailTierHandler(TierHandler):
     def check_tier(self, *, force: bool = False) -> None:
         """Do nothing, as we don't want to move thumbnails."""
 
-    def _on_created(self, event: FileCreatedEvent) -> None:
-        src_path = _src_path(event)
+    def _on_created(self, event: FileCreatedEvent | FileMovedEvent) -> None:
+        src_path = self._event_path(event)
 
         try:
             thumbnail_file_id = upsert_thumbnail_file(
                 self._storage.get_session,
                 self._storage,
                 self._camera.identifier,
-                event.src_path,
+                src_path,
             )
             with self._storage.get_session() as session:
-                values: dict[str, str | int] = {"thumbnail_path": event.src_path}
+                values: dict[str, str | int] = {"thumbnail_path": src_path}
                 if thumbnail_file_id is not None:
                     values["thumbnail_file_id"] = thumbnail_file_id
 
                 stmt = (
                     update(Recordings)
-                    .where(
-                        Recordings.id == os.path.basename(event.src_path).split(".")[0]
-                    )
+                    .where(Recordings.id == os.path.basename(src_path).split(".")[0])
                     .values(**values)
                 )
                 session.execute(stmt)
@@ -1358,8 +1373,8 @@ class EventClipTierHandler(TierHandler):
     def check_tier(self, *, force: bool = False) -> None:
         """Do nothing, as we move event clips manually."""
 
-    def _update_clip_path(self, event: FileCreatedEvent) -> None:
-        src_path = _src_path(event)
+    def _update_clip_path(self, event: FileCreatedEvent | FileMovedEvent) -> None:
+        src_path = self._event_path(event)
 
         try:
             clip_file_id = upsert_file(
@@ -1368,10 +1383,10 @@ class EventClipTierHandler(TierHandler):
                 self._camera.identifier,
                 TIER_CATEGORY_RECORDER,
                 TIER_SUBCATEGORY_EVENT_CLIPS,
-                event.src_path,
+                src_path,
             )
             with self._storage.get_session() as session:
-                values: dict[str, str | int] = {"clip_path": event.src_path}
+                values: dict[str, str | int] = {"clip_path": src_path}
                 if clip_file_id is not None:
                     values["clip_file_id"] = clip_file_id
 
@@ -1791,6 +1806,7 @@ def move_file(
         )
         return
 
+    caller_handles_retry = on_complete is not None
     accepted, on_complete = _reserve_move(batch, src, on_complete)
     if not accepted:
         return
@@ -1885,9 +1901,10 @@ def move_file(
             storage.temporary_moving_files.discard(src)
             if item.retryable_error:
                 logger.warning("Retrying move from %s to %s: %s", src, dst, item.error)
-            if on_complete is not None:
-                on_complete(False)
-            elif _is_recording_artifact(_curr_tier_category, _curr_tier_subcategory):
+            _notify_move_failure(on_complete)
+            if caller_handles_retry:
+                return
+            if _is_recording_artifact(_curr_tier_category, _curr_tier_subcategory):
                 _defer_artifact(
                     get_session,
                     camera_identifier,
@@ -1942,16 +1959,7 @@ def move_file(
         moving_files = getattr(storage, "temporary_moving_files", None)
         if moving_files is not None:
             moving_files.add(src)
-        destination_root = None
-        if (
-            _curr_tier_category == TIER_CATEGORY_RECORDER
-            and _curr_tier_subcategory == TIER_SUBCATEGORY_EVENT_CLIPS
-        ):
-            destination_root = os.path.normpath(
-                os.path.join(
-                    dst_tier_path, TIER_SUBCATEGORY_EVENT_CLIPS, camera_identifier
-                )
-            )
+        destination_root = tier_destination_root(dst_tier_path, _curr_tier_subcategory)
         _send_move_command(
             storage,
             DataItemMoveFile(
@@ -2032,6 +2040,9 @@ def move_file(
                     cmd="copy_file",
                     src=src_init,
                     dst=dst_init,
+                    destination_root=tier_destination_root(
+                        dst_tier_path, _curr_tier_subcategory
+                    ),
                 ),
                 callback=_copy_init_callback,
                 on_complete=on_complete,

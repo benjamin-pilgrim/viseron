@@ -457,19 +457,20 @@ def _check_tiers(tiers: Iterable[tuple[str, MaxAge]], category: str) -> None:
     Rules:
     - Paths cannot be reserved paths.
     - The same path cannot be used twice.
-    - The path has to exist.
+    - The first recorder tier and all non-recorder paths have to exist.
     - max_age has to be greater than max_age of the previous tier.
     """
     paths: list[str] = []
     previous_max_age: timedelta | None = None
-    for path, max_age in tiers:
+    for index, (path, max_age) in enumerate(tiers):
         if os.path.normpath(path) in ["/tmp", TEMP_DIR]:
             raise _tier_error(path, "Tier {path} is a reserved path and cannot be used")
         if path in paths:
             raise _tier_error(path, "Tier {path} is defined multiple times")
         paths.append(path)
 
-        _check_path_exists(path, category)
+        if index == 0 or category != TIER_CATEGORY_RECORDER:
+            _check_path_exists(path, category)
 
         tier_max_age = max_age.to_timedelta()
         if (

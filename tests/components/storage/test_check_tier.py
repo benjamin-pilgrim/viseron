@@ -25,7 +25,11 @@ from viseron.components.storage.check_tier import (
     load_tier,
 )
 from viseron.components.storage.models import Recordings
-from viseron.components.storage.storage_subprocess import DataItem, DataItemMoveFile
+from viseron.components.storage.storage_subprocess import (
+    DataItem,
+    DataItemCopyFile,
+    DataItemMoveFile,
+)
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_active
 
@@ -1585,3 +1589,27 @@ class TestCheckTierIntegration(BaseTestWithRecordings):
         assert item.data is not None
         assert len(item.data) == len(expected)
         assert list(item.data["id"]) == list(expected["id"])
+
+
+def test_copy_initializes_child_directories_only_under_available_root(tmp_path):
+    """A recovered archive creates its namespace without creating a missing mount."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"verified init")
+    root = tmp_path / "archive"
+    root.mkdir()
+    target = root / "segments" / "camera" / "init.mp4"
+    item = DataItemCopyFile(cmd="copy_file", src=str(source), dst=str(target))
+    item.destination_root = str(root)
+    _file_worker().work_input(item)
+    assert item.published, item.error
+    assert target.read_bytes() == source.read_bytes()
+    missing_root = tmp_path / "not-mounted"
+    missing = DataItemCopyFile(
+        cmd="copy_file",
+        src=str(source),
+        dst=str(missing_root / "segments" / "init.mp4"),
+    )
+    missing.destination_root = str(missing_root)
+    _file_worker().work_input(missing)
+    assert not missing.published
+    assert not missing_root.exists()

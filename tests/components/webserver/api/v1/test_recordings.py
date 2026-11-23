@@ -113,6 +113,11 @@ class TestRecordingsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
 
         with (
             patch(
+                "viseron.components.storage._check_database_readiness",
+                return_value=True,
+            ),
+            patch("viseron.components.storage.Storage"),
+            patch(
                 (
                     "viseron.components.webserver.request_handler.ViseronRequestHandler."
                     "_get_camera"

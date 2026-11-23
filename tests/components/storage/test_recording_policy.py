@@ -74,6 +74,8 @@ def add_segment(get_session, root, name, age=120):
 def set_space(monkeypatch, root, destination, *, pressure=False, offline=False):
     """Control capacity observations independently of candidate selection."""
 
+    destination.mkdir(parents=True, exist_ok=True)
+
     def statvfs(path):
         if str(path).startswith(str(destination)) and offline:
             raise OSError("NAS offline")
@@ -302,6 +304,7 @@ def test_handler_passes_percentages_and_applies_verified_batch(
     """Actual tier handlers forward via verified worker results and stable file IDs."""
 
     ram, nas = tmp_path / "ram", tmp_path / "nas"
+    nas.mkdir()
     path = add_segment(get_db_session, ram, "old")
     (path.parent / "init.mp4").write_bytes(b"matching init")
     camera = MockCamera(identifier="camera")
@@ -419,3 +422,53 @@ def test_pressure_overrides_cache_delay_but_not_preroll(
     ]
     item.continuous_lookback_seconds = 600
     assert run_check(get_db_session, item) == []
+
+
+def test_prompt_promotion_includes_closed_event_assets(
+    get_db_session, tmp_path, monkeypatch
+):
+    """Moving footage early cannot strand a closed event's thumbnail and clip in RAM."""
+    ram, nas = tmp_path / "ram", tmp_path / "nas"
+    nas.mkdir()
+    now = datetime.datetime.now(datetime.UTC)
+    assets = []
+    for kind, name, age in (
+        ("thumbnails", "1.jpg", 120),
+        ("event_clips", "date/1.mp4", 60),
+    ):
+        path = ram / kind / "camera" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"closed event asset")
+        published = upsert_file_at_location(
+            get_db_session,
+            "camera",
+            "recorder",
+            kind,
+            0,
+            str(ram),
+            str(path),
+            orig_ctime=now - datetime.timedelta(seconds=age),
+        )
+        assets.append((path, published.file_id))
+    with get_db_session() as session:
+        session.add(
+            Recordings(
+                camera_identifier="camera",
+                start_time=now - datetime.timedelta(seconds=125),
+                adjusted_start_time=now - datetime.timedelta(seconds=130),
+                end_time=now - datetime.timedelta(seconds=100),
+                thumbnail_path=str(assets[0][0]),
+                thumbnail_file_id=assets[0][1],
+                clip_path=str(assets[1][0]),
+                clip_file_id=assets[1][1],
+            )
+        )
+        session.commit()
+    set_space(monkeypatch, ram, nas)
+    item = check_item(ram, nas)
+    item.promotion_cutoff = now
+    result = run_check(get_db_session, item)
+    assert [(action.src, action.subcategory) for action in result] == [
+        (str(assets[0][0]), "thumbnails"),
+        (str(assets[1][0]), "event_clips"),
+    ]

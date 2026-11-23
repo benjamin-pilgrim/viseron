@@ -204,6 +204,12 @@ def raise_if_directory_unavailable(directory: str) -> None:
         raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), directory)
 
 
+def tier_destination_root(tier_path: str, subcategory: str) -> str:
+    """Keep root-mounted categories distinct from a healthy container root."""
+    root = os.path.normpath(tier_path)
+    return os.path.join(root, subcategory) if root == "/" else root
+
+
 def get_segments_path(tier: Tier, camera: AbstractCamera | FailedCamera) -> str:
     """Get segments path for camera."""
     return os.path.join(tier.path, TIER_SUBCATEGORY_SEGMENTS, camera.identifier)

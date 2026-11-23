@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from http import HTTPStatus
 from typing import cast
 
@@ -13,7 +14,7 @@ from viseron.components.storage.const import (
     TIER_CATEGORY_RECORDER,
     TIER_SUBCATEGORY_THUMBNAILS,
 )
-from viseron.components.storage.models import Files, Recordings
+from viseron.components.storage.models import Recordings
 from viseron.components.storage.thumbnails import (
     RecoveredThumbnail,
     recover_recording_thumbnail,
@@ -337,13 +338,20 @@ def _recover_recording_thumbnail(
         thumbnail_path = recording.thumbnail_path
         thumbnail_file_id = recording.thumbnail_file_id
 
-        if thumbnail_file_id is not None:
-            file = session.get(Files, thumbnail_file_id)
-            if file is not None:
-                return RecoveredThumbnail(path=file.path, file_id=thumbnail_file_id)
+    if thumbnail_file_id is not None:
+        resolved = resolve_file_id(
+            get_session,
+            storage,
+            thumbnail_file_id,
+            frozenset({(TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_THUMBNAILS)}),
+        )
+        if resolved is not None:
+            return RecoveredThumbnail(path=resolved.path, file_id=thumbnail_file_id)
 
-    if thumbnail_path is None:
-        return None
+    # Rebuild missing media in the local tier, including when the stale path
+    # points into an unavailable archive. A database row is not proof of bytes.
+    if thumbnail_path is not None and not os.path.exists(thumbnail_path):
+        thumbnail_path = None
 
     return recover_recording_thumbnail(
         storage,

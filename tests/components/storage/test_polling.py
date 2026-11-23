@@ -8,7 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from viseron.components.storage.config import RecorderTier, Tier
-from viseron.components.storage.tier_handler import SegmentsTierHandler, TierHandler
+from viseron.components.storage.tier_handler import (
+    SegmentsTierHandler,
+    TierHandler,
+    EventClipTierHandler,
+    ThumbnailTierHandler,
+)
 from viseron.const import VISERON_SIGNAL_STOPPING
 
 
@@ -97,3 +102,44 @@ def test_poll_interval_requires_finite_positive_seconds(interval):
 
     with pytest.raises(ValidationError):
         Tier(path="/recordings", poll_interval=interval)
+
+
+@pytest.mark.parametrize("missing_root", [False, True])
+@pytest.mark.parametrize("subcategory", ["segments", "thumbnails", "event_clips"])
+def test_later_recorder_tier_can_start_when_archive_is_unavailable(
+    vis, camera, tmp_path, monkeypatch, subcategory, missing_root
+):
+    """An unavailable archive must not prevent first-tier camera recording."""
+    classes = {
+        "segments": SegmentsTierHandler,
+        "thumbnails": ThumbnailTierHandler,
+        "event_clips": EventClipTierHandler,
+    }
+    real_makedirs = os.makedirs
+
+    def unavailable(path, *args, **kwargs):
+        if os.path.commonpath((str(tmp_path), str(path))) == str(tmp_path):
+            raise PermissionError("archive is offline")
+        return real_makedirs(path, *args, **kwargs)
+
+    if not missing_root:
+        monkeypatch.setattr(os, "makedirs", unavailable)
+    root = tmp_path / "offline" if missing_root else tmp_path
+    handler = None
+    try:
+        handler = classes[subcategory](
+            vis,
+            camera,
+            1,
+            "recorder",
+            subcategory,
+            RecorderTier(path=str(root)),
+            None,
+        )
+        if missing_root:
+            assert not root.exists()
+    finally:
+        if handler is not None:
+            for call in vis.register_signal_handler.call_args_list:
+                if call.args[0] == VISERON_SIGNAL_STOPPING:
+                    call.args[1]()

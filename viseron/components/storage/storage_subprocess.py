@@ -130,6 +130,7 @@ class DataItemCopyFile:
     published: bool = False
     source_missing: bool = False
     size: int | None = None
+    destination_root: str | None = None
 
 
 @dataclass

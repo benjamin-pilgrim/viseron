@@ -7,13 +7,17 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 
 from viseron.components.storage.models import (
     FileLocations,
     FileLocationState,
     Files,
     Recordings,
+)
+from viseron.components.storage.util import (
+    raise_if_directory_unavailable,
+    tier_destination_root,
 )
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.helpers import utcnow
@@ -38,6 +42,7 @@ class RecordingAction:
     tier_path: str
     destination_tier: int | None = None
     destination_path: str | None = None
+    subcategory: str = "segments"
 
 
 def event_fence(session: Session, camera: str) -> None:
@@ -51,12 +56,40 @@ def event_coverage(*, active_only: bool = False):
     """Find events overlapping the actual segment interval, counting each once."""
     predicates = [
         Recordings.camera_identifier == Files.camera_identifier,
-        Recordings.adjusted_start_time
-        <= Files.orig_ctime
-        + func.make_interval(
-            0, 0, 0, 0, 0, 0, func.coalesce(Files.duration, CAMERA_SEGMENT_DURATION)
+        or_(
+            and_(
+                Files.subcategory == "segments",
+                Recordings.adjusted_start_time
+                <= Files.orig_ctime
+                + func.make_interval(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    func.coalesce(Files.duration, CAMERA_SEGMENT_DURATION),
+                ),
+                or_(
+                    Recordings.end_time.is_(None),
+                    Recordings.end_time > Files.orig_ctime,
+                ),
+            ),
+            and_(
+                Files.subcategory == "thumbnails",
+                or_(
+                    Recordings.thumbnail_file_id == Files.id,
+                    Recordings.thumbnail_path == Files.path,
+                ),
+            ),
+            and_(
+                Files.subcategory == "event_clips",
+                or_(
+                    Recordings.clip_file_id == Files.id,
+                    Recordings.clip_path == Files.path,
+                ),
+            ),
         ),
-        or_(Recordings.end_time.is_(None), Recordings.end_time > Files.orig_ctime),
     ]
     if active_only:
         predicates.append(Recordings.end_time.is_(None))
@@ -82,7 +115,8 @@ def plan_recording_actions(get_session: Callable[[], Session], item: DataItem) -
         owned = (
             Files.camera_identifier == item.camera_identifier,
             Files.category == "recorder",
-            Files.subcategory == "segments",
+            Files.subcategory.in_(("segments", "thumbnails", "event_clips")),
+            or_(Files.subcategory == "segments", event_coverage()),
             FileLocations.tier_id == item.tier_id,
             FileLocations.state == FileLocationState.AVAILABLE.value,
         )
@@ -121,6 +155,7 @@ def plan_recording_actions(get_session: Callable[[], Session], item: DataItem) -
             select(
                 FileLocations.path,
                 FileLocations.tier_path,
+                Files.subcategory,
                 event_coverage().label("event"),
                 event_coverage(active_only=True).label("active"),
             )
@@ -147,9 +182,13 @@ def plan_recording_actions(get_session: Callable[[], Session], item: DataItem) -
                     target = continuous_target
             healthy = False
             if target is not None:
-                probe = os.path.join(target[1], "segments", item.camera_identifier)
+                probe = os.path.join(target[1], row.subcategory, item.camera_identifier)
                 if probe not in destination_health:
                     try:
+                        raise_if_directory_unavailable(
+                            tier_destination_root(target[1], row.subcategory)
+                        )
+                        os.makedirs(probe, exist_ok=True)
                         destination_health[probe] = not filesystem_pressure(
                             probe, max(MIN_FREE_BYTES, int(largest) * 2)
                         )
@@ -164,10 +203,17 @@ def plan_recording_actions(get_session: Callable[[], Session], item: DataItem) -
                 healthy = destination_health[probe] and not item.destination_failed
             if target is not None and healthy:
                 item.recording_actions.append(
-                    RecordingAction("move", row.path, row.tier_path, *target)
+                    RecordingAction(
+                        "move",
+                        row.path,
+                        row.tier_path,
+                        *target,
+                        subcategory=row.subcategory,
+                    )
                 )
             elif (
                 physical
+                and row.subcategory == "segments"
                 and item.on_full
                 and not row.active
                 and (item.on_full != "preserve_events" or not row.event)

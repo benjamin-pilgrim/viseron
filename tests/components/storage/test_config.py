@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,7 @@ from viseron.components.storage.config import (
     MaxSize,
     SnapshotsConfig,
     StorageRoot,
+    StorageConfig,
     TierRetention,
     _check_path_exists,
     validate_tiers,
@@ -654,3 +656,26 @@ def test_camera_storage_accepts_poll_interval(section, interval):
     )
     validate_tiers(config)
     assert config["storage"][section]["tiers"][0]["poll_interval"] == interval
+
+
+def test_missing_archive_root_does_not_block_local_recorder_config(
+    tmp_path, monkeypatch
+):
+    """A mounted local first tier can record while a later mount is absent."""
+    monkeypatch.setattr(
+        "viseron.components.storage.config.os.path.exists",
+        lambda path: Path(path).is_dir(),
+    )
+    missing = tmp_path / "absent-archive"
+    config = {
+        "recorder": {
+            "tiers": [
+                {"path": str(tmp_path), "events": {"max_age": {"days": 1}}},
+                {"path": str(missing), "events": {"max_age": {"days": 2}}},
+            ]
+        },
+        "snapshots": {"tiers": [{"path": str(tmp_path)}]},
+    }
+    validated = StorageConfig.model_validate(config)
+    assert validated.recorder.tiers[1].path == str(missing) + "/"
+    assert not missing.exists()

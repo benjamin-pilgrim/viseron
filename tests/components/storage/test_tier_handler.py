@@ -43,6 +43,7 @@ from viseron.components.storage.files import (
     resolve_file_id,
     upsert_file_at_location,
 )
+from viseron.components.storage.promotion_batch import PromotionBatch
 from viseron.components.storage.models import (
     FileLocations,
     FileLocationState,
@@ -818,13 +819,17 @@ class TestSegmentsTierHandler(BaseTestWithRecordings):
                 )
 
 
+@pytest.mark.parametrize("batch_enabled", [False, True])
 def test_deferred_artifact_operations_survive_retry_queue_restart(
-    vis: MockViseron, db_storage: Mock, tmp_path: Path
+    vis: MockViseron, db_storage: Mock, tmp_path: Path, batch_enabled: bool
 ) -> None:
     """The durable queue retains different operations for the same source."""
     db_storage.get_session = sessionmaker(bind=db_storage.get_session.kw["bind"])
     db_storage.camera_requested_files_count = {"test": Mock(filenames=set())}
     worker = db_storage.tier_check_worker_send_command
+    batch = PromotionBatch()
+    batch.enabled = batch_enabled
+    db_storage.promotion_batches = {str(tmp_path): batch}
     clip = Path("event_clips/test/2026-11-20/clip.mp4")
     src = _create_file(str(tmp_path / clip))
     archive = tmp_path / "archive"
@@ -2047,3 +2052,37 @@ def test_published_segment_recovery_uses_database_paths_without_archive_scan(
         assert file.hls_init_hash == init_hash
         assert (dst.parent / f"init-{init_hash}.mp4").read_bytes() == init_bytes
         assert file.tier_id == 1
+
+
+def test_thumbnail_atomic_rename_registers_final_filename(vis, db_storage, tmp_path):
+    """A JPEG published by atomic rename updates its event using the final filename."""
+    handler = _make_bare_tier_handler(
+        ThumbnailTierHandler,
+        vis,
+        db_storage,
+        0,
+        str(tmp_path),
+        "recorder",
+        "thumbnails",
+    )
+    db_storage.camera_tier_handlers = {"test": {"recorder": [{"thumbnails": handler}]}}
+    final = tmp_path / "thumbnails" / "test" / "1.jpg"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"published JPEG")
+    with db_storage.get_session() as session:
+        session.add(
+            Recordings(
+                id=1,
+                camera_identifier="test",
+                start_time=utcnow(),
+                adjusted_start_time=utcnow(),
+            )
+        )
+        session.commit()
+    handler._on_created(
+        FileMovedEvent(str(final.parent / ".viseron-tmp-1.jpg.abc.jpg"), str(final))
+    )
+    with db_storage.get_session() as session:
+        recording = session.get(Recordings, 1)
+        assert recording.thumbnail_path == str(final)
+        assert recording.thumbnail_file_id is not None
