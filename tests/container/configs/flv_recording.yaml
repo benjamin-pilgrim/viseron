@@ -3,13 +3,26 @@ logger:
 storage:
   recorder:
     tiers:
-      - path: /
+      - path: /ram
+        promote_after: 0
+        promotion_batch_interval: 60
         continuous:
-          max_age:
-            days: 1
+          max_size:
+            percent: 40
         events:
-          max_age:
-            days: 1
+          max_size:
+            percent: 20
+        on_full:
+          policy: preserve_events
+      - path: /archive
+        continuous:
+          max_size:
+            percent: 40
+        events:
+          max_size:
+            percent: 20
+        on_full:
+          policy: preserve_events
 go2rtc:
   api:
     listen: 127.0.0.1:1984

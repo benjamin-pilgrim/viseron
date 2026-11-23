@@ -147,11 +147,14 @@ def put_abs(
     container.put_archive("/", _make_tar({rel: data}, owner=owner, mode=mode))
 
 
-def create_directories(container: Any, *container_paths: str) -> None:
+def create_directories(
+    container: Any, *container_paths: str, owner: tuple[int, int] | None = None
+) -> None:
     """Create empty directories at the given absolute paths inside ``container``.
 
     Uses ``put_archive`` so it works regardless of filesystem visibility
-    between the test process and the Docker daemon.
+    between the test process and the Docker daemon. ``owner`` sets container
+    UID/GID for paths outside the image's normal startup ownership changes.
     """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -160,6 +163,8 @@ def create_directories(container: Any, *container_paths: str) -> None:
             info = tarfile.TarInfo(name=rel)
             info.type = tarfile.DIRTYPE
             info.mode = 0o755
+            if owner is not None:
+                info.uid, info.gid = owner
             tar.addfile(info)
     buf.seek(0)
     container.put_archive("/", buf.getvalue())

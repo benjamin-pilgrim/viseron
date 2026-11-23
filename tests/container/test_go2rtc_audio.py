@@ -78,6 +78,10 @@ def test_recording_with_fresh_database(
         image,
         name=name,
         ports={"8888/tcp": ("127.0.0.1", None)} if keep else {},
+        tmpfs={
+            "/ram": "rw,size=64m,mode=1777",
+            "/tmp/viseron": "rw,size=64m,mode=1777",
+        },
         environment={
             "PUID": str(os.getuid()),
             "PGID": str(os.getgid()),
@@ -106,6 +110,8 @@ def test_recording_with_fresh_database(
         "/snapshots",
         "/thumbnails",
         "/event_clips",
+        "/archive",
+        owner=(os.getuid(), os.getgid()),
     )
     for script in ("flv_camera_source.py", "flv_recording_probe.py"):
         helpers.put_file(
@@ -156,6 +162,41 @@ def test_recording_with_fresh_database(
         )
         (artifact_dir / f"{name}-recording.txt").write_bytes(result.output)
         assert result.exit_code == 0, result.output.decode(errors="replace")
+        # Observe real committed archive locations, not just successful startup.
+        deadline = time.monotonic() + 100
+        promotion = None
+        while time.monotonic() < deadline:
+            promotion = container.exec_run(
+                [
+                    "s6-setuidgid",
+                    "postgres",
+                    "psql",
+                    "-tAc",
+                    "SELECT count(DISTINCT f.camera_identifier) FROM files f "
+                    "JOIN file_locations l ON l.file_id=f.id "
+                    "WHERE f.subcategory='segments' AND l.tier_id=1 "
+                    "AND l.state='available' AND l.path LIKE '/archive/%' "
+                    "AND NOT EXISTS (SELECT 1 FROM file_locations source "
+                    "WHERE source.file_id=f.id AND source.tier_id=0)",
+                    "-d",
+                    "viseron",
+                ]
+            )
+            if promotion.exit_code == 0 and promotion.output.strip() == b"2":
+                break
+            time.sleep(1)
+        assert (
+            promotion is not None
+            and promotion.exit_code == 0
+            and promotion.output.strip() == b"2"
+        ), promotion
+        # Recheck old footage after promotion and source release through the API.
+        replay = container.exec_run(
+            ["python3", "/tmp/flv_recording_probe.py", "--start", str(start)]
+            + (["--audio-dropout"] if audio_dropout else [])
+        )
+        (artifact_dir / f"{name}-after-promotion.txt").write_bytes(replay.output)
+        assert replay.exit_code == 0, replay.output.decode(errors="replace")
     finally:
         docker_client.api.timeout = previous_timeout
         (artifact_dir / f"{name}.log").write_bytes(container.logs())
