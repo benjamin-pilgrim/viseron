@@ -630,11 +630,13 @@ def wait_for_threads_and_processes_to_exit(
         start_time = time.time()
         LOGGER.debug(f"Waiting for {thread_or_process.name} to exit")
         try:
-            thread_or_process.join(timeout=5)
+            # Camera teardown can wait for its stream to close before draining
+            # the final segments. Do not kill its workers after only five seconds.
+            thread_or_process.join(timeout=30)
         except RuntimeError:
             LOGGER.debug(f"Failed to join {thread_or_process.name}")
             time.sleep(0.1)
-            thread_or_process.join(timeout=5)
+            thread_or_process.join(timeout=30)
         LOGGER.debug(
             f"Finished waiting for {thread_or_process.name} "
             f"after {time.time() - start_time:.2f}s"
