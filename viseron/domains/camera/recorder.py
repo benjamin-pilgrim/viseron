@@ -157,6 +157,10 @@ class ManualRecording:
     duration: int | None = None
 
 
+class RecordingInProgressError(RuntimeError):
+    """A deletion request includes a recording that is still active."""
+
+
 class RecorderBase:
     """Base recorder."""
 
@@ -718,16 +722,19 @@ def delete_recordings(
 
     Returns the deleted recordings so that they can be deleted from disk.
     """
-    stmt = (
-        delete(Recordings)
-        .where(Recordings.camera_identifier == camera_identifier)
-        .returning(Recordings)
-    )
+    conditions = [Recordings.camera_identifier == camera_identifier]
     if date:
-        stmt = stmt.where(func.date(Recordings.start_time.local(utc_offset)) == date)
+        conditions.append(func.date(Recordings.start_time.local(utc_offset)) == date)
     if recording_id:
-        stmt = stmt.where(Recordings.id == recording_id)
+        conditions.append(Recordings.id == recording_id)
     with get_session() as session:
+        event_fence(session, camera_identifier)
+        active = select(Recordings.id).where(*conditions, Recordings.end_time.is_(None))
+        if session.execute(active.limit(1)).first():
+            raise RecordingInProgressError(
+                "Stop active recordings before deleting them"
+            )
+        stmt = delete(Recordings).where(*conditions).returning(Recordings)
         _deleted_recordings = session.execute(stmt).scalars().all()
         session.commit()
     return _deleted_recordings

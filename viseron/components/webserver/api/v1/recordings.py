@@ -25,6 +25,7 @@ from viseron.components.webserver.api.v1.files import (
     resolve_file_id,
     serve_resolved_file,
 )
+from viseron.domains.camera.recorder import RecordingInProgressError
 from viseron.helpers.validators import request_argument_bool, request_argument_no_value
 
 LOGGER = logging.getLogger(__name__)
@@ -305,9 +306,17 @@ class RecordingsAPIHandler(BaseAPIHandler):
             return
 
         # Try to delete recording
-        if await self.run_in_executor(
-            camera.recorder.delete_recording, self.utc_offset, date, recording_id
-        ):
+        try:
+            deleted = await self.run_in_executor(
+                camera.recorder.delete_recording, self.utc_offset, date, recording_id
+            )
+        except RecordingInProgressError:
+            self.response_error(
+                HTTPStatus.CONFLICT,
+                reason="Stop active recordings before deleting them",
+            )
+            return
+        if deleted:
             await self.response_success()
             return
         self.response_error(

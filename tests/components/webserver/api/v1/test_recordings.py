@@ -9,6 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy.orm.session import Session, sessionmaker
 
+from viseron.components.storage.models import Recordings
+from viseron.domains.camera.recorder import delete_recordings
+
 from tests.common import BaseTestWithRecordings, MockCamera
 from tests.components.webserver.common import TestAppBaseNoAuth
 
@@ -19,6 +22,7 @@ class TestRecordingsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
     @pytest.fixture(scope="function", autouse=True)
     def prepare_and_mock(self, get_db_session: sessionmaker[Session]):
         """Prepare the database with recordings and setup mocks."""
+        self.recordings_session = get_db_session
         mock_recordings = {
             "2024-06-22": {
                 "1": {
@@ -295,3 +299,52 @@ class TestRecordingsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
                 method="DELETE",
             )
             assert response.code == 500
+
+    def test_delete_active_recordings_returns_conflict(self):
+        """Single, date and camera deletion reject an active recording via HTTP."""
+        start = datetime.datetime(2023, 3, 2, 12, tzinfo=datetime.UTC)
+        with self.recordings_session() as session:
+            session.add(
+                Recordings(
+                    id=90001,
+                    camera_identifier="test",
+                    start_time=start,
+                    adjusted_start_time=start,
+                )
+            )
+            session.commit()
+        camera = MockCamera(identifier="test")
+        camera.recorder = MagicMock()
+
+        def delete_selected(offset, date, identifier):
+            return bool(
+                delete_recordings(
+                    self.recordings_session, "test", offset, date, identifier
+                )
+            )
+
+        camera.recorder.delete_recording.side_effect = delete_selected
+        with patch(
+            "viseron.components.webserver.request_handler.ViseronRequestHandler._get_camera",
+            return_value=camera,
+        ):
+            for suffix in ("/90001", "/2023-03-02", ""):
+                response = self.fetch(
+                    "/api/v1/recordings/test" + suffix, method="DELETE"
+                )
+                assert response.code == 409, response.body
+        with self.recordings_session() as session:
+            assert session.get(Recordings, 90001).end_time is None
+            session.get(Recordings, 90001).end_time = start + datetime.timedelta(
+                minutes=1
+            )
+            session.commit()
+        with patch(
+            "viseron.components.webserver.request_handler.ViseronRequestHandler._get_camera",
+            return_value=camera,
+        ):
+            assert (
+                self.fetch("/api/v1/recordings/test/90001", method="DELETE").code == 200
+            )
+        with self.recordings_session() as session:
+            assert session.get(Recordings, 90001) is None

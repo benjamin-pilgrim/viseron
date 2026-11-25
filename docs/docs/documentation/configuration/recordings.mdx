@@ -179,6 +179,14 @@ While it is turned off, no recordings will be created and it will not consume an
   />
 </details>
 
+## Deleting recordings
+
+Stop an active recording before deleting it. If a camera or date selection
+includes an active recording, the entire deletion is rejected and no selected
+recordings are removed. Select a closed recording individually to delete it
+while another recording remains active. The API returns HTTP 409 for these
+active-recording conflicts; retry after the recording stops.
+
 ## Manual recordings
 
 Manual recordings can be started and stopped on-demand in multiple ways:

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
 
 from viseron.components.storage.models import (
@@ -39,6 +39,63 @@ from tests.common import MockCamera
 
 if TYPE_CHECKING:
     from viseron import Viseron
+
+
+@pytest.mark.parametrize("selection", [{}, {"date": "2023-03-02"}, {"recording_id": 1}])
+def test_delete_active_selection_is_atomic(get_db_session, selection):
+    """An active recording prevents deletion of the entire selected group."""
+    start = datetime.datetime(2023, 3, 1, 23, 30, tzinfo=datetime.UTC)
+    with get_db_session() as session:
+        session.add_all(
+            [
+                Recordings(
+                    id=identifier,
+                    camera_identifier="test",
+                    start_time=start,
+                    adjusted_start_time=start,
+                    end_time=None
+                    if identifier == 1
+                    else start + datetime.timedelta(minutes=1),
+                )
+                for identifier in (1, 2)
+            ]
+        )
+        session.commit()
+
+    with pytest.raises(RuntimeError):
+        delete_recordings(
+            get_db_session, "test", datetime.timedelta(hours=5, minutes=30), **selection
+        )
+
+    with get_db_session() as session:
+        assert set(session.scalars(select(Recordings.id))) == {1, 2}
+
+
+def test_delete_closed_recording_with_another_active(get_db_session):
+    """An active event outside the selected recording must not block deletion."""
+    start = datetime.datetime(2023, 3, 1, 23, 30, tzinfo=datetime.UTC)
+    with get_db_session() as session:
+        session.add_all(
+            [
+                Recordings(
+                    id=identifier,
+                    camera_identifier="test",
+                    start_time=start,
+                    adjusted_start_time=start,
+                    end_time=None
+                    if identifier == 1
+                    else start + datetime.timedelta(minutes=1),
+                )
+                for identifier in (1, 2)
+            ]
+        )
+        session.commit()
+    deleted = delete_recordings(
+        get_db_session, "test", datetime.timedelta(), recording_id=2
+    )
+    assert [recording.id for recording in deleted] == [2]
+    with get_db_session() as session:
+        assert list(session.scalars(select(Recordings.id))) == [1]
 
 
 @pytest.fixture(scope="function")
