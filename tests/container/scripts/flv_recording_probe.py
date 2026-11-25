@@ -45,7 +45,7 @@ def probe(camera, start, folder):
             media.write_bytes(fetch(init_url) + fetch(urllib.parse.urljoin(url, line)))
             result = subprocess.run(
                 [
-                    "/ffmpeg/bin/ffprobe",
+                    "/home/abc/bin/ffprobe",
                     "-v",
                     "error",
                     "-count_packets",
@@ -73,7 +73,7 @@ def probe(camera, start, folder):
             }
             subprocess.run(
                 [
-                    "/ffmpeg/bin/ffmpeg",
+                    "/home/abc/bin/ffmpeg",
                     "-v",
                     "error",
                     "-i",
@@ -101,7 +101,7 @@ def audio_rms(media):
     """Measure decoded audio rather than infer silence from packet metadata."""
     result = subprocess.run(
         [
-            "/ffmpeg/bin/ffmpeg",
+            "/home/abc/bin/ffmpeg",
             "-v",
             "error",
             "-i",

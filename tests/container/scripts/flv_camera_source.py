@@ -21,7 +21,7 @@ def main() -> None:
         fixture = pathlib.Path(folder) / "camera.flv"
         subprocess.run(
             [
-                "/ffmpeg/bin/ffmpeg",
+                "/home/abc/bin/ffmpeg",
                 "-v",
                 "error",
                 "-f",

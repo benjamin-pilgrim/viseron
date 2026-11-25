@@ -66,12 +66,17 @@ def _http(url, body=None):
 
 
 @contextmanager
-def _recording_case(docker_client, image, artifact_dir, request, *, offline=False):
+def _recording_case(
+    docker_client, image, artifact_dir, request, *, offline=False, archive_path=None
+):
     name = helpers.unique_container_name("viseron-storage-recovery")
     container = docker_client.containers.create(
         image,
         name=name,
         oom_score_adj=1000,
+        volumes={archive_path: {"bind": "/archive", "mode": "rw"}}
+        if archive_path
+        else None,
         log_config=LogConfig(type="json-file"),
         ports={"8888/tcp": ("127.0.0.1", None)},
         tmpfs={
@@ -99,7 +104,7 @@ def _recording_case(docker_client, image, artifact_dir, request, *, offline=Fals
         "/snapshots",
         "/thumbnails",
         "/event_clips",
-        "/archive",
+        *([] if archive_path else ["/archive"]),
         owner=(os.getuid(), os.getgid()),
     )
     helpers.put_file(
@@ -154,7 +159,7 @@ def _segments(container):
 
 def _decode_history(container, url, start):
     command = [
-        "/ffmpeg/bin/ffmpeg",
+        "/home/abc/bin/ffmpeg",
         "-v",
         "error",
         "-allowed_extensions",

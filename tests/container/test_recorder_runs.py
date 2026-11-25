@@ -1,8 +1,7 @@
 """Opt-in recorder-run acceptance: pass --run-model-acceptance with --image.
 
-The current hash-sidecar implementation does not meet this gate. A real FFmpeg
-restart must create a separate playable run and split/resume a timed manual
-recording without extending its original deadline.
+A real FFmpeg restart must create a separate playable run and split/resume a
+timed manual recording without extending its original deadline.
 """
 
 from __future__ import annotations
@@ -45,7 +44,9 @@ def _recordings(url):
 def restarted_recording(docker_client, image, artifact_dir, request):
     """Observe one real recorder restart, without restarting Viseron or its DB."""
     if not request.config.getoption("--run-model-acceptance"):
-        pytest.skip("Opt in with --run-model-acceptance to check the missing run model")
+        pytest.skip(
+            "Opt in with --run-model-acceptance to check the recorder run model"
+        )
 
     with _recording_case(docker_client, image, artifact_dir, request) as (
         container,
@@ -133,7 +134,7 @@ def test_restart_preserves_separate_playable_run_directories(restarted_recording
         _exec(
             container,
             [
-                "/ffmpeg/bin/ffmpeg",
+                "/home/abc/bin/ffmpeg",
                 "-v",
                 "error",
                 "-i",

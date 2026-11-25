@@ -17,13 +17,13 @@ from viseron.domains.camera.recording_run import RUN_TOKEN
 
 def main() -> None:
     """Count transformed frames and independently decode the archived video."""
-    os.environ[ENV_FFMPEG_PATH] = "/ffmpeg/bin/ffmpeg"
+    os.environ[ENV_FFMPEG_PATH] = "/home/abc/bin/ffmpeg"
     with tempfile.TemporaryDirectory(prefix="recorder-fps-") as directory:
         root = pathlib.Path(directory)
         source = root / "source.mp4"
         subprocess.run(
             [
-                "/ffmpeg/bin/ffmpeg",
+                "/home/abc/bin/ffmpeg",
                 "-v",
                 "error",
                 "-f",
@@ -80,7 +80,7 @@ def main() -> None:
             # This probe has one encoder launch; restart allocation is covered
             # by the packaged recorder-run acceptance gate.
             command = [
-                "/ffmpeg/bin/ffmpeg",
+                "/home/abc/bin/ffmpeg",
                 "-loglevel",
                 "repeat+info",
                 "-nostats",
@@ -116,7 +116,7 @@ def main() -> None:
             )
             probe = subprocess.run(
                 [
-                    "/ffmpeg/bin/ffprobe",
+                    "/home/abc/bin/ffprobe",
                     "-v",
                     "error",
                     "-count_frames",

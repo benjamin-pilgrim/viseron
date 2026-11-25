@@ -11,17 +11,18 @@ from types import SimpleNamespace
 from viseron.components.ffmpeg.camera import CAMERA_SCHEMA
 from viseron.components.ffmpeg.const import ENV_FFMPEG_PATH
 from viseron.components.ffmpeg.stream import Stream
+from viseron.domains.camera.recording_run import RUN_TOKEN
 
 
 def main() -> None:
     """Exercise the recorder's FFmpeg output arguments with a buffered burst."""
-    os.environ[ENV_FFMPEG_PATH] = "/ffmpeg/bin/ffmpeg"
+    os.environ[ENV_FFMPEG_PATH] = "/home/abc/bin/ffmpeg"
     with tempfile.TemporaryDirectory(prefix="recorder-burst-") as folder:
         root = pathlib.Path(folder)
         fixture = root / "source.mp4"
         subprocess.run(
             [
-                "/ffmpeg/bin/ffmpeg",
+                "/home/abc/bin/ffmpeg",
                 "-v",
                 "error",
                 "-f",
@@ -62,15 +63,18 @@ def main() -> None:
             SimpleNamespace(config=config, temp_segments_folder=folder),
             f"burst_{uuid.uuid4().hex}",
         )
+        run_folder = root / "synthetic-run"
+        run_folder.mkdir()
+        command = ["/home/abc/bin/ffmpeg", "-v", "warning", "-i", str(fixture)]
+        command.extend(stream.segment_args())
         subprocess.run(
-            ["/ffmpeg/bin/ffmpeg", "-v", "warning", "-i", str(fixture)]
-            + stream.segment_args(),
+            [argument.replace(RUN_TOKEN, run_folder.name) for argument in command],
             check=True,
             timeout=30,
         )
         fragments = [
             line
-            for line in (root / "index.m3u8").read_text().splitlines()
+            for line in (run_folder / "index.m3u8").read_text().splitlines()
             if line and not line.startswith("#")
         ]
         assert len(fragments) == len(set(fragments)) == 4, fragments
@@ -78,11 +82,12 @@ def main() -> None:
         for fragment in fragments:
             media = root / "probe.mp4"
             media.write_bytes(
-                (root / "init.mp4").read_bytes() + (root / fragment).read_bytes()
+                (run_folder / "init.mp4").read_bytes()
+                + (run_folder / fragment).read_bytes()
             )
             result = subprocess.run(
                 [
-                    "/ffmpeg/bin/ffprobe",
+                    "/home/abc/bin/ffprobe",
                     "-v",
                     "error",
                     "-show_packets",
