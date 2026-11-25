@@ -1,6 +1,7 @@
 """Test the query functions."""
 
 import datetime
+import errno
 import os
 import threading
 from typing import Any
@@ -149,6 +150,32 @@ class TestFileOperations:
             assert item.published
             assert item.size == len(b"segment")
             assert dst.read_bytes() == src.read_bytes() == b"segment"
+
+    @pytest.mark.parametrize("error_number", [errno.EBADF, errno.EAGAIN])
+    def test_move_retries_failed_sync_without_releasing_source(
+        self, tmp_path, error_number: int
+    ) -> None:
+        """A lost remote handle must retain footage until a verified retry."""
+        src, dst = tmp_path / "src.m4s", tmp_path / "dst.m4s"
+        src.write_bytes(b"recorded footage")
+        worker = _file_worker()
+        failed = DataItemMoveFile(cmd="move_file", src=str(src), dst=str(dst))
+        with patch(
+            "viseron.components.storage.util.os.fsync",
+            side_effect=OSError(error_number, os.strerror(error_number)),
+        ):
+            worker.work_input(failed)
+        assert failed.retryable_error
+        assert not failed.published
+        assert not failed.source_missing
+        assert src.read_bytes() == b"recorded footage"
+        assert not dst.exists()
+
+        retry = DataItemMoveFile(cmd="move_file", src=str(src), dst=str(dst))
+        worker.work_input(retry)
+        assert retry.published
+        assert not retry.error
+        assert src.read_bytes() == dst.read_bytes() == b"recorded footage"
 
     def test_move_missing_source_does_not_claim_an_existing_destination(
         self, tmp_path

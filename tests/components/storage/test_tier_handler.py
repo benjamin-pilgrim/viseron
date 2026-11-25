@@ -905,7 +905,8 @@ def test_deferred_artifact_operations_survive_retry_queue_restart(
 
 
 @pytest.mark.parametrize(
-    ("error_number", "expected_retry"), [(errno.EAGAIN, True), (errno.EACCES, False)]
+    ("error_number", "expected_retry"),
+    [(errno.EAGAIN, True), (errno.EBADF, True), (errno.EACCES, False)],
 )
 def test_accepted_clip_move_retries_temporary_publish_errors(
     error_number: int,

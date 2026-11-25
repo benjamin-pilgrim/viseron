@@ -32,6 +32,9 @@ TRANSIENT_FILESYSTEM_ERRNOS = {
     error_number
     for error_number in (
         errno.EAGAIN,
+        # CIFS can lose a server-side file handle during reconnect. Retrying
+        # the whole operation reopens files and verifies the copy again.
+        errno.EBADF,
         errno.EIO,
         getattr(errno, "ESTALE", None),
         errno.ETIMEDOUT,
