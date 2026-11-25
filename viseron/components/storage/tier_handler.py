@@ -87,6 +87,7 @@ from viseron.components.storage.util import (
     tier_destination_root,
 )
 from viseron.components.webserver.const import COMPONENT as WEBSERVER_COMPONENT
+from viseron.domains.camera.recording_run import segment_init_files
 from viseron.const import (
     CAMERA_SEGMENT_DURATION,
     VISERON_SIGNAL_LAST_WRITE,
@@ -1972,6 +1973,27 @@ def move_file(
             on_complete=on_complete,
         )
 
+    init_copies: list[str] = []
+
+    def _copy_next_init() -> None:
+        if not init_copies:
+            _send_segment_move()
+            return
+        name = init_copies.pop(0)
+        _send_move_command(
+            storage,
+            DataItemCopyFile(
+                cmd="copy_file",
+                src=os.path.join(os.path.dirname(src), name),
+                dst=os.path.join(os.path.dirname(dst), name),
+                destination_root=tier_destination_root(
+                    dst_tier_path, _curr_tier_subcategory
+                ),
+            ),
+            callback=_copy_init_callback,
+            on_complete=on_complete,
+        )
+
     def _copy_init_callback(item: DataItemCopyFile) -> None:
         if item.deferred or item.retryable_error:
             _notify_move_failure(on_complete)
@@ -1992,7 +2014,7 @@ def move_file(
                     dst,
                     item.src,
                 )
-            _send_segment_move()
+            _copy_next_init()
             return
         if item.source_missing:
             logger.warning(
@@ -2020,34 +2042,11 @@ def move_file(
         _curr_tier_category == TIER_CATEGORY_RECORDER
         and _curr_tier_subcategory == TIER_SUBCATEGORY_SEGMENTS
         and os.path.basename(src) != "init.mp4"
+        and os.path.dirname(src) != os.path.dirname(dst)
     ):
-        init_filename = (
-            f"init-{file_meta.hls_init_hash}.mp4"
-            if file_meta.hls_init_hash
-            else "init.mp4"
-        )
-        src_init = os.path.join(os.path.dirname(src), init_filename)
-        dst_init = os.path.join(os.path.dirname(dst), init_filename)
-        if src_init != dst_init:
-            # HLS init files are intentionally ignored by storage watchers and
-            # have no Files rows, but fMP4 HLS needs the matching init beside
-            # any segment directory the playlist references. Copy it before
-            # committing the segment move so a later-tier segment never becomes
-            # visible without its sidecar.
-            _send_move_command(
-                storage,
-                DataItemCopyFile(
-                    cmd="copy_file",
-                    src=src_init,
-                    dst=dst_init,
-                    destination_root=tier_destination_root(
-                        dst_tier_path, _curr_tier_subcategory
-                    ),
-                ),
-                callback=_copy_init_callback,
-                on_complete=on_complete,
-            )
-            return
+        init_copies.extend(segment_init_files(src, file_meta.hls_init_hash))
+        _copy_next_init()
+        return
 
     _send_segment_move()
 

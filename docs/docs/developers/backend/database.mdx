@@ -1,5 +1,11 @@
 # Database
 
+Recorder events may include a `recorder_run_id`; historical events without one
+retain their existing time-based selection. Recorder segment identity includes
+its path within the tier, so different runs may reuse a filename without sharing
+a file ID. The migration preserves existing file IDs and media URLs. Downgrading
+to filename-only identity is rejected while different runs reuse segment names.
+
 :::info
 
 The developer documentation is still under construction and this page is not complete.

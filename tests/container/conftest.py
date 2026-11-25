@@ -193,6 +193,7 @@ def image_container(
         "image": image,
         "name": container_name,
         "entrypoint": ["sleep", "infinity"],
+        "oom_score_adj": 1000,
     }
     if Path("/dev/dri").exists():
         run_kwargs["devices"] = ["/dev/dri:/dev/dri"]

@@ -118,7 +118,10 @@ class FragmenterSubProcessWorker(ChildProcessWorker):
         """Fragment all pending segments, blocking until done or timeout."""
         self._drained.clear()
         try:
-            self.input_queue.put({"cmd": "drain"}, timeout=timeout)
+            self.input_queue.put(
+                {"cmd": "drain", "writer_stopped": self._camera.stopped.is_set()},
+                timeout=timeout,
+            )
         except queue.Full:
             return False
         return self._drained.wait(timeout)
@@ -241,7 +244,11 @@ class Fragmenter:
             return
 
         try:
-            worker.input_queue.put({"cmd": "fragment"}, timeout=1)
+            command = {"cmd": "fragment"}
+            run_id = getattr(self._camera, "recording_run_id", None)
+            if isinstance(run_id, str):
+                command["run_id"] = run_id
+            worker.input_queue.put(command, timeout=1)
         except queue.Full:
             pass
 
@@ -351,6 +358,7 @@ def discontinuity_in_fragments(prev_fragment: Fragment, fragment: Fragment) -> b
     """Check if there is an HLS discontinuity between two fragments."""
     return gap_in_fragments(prev_fragment, fragment) or (
         prev_fragment.init_file != fragment.init_file
+        or prev_fragment.run_id != fragment.run_id
     )
 
 
@@ -415,6 +423,7 @@ def generate_playlist(
         fragment_init_file = fragment.init_file or init_file
         if prev_fragment and (
             gap_in_fragments(prev_fragment, fragment)
+            or prev_fragment.run_id != fragment.run_id
             or (prev_fragment.init_file or init_file) != fragment_init_file
         ):
             playlist.append("#EXT-X-DISCONTINUITY")
@@ -444,6 +453,7 @@ class Fragment:
     duration: float
     creation_time: datetime.datetime
     init_file: str | None = None
+    run_id: str | None = None
 
 
 class Timespan(TypedDict):

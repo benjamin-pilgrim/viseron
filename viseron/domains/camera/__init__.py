@@ -398,7 +398,7 @@ class AbstractCamera(AbstractDomain):
         """Start camera recorder."""
 
     @abstractmethod
-    def stop_recorder(self) -> None:
+    def stop_recorder(self, *, end_time=None) -> None:
         """Stop camera recorder."""
 
     @property

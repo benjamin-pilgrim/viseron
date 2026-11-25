@@ -6,6 +6,12 @@ import os
 import subprocess as sp
 from typing import TYPE_CHECKING, BinaryIO
 
+from viseron.domains.camera.recording_run import (
+    RUN_TOKEN,
+    new_run_id,
+    recording_run_id,
+    remove_finished_run_metadata,
+)
 from viseron.helpers.logs import LogPipe
 from viseron.watchdog.subprocess_watchdog import RestartablePopen
 
@@ -26,7 +32,9 @@ class FFmpegPipe:
         decoder_command: list[str] | None = None,
         segment_command: list[str] | None = None,
         dedicated_rawvideo_fd: bool = False,
+        run_marker=None,
     ) -> None:
+        self._run_marker = run_marker
         self._camera_identifier = camera_identifier
         self._logger = logger
         self._loglevel = loglevel
@@ -38,6 +46,30 @@ class FFmpegPipe:
         self._log_pipe: LogPipe | None = None
         self._rawvideo_pipe: BinaryIO | None = None
         self.segment_process: RestartablePopen | None = None
+
+    def _run_options(self, command: list[str]) -> dict:
+        """Allocate a fresh run on every actual launch, including watchdog retries."""
+        if not any(RUN_TOKEN in argument for argument in command):
+            return {}
+
+        def prepare():
+            run_id = new_run_id()
+            resolved = [argument.replace(RUN_TOKEN, run_id) for argument in command]
+            for original, target in zip(command, resolved):
+                if RUN_TOKEN in original:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+            return resolved
+
+        def started(resolved):
+            if self._run_marker is not None:
+                for original, target in zip(command, resolved):
+                    if RUN_TOKEN in original:
+                        self._run_marker.value = recording_run_id(target).encode(
+                            "ascii"
+                        )
+                        break
+
+        return {"command_factory": prepare, "on_started": started}
 
     def _close_log_pipe(self) -> None:
         try:
@@ -76,6 +108,7 @@ class FFmpegPipe:
             self._logger.debug("FFmpeg decoder command: %s", " ".join(command))
             process = RestartablePopen(
                 command,
+                **self._run_options(command),
                 name=f"viseron.camera.{self._camera_identifier}.pipe",
                 register=False,
                 stdin=sp.DEVNULL,
@@ -111,6 +144,7 @@ class FFmpegPipe:
                 )
                 self.segment_process = RestartablePopen(
                     self._segment_command,
+                    **self._run_options(self._segment_command),
                     name=f"viseron.camera.{self._camera_identifier}.segments",
                     # Recover track changes quickly, while bounding bad-start retries.
                     grace_period=2,
@@ -129,6 +163,7 @@ class FFmpegPipe:
                     )
                     self._pipe = RestartablePopen(
                         self._decoder_command,
+                        **self._run_options(self._decoder_command),
                         name=f"viseron.camera.{self._camera_identifier}.pipe",
                         register=False,
                         stdin=sp.DEVNULL,
@@ -187,6 +222,16 @@ class FFmpegPipe:
                 self._logger.debug("FFmpeg did not terminate, killing instead.")
                 process.kill()
                 process.communicate()
+            command = getattr(process.subprocess, "args", None)
+            template = (
+                self._segment_command
+                if process is self.segment_process
+                else self._decoder_command
+            )
+            if isinstance(command, (list, tuple)) and template:
+                for original, argument in zip(template, command):
+                    if RUN_TOKEN in original and recording_run_id(argument):
+                        remove_finished_run_metadata(os.path.dirname(argument))
         except (AttributeError, OSError) as error:
             self._logger.error(f"Failed to close {description}: {error}")
 

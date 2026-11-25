@@ -21,6 +21,7 @@ from viseron.components.storage.queries import get_recording_fragments
 from viseron.components.storage.util import fsync_directory, get_storage_temp_path
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.fragmenter import Fragment, generate_playlist
+from viseron.domains.camera.recording_run import recording_run_id
 from viseron.helpers import create_directory
 
 if TYPE_CHECKING:
@@ -82,8 +83,12 @@ def _extract_thumbnail_from_fragment(
     thumbnail_path: str,
 ) -> bool:
     """Extract a thumbnail from a fragment."""
-    init_file = os.path.join(os.path.dirname(fragment.path), "init.mp4")
+    init_file = fragment.init_file or os.path.join(
+        os.path.dirname(fragment.path), "init.mp4"
+    )
     if not os.path.exists(init_file):
+        if fragment.init_file or recording_run_id(fragment.path):
+            return False
         init_file = os.path.join(camera.segments_folder, "init.mp4")
     if not os.path.exists(init_file):
         LOGGER.debug("No init.mp4 found for thumbnail repair")
@@ -177,7 +182,15 @@ def recover_recording_thumbnail(
 
     files = get_recording_fragments(recording_id, lookback, storage.get_session)
     fragments = [
-        Fragment(file.filename, file.path, file.duration, file.orig_ctime)
+        Fragment(
+            file.filename,
+            file.path,
+            file.duration,
+            file.orig_ctime,
+            os.path.join(os.path.dirname(file.path), f"init-{file.hls_init_hash}.mp4")
+            if isinstance(getattr(file, "hls_init_hash", None), str)
+            else None,
+        )
         for file in files
     ]
     for fragment in fragments:

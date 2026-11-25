@@ -63,6 +63,24 @@ PLAYLIST_CONTENT = """#EXTM3U
 1723111171.m4s"""
 
 
+def test_playlist_marks_encoder_restart_even_with_unchanged_codec():
+    """Contiguous timestamps and identical init still need a new HLS decode epoch."""
+    now = utcnow()
+    fragments = [
+        Fragment("1.m4s", "/1.m4s", 5, now, "/init.mp4", run_id="first"),
+        Fragment(
+            "2.m4s",
+            "/2.m4s",
+            5,
+            now + datetime.timedelta(seconds=5),
+            "/init.mp4",
+            run_id="second",
+        ),
+    ]
+    playlist = generate_playlist(fragments, "/init.mp4", end=True)
+    assert playlist.count("#EXT-X-DISCONTINUITY\n") == 1
+
+
 def test_generate_playlist() -> None:
     """Test generate_playlist."""
     now = utcnow()
@@ -588,6 +606,8 @@ class TestFragmenter:
         self.camera.segments_folder = tempfile.mkdtemp()
         self.camera.timelapse_folder = None
         self.camera.temp_timelapse_folder = None
+        self.camera.stopped = threading.Event()
+        self.camera.stopped.set()
         self.fragmenter = Fragmenter(self.vis, self.camera)
         self.fragmenter.start()
 
@@ -651,6 +671,36 @@ def test_fragments_missing_from_playlist_are_retained(tmp_path) -> None:
     assert (segments / "06.m4s").read_bytes() == VALID_FRAGMENT
     # Missing playlist entries remain recoverable rather than being discarded.
     assert len(list(staging.glob("*.m4s"))) == 5
+
+
+@pytest.mark.parametrize("retained_media", [False, True])
+def test_closed_run_metadata_reclaimed_without_removing_active_or_pending_media(
+    tmp_path, retained_media
+):
+    """Repeated camera restarts must not fill RAM with metadata-only run folders."""
+    run1 = "20261125T000000.000000Z-123456789abc"
+    run2 = "20261125T000001.000000Z-123456789abd"
+    spool, storage = tmp_path / "spool", tmp_path / "segments"
+    for root in (spool, storage):
+        for run in (run1, run2):
+            directory = root / run
+            directory.mkdir(parents=True)
+            (directory / "init.mp4").write_bytes(b"init")
+        if retained_media:
+            (root / run1 / "1.m4s").write_bytes(b"pending media")
+    worker = _fragmenter_work(str(spool), str(storage))
+    with patch(
+        "viseron.domains.camera.fragmenter_process._get_mp4_files_to_fragment",
+        return_value=[],
+    ):
+        worker.work_input({"cmd": "fragment", "run_id": run1})
+        assert (spool / run1).exists()
+        worker.work_input({"cmd": "fragment", "run_id": run2})
+    for root in (spool, storage):
+        assert (root / run2 / "init.mp4").read_bytes() == b"init"
+        assert (root / run1).exists() is retained_media
+        if retained_media:
+            assert (root / run1 / "1.m4s").read_bytes() == b"pending media"
 
 
 def test_failed_mp4_conversion_preserves_source(tmp_path) -> None:

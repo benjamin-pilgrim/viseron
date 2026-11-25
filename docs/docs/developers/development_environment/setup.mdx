@@ -152,5 +152,7 @@ and the resumed event must retain its original deadline within two seconds.
 Logs and a JSON observation file are written to `smoke-artifacts`, or to
 `VISERON_SMOKE_ARTIFACT_DIR` when set. No production camera or storage is used.
 
-This gate is opt-in; the default smoke suite skips it. The current flat segment
-layout with hash-addressed init sidecars does not satisfy the run-directory gate.
+This gate targets the FFmpeg recorder and is opt-in; the default smoke suite skips
+it. Run it when changing recorder launches, run publication or event lifecycle
+behavior. Existing flat-recording compatibility is also covered by the regular
+storage and HLS regression tests.

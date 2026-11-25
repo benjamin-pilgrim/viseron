@@ -59,6 +59,10 @@ def event_coverage(*, active_only: bool = False):
         or_(
             and_(
                 Files.subcategory == "segments",
+                or_(
+                    Recordings.recorder_run_id.is_(None),
+                    Files.directory.endswith("/" + Recordings.recorder_run_id),
+                ),
                 Recordings.adjusted_start_time
                 <= Files.orig_ctime
                 + func.make_interval(

@@ -457,9 +457,9 @@ class Camera(AbstractCamera):
         """Start camera recorder."""
         self._recorder.start(shared_frame, objects_in_fov or [], trigger_type)
 
-    def stop_recorder(self) -> None:
+    def stop_recorder(self, *, end_time=None) -> None:
         """Stop camera recorder."""
-        self._recorder.stop(self.recorder.active_recording)
+        self._recorder.stop(self.recorder.active_recording, end_time=end_time)
 
     @property
     def output_fps(self):

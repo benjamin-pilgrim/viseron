@@ -26,6 +26,11 @@ import psutil
 
 from viseron.components.storage.util import copy_file_atomic, move_file_atomic
 from viseron.domains.camera.const import MP4BOX_PATH
+from viseron.domains.camera.recording_run import (
+    is_run_directory,
+    recording_run_id,
+    remove_finished_run_metadata,
+)
 from viseron.helpers import get_utc_offset
 from viseron.helpers.child_process_worker import ChildProcessWork
 from viseron.helpers.logs import LogPipe
@@ -44,7 +49,7 @@ def _get_open_files(path: str, process: psutil.Process) -> list[str]:
         open_files = process.open_files()
         for file in open_files:
             if file.path.startswith(f"{path}/"):
-                files.append(file.path.split("/")[-1])
+                files.append(os.path.relpath(file.path, path))
     except psutil.Error:
         pass
     return files
@@ -52,10 +57,20 @@ def _get_open_files(path: str, process: psutil.Process) -> list[str]:
 
 def _get_mp4_files_to_fragment(path: str) -> list[str]:
     """Get mp4 files that are not in use by ffmpeg/gstreamer."""
+    root = Path(path)
+    directories = [root] + [
+        child
+        for child in root.iterdir()
+        if child.is_dir() and is_run_directory(child.name)
+    ]
     mp4_files = [
         file
-        for file in Path(path).iterdir()
-        if file.suffix in (".mp4", ".m4s") and file.is_file()
+        for directory in directories
+        for file in directory.iterdir()
+        if file.suffix in (".mp4", ".m4s")
+        and file.is_file()
+        and file.name != "init.mp4"
+        and not file.name.startswith("init-")
     ]
     files_in_use = ["init.mp4"]
     for process in psutil.process_iter():
@@ -65,7 +80,11 @@ def _get_mp4_files_to_fragment(path: str) -> list[str]:
                 files_in_use.extend(_get_open_files(path, process))
         except psutil.Error:
             pass
-    return [str(f.name) for f in mp4_files if str(f.name) not in files_in_use]
+    return [
+        str(f.relative_to(root))
+        for f in mp4_files
+        if str(f.relative_to(root)) not in files_in_use
+    ]
 
 
 def _extract_extinf_number(playlist_content: str, file: str) -> float | None:
@@ -116,7 +135,7 @@ def _get_orig_ctime(
     if program_date_time:
         return program_date_time
     return datetime.datetime.fromtimestamp(
-        int(file.split(".", maxsplit=1)[0].split("_", maxsplit=1)[0]),
+        int(os.path.basename(file).split(".", maxsplit=1)[0].split("_", maxsplit=1)[0]),
         tz=datetime.timezone.utc,
     )
 
@@ -207,6 +226,8 @@ class FragmenterWork(ChildProcessWork):
         self._worker_event = worker_event
         self._metadata_ack = metadata_ack
         self._last_attempted_fragment = ""
+        self._active_run: str | None = None
+        self._closed_runs: set[str] = set()
         self._last_retained_warning = float("-inf")
         self._logger = logging.getLogger(fragmenter_logger_names(camera_identifier)[0])
         self._log_pipe: LogPipe
@@ -229,15 +250,29 @@ class FragmenterWork(ChildProcessWork):
         if cmd not in ("fragment", "drain"):
             return None
 
+        run_id = item.get("run_id")
+        if isinstance(run_id, str) and is_run_directory(run_id):
+            if self._active_run and self._active_run != run_id:
+                self._closed_runs.add(self._active_run)
+            self._active_run = run_id
+        if cmd == "drain" and item.get("writer_stopped") is True and self._active_run:
+            self._closed_runs.add(self._active_run)
+
         self._logger.debug(
             f"Checking for new segments to fragment in {self.temp_segments_folder}"
         )
         pending_dir = Path(self.temp_segments_folder) / ".pending_fragments"
         pending = set()
         if pending_dir.is_dir():
+            packages = []
             for directory in pending_dir.iterdir():
+                if directory.is_dir() and is_run_directory(directory.name):
+                    packages.extend(directory.iterdir())
+                else:
+                    packages.append(directory)
+            for directory in packages:
                 if (directory / "segment").is_file():
-                    pending.add(directory.name)
+                    pending.add(str(directory.relative_to(pending_dir)))
                 elif directory.is_dir():
                     shutil.rmtree(directory, ignore_errors=True)
         mp4s = sorted(
@@ -258,13 +293,22 @@ class FragmenterWork(ChildProcessWork):
             else:
                 self._handle_mp4(mp4)
 
+        for run in list(self._closed_runs):
+            spool_empty = remove_finished_run_metadata(
+                os.path.join(self.temp_segments_folder, run)
+            )
+            storage_empty = remove_finished_run_metadata(
+                os.path.join(self.segments_folder, run)
+            )
+            if spool_empty and storage_empty:
+                self._closed_runs.discard(run)
         if cmd == "drain":
             return {"drained": True}
         return None
 
     def _mp4box_command(self, file: str) -> bool:
         """Create fragmented fmp4 from mp4 using MP4Box."""
-        outdir = os.path.join(self.temp_segments_folder, file.split(".", maxsplit=1)[0])
+        outdir = os.path.join(self.temp_segments_folder, os.path.splitext(file)[0])
         os.makedirs(outdir, exist_ok=True)
         try:
             sp.run(  # type: ignore[call-overload]
@@ -306,10 +350,10 @@ class FragmenterWork(ChildProcessWork):
         tmp_frame_path = os.path.join(self._temp_timelapse_folder, frame_filename)
         frame_path = os.path.join(self._timelapse_folder, frame_filename)
         init_path = os.path.join(
-            self.temp_segments_folder, file.split(".", maxsplit=1)[0], "clip_init.mp4"
+            self.temp_segments_folder, os.path.splitext(file)[0], "clip_init.mp4"
         )
         segment_path = os.path.join(
-            self.temp_segments_folder, file.split(".", maxsplit=1)[0], "clip_1.m4s"
+            self.temp_segments_folder, os.path.splitext(file)[0], "clip_1.m4s"
         )
 
         self._extract_timelapse_frame(
@@ -426,6 +470,30 @@ class FragmenterWork(ChildProcessWork):
         else:
             self._logger.debug("Retaining fragment %s: %s", path, error)
 
+    def _publish_init(self, init_src: str, dst: str) -> str:
+        """Publish immutable run init bytes before making any segment visible."""
+        with open(init_src, "rb") as init:
+            init_bytes = init.read()
+        init_hash = hashlib.sha256(init_bytes).hexdigest()
+        destination_dir = os.path.dirname(dst)
+        os.makedirs(destination_dir, exist_ok=True)
+        sidecar = os.path.join(destination_dir, f"init-{init_hash}.mp4")
+        if not os.path.isfile(sidecar):
+            # Publish exactly the bytes that were hashed, even if the encoder
+            # replaces its mutable init.mp4 while remounting or restarting.
+            with tempfile.NamedTemporaryFile(dir=self.temp_segments_folder) as staged:
+                staged.write(init_bytes)
+                staged.flush()
+                copy_file_atomic(staged.name, sidecar)
+        plain_init = os.path.join(destination_dir, "init.mp4")
+        if recording_run_id(dst) and os.path.exists(plain_init):
+            with open(plain_init, "rb") as saved:
+                if saved.read() != init_bytes:
+                    raise ValueError("Recorder run init changed")
+        else:
+            copy_file_atomic(sidecar, plain_init)
+        return init_hash
+
     def _publish_segment(
         self,
         init_src: str,
@@ -437,20 +505,7 @@ class FragmenterWork(ChildProcessWork):
         """Publish a segment only after its init and metadata are ready."""
         try:
             _validate_fragment(src)
-            with open(init_src, "rb") as init:
-                init_bytes = init.read()
-            init_hash = hashlib.sha256(init_bytes).hexdigest()
-            sidecar = os.path.join(self.segments_folder, f"init-{init_hash}.mp4")
-            if not os.path.isfile(sidecar):
-                # Publish exactly the bytes that were hashed, even if the encoder
-                # replaces its mutable init.mp4 while remounting or restarting.
-                with tempfile.NamedTemporaryFile(
-                    dir=self.temp_segments_folder
-                ) as staged:
-                    staged.write(init_bytes)
-                    staged.flush()
-                    copy_file_atomic(staged.name, sidecar)
-            copy_file_atomic(sidecar, os.path.join(self.segments_folder, "init.mp4"))
+            init_hash = self._publish_init(init_src, dst)
 
             if not self._send_files_metadata(dst, orig_ctime, duration, init_hash):
                 return False
@@ -475,17 +530,18 @@ class FragmenterWork(ChildProcessWork):
         return open(
             os.path.join(
                 self.temp_segments_folder,
-                file.split(".", maxsplit=1)[0],
+                os.path.splitext(file)[0],
                 "master_1.m3u8",
             ),
             encoding="utf-8",
         ).read()
 
-    def _read_m3u8(self) -> str:
+    def _read_m3u8(self, directory: str = "") -> str:
         """Read m3u8 file created by encoder."""
         return open(
             os.path.join(
                 self.temp_segments_folder,
+                directory,
                 "index.m3u8",
             ),
             encoding="utf-8",
@@ -494,7 +550,7 @@ class FragmenterWork(ChildProcessWork):
     def _handle_mp4(self, file: str) -> None:
         """Fragment and publish an MP4, retaining the input on publish failure."""
         source = Path(self.temp_segments_folder) / file
-        stem = file.split(".", maxsplit=1)[0]
+        stem = os.path.splitext(file)[0]
         outdir = os.path.join(self.temp_segments_folder, stem)
         try:
             try:
@@ -532,10 +588,14 @@ class FragmenterWork(ChildProcessWork):
         source = Path(self.temp_segments_folder) / file
         try:
             try:
-                m3u8 = self._read_m3u8()
-                extinf = _extract_extinf_number(m3u8, file)
+                m3u8 = (
+                    self._read_m3u8(os.path.dirname(file))
+                    if os.path.dirname(file)
+                    else self._read_m3u8()
+                )
+                extinf = _extract_extinf_number(m3u8, os.path.basename(file))
                 orig_ctime = _get_orig_ctime(
-                    file, _extract_program_date_time(m3u8, file)
+                    file, _extract_program_date_time(m3u8, os.path.basename(file))
                 )
             except (FileNotFoundError, ValueError) as error:
                 self._log_retained_fragment(str(source), error)
@@ -549,7 +609,7 @@ class FragmenterWork(ChildProcessWork):
             _validate_fragment(str(source))
             pending = self._pending_fragment(file)
             pending.mkdir(parents=True, exist_ok=True)
-            init_src = Path(self.temp_segments_folder) / "init.mp4"
+            init_src = source.parent / "init.mp4"
             shutil.copyfile(init_src, pending / "init")
             with open(pending / "metadata", "w", encoding="utf-8") as metadata:
                 json.dump((orig_ctime.isoformat(), extinf), metadata)

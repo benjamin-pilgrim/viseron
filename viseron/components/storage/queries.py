@@ -48,7 +48,7 @@ def get_recording_fragments(
     """
     row_number = (
         func.row_number()
-        .over(partition_by=Files.filename, order_by=desc(Files.created_at))
+        .over(partition_by=Files.file_key, order_by=desc(Files.created_at))
         .label("row_number")
     )
     recording_files = (
@@ -56,6 +56,12 @@ def get_recording_fragments(
         .add_columns(row_number)
         .join(Recordings, Files.camera_identifier == Recordings.camera_identifier)
         .where(Recordings.id == recording_id)
+        .where(
+            or_(
+                Recordings.recorder_run_id.is_(None),
+                Files.directory.endswith("/" + Recordings.recorder_run_id),
+            )
+        )
         .where(Files.category == TIER_CATEGORY_RECORDER)
         .where(Files.subcategory == TIER_SUBCATEGORY_SEGMENTS)
         .where(Files.duration.isnot(None))
@@ -119,7 +125,7 @@ def get_time_period_fragments(
 
     row_number = (
         func.row_number()
-        .over(partition_by=Files.filename, order_by=desc(Files.created_at))
+        .over(partition_by=Files.file_key, order_by=desc(Files.created_at))
         .label("row_number")
     )
     files = (

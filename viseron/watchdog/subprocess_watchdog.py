@@ -38,12 +38,16 @@ class RestartablePopen(_Base):
         stage: str | None = VISERON_SIGNAL_SHUTDOWN,
         start_new_session: bool = True,
         before_restart: Callable[[], None] | None = None,
+        command_factory: Callable[[], list[str]] | None = None,
+        on_started: Callable[[list[str]], None] | None = None,
         **kwargs,
     ) -> None:
         self._args = args
         self._name = name
         self._grace_period = grace_period
         self._before_restart = before_restart
+        self._command_factory = command_factory
+        self._on_started = on_started
         self._kwargs = kwargs
         self._kwargs["start_new_session"] = start_new_session
         self._subprocess: sp.Popen | None = None
@@ -93,10 +97,13 @@ class RestartablePopen(_Base):
 
     def start(self) -> None:
         """Start the subprocess."""
+        args = (self._command_factory(),) if self._command_factory else self._args
         self._subprocess = sp.Popen(
-            *self._args,
+            *args,
             **self._kwargs,
         )
+        if self._on_started is not None:
+            self._on_started(args[0])
         self._start_time = utcnow().timestamp()
         self._started = True
 

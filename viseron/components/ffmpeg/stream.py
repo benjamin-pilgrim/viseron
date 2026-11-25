@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from viseron.domains.camera.recording_run import RUN_TOKEN
 from viseron.const import (
     CAMERA_SEGMENT_DURATION,
     ENV_CUDA_SUPPORTED,
@@ -562,6 +563,7 @@ class Stream:
                 "-hls_segment_filename",
                 os.path.join(
                     self._camera.temp_segments_folder,
+                    RUN_TOKEN,
                     "%s_%%010d.m4s",
                 ),
             ]
@@ -575,6 +577,7 @@ class Stream:
             + [
                 os.path.join(
                     self._camera.temp_segments_folder,
+                    RUN_TOKEN,
                     "index.m3u8",
                 ),
             ]
@@ -683,6 +686,7 @@ class Stream:
             self._logger,
             FFMPEG_LOGLEVELS[self._config[CONFIG_FFMPEG_LOGLEVEL]],
             segment_command=self.build_segment_command(),
+            run_marker=getattr(self._camera, "_recording_run_marker", None),
         )
         self._ffmpeg_pipe.start()
 

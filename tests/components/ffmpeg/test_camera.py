@@ -34,6 +34,7 @@ def camera_fixture() -> Iterator[Camera]:
     camera._identifier = "cam"
     camera._logger = MagicMock()
     camera._mp_context = cast("mp.context.ForkServerContext", mp.get_context())
+    camera._recording_run_marker = camera._mp_context.Array("c", 64)
     camera._frame_queue = None  # type: ignore[assignment]
     camera._capture_frames = MagicMock()
     camera.decode_error = MagicMock()

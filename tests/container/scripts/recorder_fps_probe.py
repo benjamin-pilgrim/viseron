@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from viseron.components.ffmpeg.camera import CAMERA_SCHEMA
 from viseron.components.ffmpeg.const import ENV_FFMPEG_PATH
 from viseron.components.ffmpeg.stream import Stream
+from viseron.domains.camera.recording_run import RUN_TOKEN
 
 
 def main() -> None:
@@ -74,18 +75,23 @@ def main() -> None:
             camera = SimpleNamespace(config=config, temp_segments_folder=str(folder))
             stream = Stream(config, camera, f"fps_{uuid.uuid4().hex}")
             stream.output_fps = 1
+            run_folder = folder / "synthetic-run"
+            run_folder.mkdir()
+            # This probe has one encoder launch; restart allocation is covered
+            # by the packaged recorder-run acceptance gate.
+            command = [
+                "/ffmpeg/bin/ffmpeg",
+                "-loglevel",
+                "repeat+info",
+                "-nostats",
+                "-i",
+                str(source),
+                *stream.segment_args(),
+                *stream.filter_args(),
+                *stream.output_args,
+            ]
             recorded = subprocess.run(
-                [
-                    "/ffmpeg/bin/ffmpeg",
-                    "-loglevel",
-                    "repeat+info",
-                    "-nostats",
-                    "-i",
-                    str(source),
-                    *stream.segment_args(),
-                    *stream.filter_args(),
-                    *stream.output_args,
-                ],
+                [argument.replace(RUN_TOKEN, "synthetic-run") for argument in command],
                 check=True,
                 capture_output=True,
                 timeout=30,
@@ -99,14 +105,14 @@ def main() -> None:
             assert len(recorded.stdout) == 4 * 320 * 240 * 3 // 2
             fragments = [
                 line
-                for line in (folder / "index.m3u8").read_text().splitlines()
+                for line in (run_folder / "index.m3u8").read_text().splitlines()
                 if line and not line.startswith("#")
             ]
             assert len(fragments) == 1, fragments
             media = folder / "archived.mp4"
             media.write_bytes(
-                (folder / "init.mp4").read_bytes()
-                + (folder / fragments[0]).read_bytes()
+                (run_folder / "init.mp4").read_bytes()
+                + (run_folder / fragments[0]).read_bytes()
             )
             probe = subprocess.run(
                 [

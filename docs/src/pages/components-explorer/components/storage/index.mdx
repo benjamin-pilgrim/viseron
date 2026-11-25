@@ -102,6 +102,54 @@ For technical reasons it is very likely that there will be a few extra megabytes
 
 :::
 
+### FFmpeg recording runs
+
+Each actual FFmpeg recorder launch writes to a separate run directory. Reconnects
+and recorder process restarts create new runs even when the codec is unchanged.
+Run names contain a UTC start timestamp and a random suffix. Stored footage uses:
+
+```text
+<tier>/segments/<camera>/<run>/init.mp4
+<tier>/segments/<camera>/<run>/<epoch>_<sequence>.m4s
+```
+
+The matching init is copied and verified before its segments are promoted.
+Hash-addressed init sidecars remain alongside the run init for HLS compatibility.
+Existing flat recordings remain readable. GStreamer retains its existing layout.
+The stored run does not need a persistent playlist: Viseron generates playback
+playlists from the database when requested.
+
+Events are bound to one run. An encoder restart closes the old event. A manual
+recording resumes as a new event when footage returns, retaining its original
+deadline; an expired request does not resume. Automatic resume applies to camera
+or encoder reconnects while Viseron remains running. Historical events that
+contain multiple identifiable runs return HTTP 409 for event playback; use the
+timeline to view those periods instead. Timeline playback can cross run boundaries.
+
+To recover footage without the database, copy one run directory outside Viseron's
+recording storage. From that copy, concatenate its init and retained segments into
+an ordinary MP4. This requires Python 3 and FFmpeg and preserves any existing
+`recovered.mp4`:
+
+```shell
+python3 - <<'PY' | ffmpeg -v error -f mp4 -i pipe:0 -c copy -n recovered.mp4
+from pathlib import Path
+import shutil
+import sys
+
+segments = sorted(Path('.').glob('*.m4s'),
+                  key=lambda path: int(path.stem.rsplit('_', 1)[-1]))
+for path in [Path('init.mp4'), *segments]:
+    with path.open('rb') as source:
+        shutil.copyfileobj(source, sys.stdout.buffer)
+PY
+```
+
+Recovery includes the retained segments from that run; it cannot restore deleted
+or incomplete footage. Metadata-only directories from stopped runs are reclaimed
+from staging and the first recording tier. Media, partial output and unknown files
+are retained for recovery.
+
 ### Percentage limits and promotion batches
 
 Recorder tiers accept `percent` under `continuous` and `events`, in either

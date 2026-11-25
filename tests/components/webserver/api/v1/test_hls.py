@@ -32,6 +32,18 @@ if TYPE_CHECKING:
 class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
     """Test the HLS API handler."""
 
+    @pytest.fixture(autouse=True)
+    def mock_storage_service(self):
+        """Use the test database rather than booting the default storage service."""
+        with (
+            patch(
+                "viseron.components.storage._check_database_readiness",
+                return_value=True,
+            ),
+            patch("viseron.components.storage.Storage"),
+        ):
+            yield
+
     def test_get_recording_hls_playlist(self):
         """Test getting a recording HLS playlist."""
         mocked_camera = MockCamera(
@@ -64,6 +76,47 @@ class TestHlsApiHandler(TestAppBaseNoAuth, BaseTestWithRecordings):
         assert response_string.count("/file/test/") == 3
         assert "?first_tier_path=" not in response_string
         assert response_string.count("#EXT-X-ENDLIST") == 1
+
+    def test_historical_event_crossing_runs_returns_conflict(self):
+        """An unbound historical event cannot silently concatenate different runs."""
+        runs = [
+            "20261125T000000.000000Z-123456789abc",
+            "20261125T000001.000000Z-123456789abd",
+        ]
+        with self._get_db_session() as session:
+            files = session.scalars(
+                select(Files)
+                .where(
+                    Files.camera_identifier == "test", Files.subcategory == "segments"
+                )
+                .order_by(Files.id)
+                .limit(3)
+            ).all()
+            assert len(files) == 3
+            for index, file in enumerate(files):
+                directory = "/segments/test/" + runs[min(index, 1)]
+                path = directory + "/" + file.filename
+                file.path, file.directory = path, directory
+                session.execute(
+                    update(FileLocations)
+                    .where(FileLocations.file_id == file.id)
+                    .values(path=path, directory=directory)
+                )
+            session.commit()
+        with (
+            patch(
+                "viseron.components.webserver.request_handler.ViseronRequestHandler._get_camera",
+                return_value=MockCamera(
+                    identifier="test", config={CONFIG_RECORDER: {CONFIG_LOOKBACK: 5}}
+                ),
+            ),
+            patch(
+                "viseron.components.webserver.request_handler.ViseronRequestHandler._get_session",
+                return_value=self._get_db_session(),
+            ),
+        ):
+            response = self.fetch("/api/v1/hls/test/1/index.m3u8")
+        assert response.code == 409, response.body
 
     def _fetch_recording_playlist_uris(self) -> list[str]:
         mocked_camera = MockCamera(

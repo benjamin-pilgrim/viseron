@@ -616,8 +616,8 @@ def upsert_file_at_location(
     filename = os.path.basename(normalized_path)
     logical_path = (
         normalized_path[len(tier_path.rstrip("/")) + 1 :]
-        if (category, subcategory)
-        == (TIER_CATEGORY_RECORDER, TIER_SUBCATEGORY_EVENT_CLIPS)
+        if category == TIER_CATEGORY_RECORDER
+        and subcategory in (TIER_SUBCATEGORY_EVENT_CLIPS, TIER_SUBCATEGORY_SEGMENTS)
         else filename
     )
     values = {

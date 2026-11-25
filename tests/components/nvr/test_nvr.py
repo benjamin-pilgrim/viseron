@@ -86,7 +86,9 @@ def configure_camera_for_recording_tests(
             start_time=fake_time.now, trigger_type=trigger_type
         )
 
-    def stop_recorder_side_effect():
+    def stop_recorder_side_effect(*, end_time=None):
+        if camera.recorder.active_recording is not None:
+            camera.recorder.active_recording.end_time = end_time or fake_time.now
         camera.is_recording = False
         camera.recorder.active_recording = None
 
@@ -1061,6 +1063,55 @@ class TestNVRRunBoth:
         assert not camera.is_recording
 
 
+def test_manual_run_restart_resumes_until_original_deadline(vis, monkeypatch):
+    """Encoder restart splits manual intent without extending its duration."""
+    nvr, camera = make_nvr(vis)
+    clock = FakeTime()
+    patch_nvr_utcnow(monkeypatch, clock)
+    configure_camera_for_recording_tests(camera, clock)
+    camera.recording_run_id = "20261125T000000.000000Z-123456789abc"
+    deadline = clock.now + datetime.timedelta(seconds=10)
+    nvr.start_manual_recording(ManualRecording(duration=10))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    first = camera.recorder.active_recording
+    clock.advance(3)
+    camera.recording_run_id = "20261125T000003.000000Z-123456789abd"
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    second = camera.recorder.active_recording
+    assert second is not first
+    assert first.end_time == clock.now
+    assert camera.is_recording
+    clock.advance(8)
+    nvr._run()  # No frame arrives to trigger the deadline.
+    assert not camera.is_recording
+    assert second.end_time == deadline
+    assert camera.start_recorder.call_count == 2
+
+
+def test_manual_run_restart_after_deadline_does_not_resume(vis, monkeypatch):
+    """A camera returning after expiry cannot start another manual event."""
+    nvr, camera = make_nvr(vis)
+    clock = FakeTime()
+    patch_nvr_utcnow(monkeypatch, clock)
+    configure_camera_for_recording_tests(camera, clock)
+    camera.recording_run_id = "20261125T000000.000000Z-123456789abc"
+    deadline = clock.now + datetime.timedelta(seconds=3)
+    nvr.start_manual_recording(ManualRecording(duration=3))
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    original = camera.recorder.active_recording
+    clock.advance(4)
+    camera.recording_run_id = "20261125T000004.000000Z-123456789abd"
+    nvr._run()
+    assert original.end_time == deadline
+    feed_frame_to_nvr(nvr)
+    nvr._run()
+    assert not camera.is_recording
+    assert camera.start_recorder.call_count == 1
+
+
 class TestNVRRunManualRecording:
     """_run tests (manual recording)."""
 
@@ -1088,7 +1139,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(2)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        nvr.stop_recorder.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_overrides_object_event(self, vis, monkeypatch, caplog):
@@ -1124,7 +1175,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        assert nvr.stop_recorder.call_args.kwargs["force"] is True
         assert not camera.is_recording
 
     def test_manual_recording_overrides_motion_event(self, vis, monkeypatch, caplog):
@@ -1158,7 +1209,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_with(force=True)
+        assert nvr.stop_recorder.call_args.kwargs["force"] is True
         assert not camera.is_recording
 
     def test_manual_recording_does_not_restart_each_frame(
@@ -1188,7 +1239,7 @@ class TestNVRRunManualRecording:
         fake_time.advance(3)
         feed_frame_to_nvr(nvr)
         nvr._run()
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        nvr.stop_recorder.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration(self, vis, monkeypatch, caplog):
@@ -1215,7 +1266,7 @@ class TestNVRRunManualRecording:
         feed_frame_to_nvr(nvr)
         nvr._run()
         assert "Received request to stop manual recording" in caplog.text
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        nvr.stop_recorder.assert_called_once()
         assert not camera.is_recording
 
     def test_manual_recording_no_duration_max_recording_time_exceeded(
@@ -1237,7 +1288,7 @@ class TestNVRRunManualRecording:
         feed_frame_to_nvr(nvr)
         nvr._run()
         assert "Max recording time exceeded, stopping recorder" in caplog.text
-        nvr.stop_recorder.assert_called_once_with(force=True)
+        nvr.stop_recorder.assert_called_once()
         assert not camera.is_recording
 
 

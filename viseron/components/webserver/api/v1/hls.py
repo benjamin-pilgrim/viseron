@@ -43,6 +43,7 @@ from viseron.domains.camera.fragmenter import (
     generate_playlist,
     get_available_timespans,
 )
+from viseron.domains.camera.recording_run import recording_run_id
 from viseron.helpers import client_current_datetime, daterange_to_utc, utcnow
 from viseron.helpers.fixed_size_dict import FixedSizeDict
 
@@ -53,6 +54,11 @@ if TYPE_CHECKING:
 
     from viseron.components.storage import Storage
     from viseron.domains.camera import FailedCamera
+
+
+class EventSpansRunsError(ValueError):
+    """Historical event footage crosses recorder runs and cannot be exported."""
+
 
 LOGGER = logging.getLogger(__name__)
 HLS_SEGMENT_RESPONSE_WARN_SECONDS = 0.05
@@ -204,15 +210,19 @@ class HlsAPIHandler(BaseAPIHandler):
 
         hls_client_id = self.request.headers.get("Hls-Client-Id", None)
         subpath = self.get_subpath()
-        playlist = await self.run_in_executor(
-            _generate_playlist,
-            self._get_session,
-            hls_client_id,
-            camera,
-            recording_id,
-            subpath,
-            self.request_arguments["_HLS_skip"] is not None,
-        )
+        try:
+            playlist = await self.run_in_executor(
+                _generate_playlist,
+                self._get_session,
+                hls_client_id,
+                camera,
+                recording_id,
+                subpath,
+                self.request_arguments["_HLS_skip"] is not None,
+            )
+        except EventSpansRunsError as error:
+            self.response_error(HTTPStatus.CONFLICT, reason=str(error))
+            return
         if not playlist:
             LOGGER.warning(
                 "Returning 404 for HLS playlist (camera=%s, recording_id=%s)",
@@ -593,6 +603,7 @@ def files_to_fragments(
             else _legacy_init_file_url(
                 camera, subpath, legacy_init_tiers[file.tier_id]
             ),
+            run_id=recording_run_id(file.path),
         )
         for file in files
     ]
@@ -652,6 +663,8 @@ def _generate_playlist(
         get_session,
         now=now,
     )
+    if len({recording_run_id(file.path) for file in files}) > 1:
+        raise EventSpansRunsError("Event spans recorder runs; use the timeline instead")
     legacy_init_tiers = _legacy_init_tiers(camera, files)
     if not files or legacy_init_tiers is None:
         return None
@@ -669,9 +682,9 @@ def _generate_playlist(
         LOGGER.debug("Recording ended more than a minute ago")
         end = True
     # Recording has ended but the last file is not finished yet
-    elif len(files) > 0 and recording.end_time.timestamp() > float(
-        files[-1].filename.split(".")[0]
-    ) + float(files[-1].duration):
+    elif len(files) > 0 and recording.end_time.timestamp() > files[
+        -1
+    ].orig_ctime.timestamp() + float(files[-1].duration):
         LOGGER.debug("Recording has ended but the last file is not finished yet")
         end = False
 

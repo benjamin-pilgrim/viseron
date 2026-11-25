@@ -182,7 +182,8 @@ class Files(Base):
     logical_path: Mapped[str] = mapped_column(
         String,
         Computed(
-            """CASE WHEN category = 'recorder' AND subcategory = 'event_clips'
+            """CASE WHEN category = 'recorder'
+AND subcategory IN ('event_clips', 'segments')
 THEN substr(path, length(rtrim(tier_path, '/')) + 2)
 ELSE filename END""",
             persisted=True,
@@ -294,6 +295,7 @@ class Recordings(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    recorder_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     camera_identifier: Mapped[str] = mapped_column(String)
     start_time: Mapped[datetime.datetime] = mapped_column(UTCDateTime(timezone=False))
     end_time: Mapped[datetime.datetime | None] = mapped_column(

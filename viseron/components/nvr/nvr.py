@@ -278,6 +278,8 @@ class NVR(AbstractNVR):
         self._seconds_left = 0
         self._manual_recording: ManualRecording | None = None
         self._start_manual_recording = False
+        self._manual_recording_deadline: datetime.datetime | None = None
+        self._recording_run_id: str | None = None
         self._kill_received = False
         self._operation_state: OperationState | None = None
 
@@ -515,12 +517,15 @@ class NVR(AbstractNVR):
             f"{manual_recording.duration}"
         )
         self._manual_recording = manual_recording
+        self._manual_recording_deadline = None
         self._start_manual_recording = True
 
     def stop_manual_recording(self) -> None:
         """Stop manual recording."""
         self._logger.debug("Received request to stop manual recording")
         self._manual_recording = None
+        self._start_manual_recording = False
+        self._manual_recording_deadline = None
 
     def process_manual_recording(self) -> None:
         """Process manual recording."""
@@ -528,6 +533,12 @@ class NVR(AbstractNVR):
             return
 
         if not self._start_manual_recording:
+            return
+        if (
+            self._manual_recording_deadline is not None
+            and utcnow() >= self._manual_recording_deadline
+        ):
+            self.stop_manual_recording()
             return
 
         if self._camera.is_recording:
@@ -539,10 +550,11 @@ class NVR(AbstractNVR):
         self._start_manual_recording = False
         self._trigger_type = TriggerTypes.MANUAL
         self._start_recorder = True
-        if self._manual_recording.duration:
-            self._stop_recorder_at = utcnow() + datetime.timedelta(
+        if self._manual_recording.duration and self._manual_recording_deadline is None:
+            self._manual_recording_deadline = utcnow() + datetime.timedelta(
                 seconds=self._manual_recording.duration
             )
+        self._stop_recorder_at = self._manual_recording_deadline
 
     @property
     def manual_recording_ended(self) -> bool:
@@ -550,15 +562,12 @@ class NVR(AbstractNVR):
         if not self._manual_recording:
             return True
 
-        if self.camera.recorder.active_recording is None:
-            return True
-
         if self._manual_recording.duration is None:
             return False
-
         return (
-            utcnow() - self.camera.recorder.active_recording.start_time
-        ).total_seconds() > self._manual_recording.duration
+            self._manual_recording_deadline is not None
+            and utcnow() >= self._manual_recording_deadline
+        )
 
     def _any_filter_requires_motion_overlap(self) -> bool:
         """Return True if any configured label requires motion to overlap objects."""
@@ -784,6 +793,14 @@ class NVR(AbstractNVR):
         if self._stop_recorder_at and self._stop_recorder_at < utcnow():
             self._stop_recorder_at = None
 
+        if (
+            trigger_type == TriggerTypes.MANUAL
+            and self._manual_recording_deadline is not None
+            and utcnow() >= self._manual_recording_deadline
+        ):
+            self.stop_manual_recording()
+            return
+
         self._camera.start_recorder(
             shared_frame,
             self._object_detector.objects_in_fov if self._object_detector else None,
@@ -799,13 +816,16 @@ class NVR(AbstractNVR):
             self._frame_scanners[MOTION_DETECTOR].scan = True
             self._logger.info("Starting motion detector")
 
-    def stop_recorder(self, *, force: bool = False) -> None:
+    def stop_recorder(self, *, force: bool = False, end_time=None) -> None:
         """Stop recorder."""
 
         def _stop() -> None:
             self._stop_recorder_at = None
             self._seconds_left = 0
-            self._camera.stop_recorder()
+            if end_time is None:
+                self._camera.stop_recorder()
+            else:
+                self._camera.stop_recorder(end_time=end_time)
 
         if force:
             _stop()
@@ -885,8 +905,51 @@ class NVR(AbstractNVR):
 
         self._logger.debug("NVR thread stopped")
 
+    def _check_recording_run(self) -> None:
+        """Close the old event and reapply manual intent at an encoder restart."""
+        run_id = getattr(self._camera, "recording_run_id", None)
+        if not isinstance(run_id, str) or not run_id:
+            return
+        if self._recording_run_id is None:
+            self._recording_run_id = run_id
+            return
+        if self._recording_run_id == run_id:
+            return
+        self._start_recorder = False
+        self._trigger_type = None
+        if self._camera.is_recording:
+            self.stop_recorder(force=True)
+        self._recording_run_id = run_id
+        if self._manual_recording is not None:
+            self._start_manual_recording = True
+
+    def _expire_manual_recording(self) -> bool:
+        """Honor manual stop/deadline even while the camera supplies no frames."""
+        recording = self._camera.recorder.active_recording
+        if recording is None or recording.trigger_type != TriggerTypes.MANUAL:
+            return False
+        deadline = self._manual_recording_deadline
+        if self._manual_recording is not None and (
+            deadline is None or utcnow() < deadline
+        ):
+            return False
+        self.stop_manual_recording()
+        self._stop_recorder_at = None
+        self._seconds_left = 0
+        self.stop_recorder(force=True, end_time=deadline)
+        return True
+
     def _run(self) -> None:
         """Process frames from camera."""
+        if self._expire_manual_recording():
+            return
+        self._check_recording_run()
+        if (
+            self._manual_recording is not None
+            and self._manual_recording_deadline is not None
+            and utcnow() >= self._manual_recording_deadline
+        ):
+            self.stop_manual_recording()
         self.update_operation_state()
         try:
             frame = self._frame_queue.get(timeout=1)

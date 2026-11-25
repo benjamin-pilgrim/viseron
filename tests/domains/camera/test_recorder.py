@@ -472,7 +472,9 @@ def fixture_create_recording(recording_params):
             start_time=params["start_time"],
             start_timestamp=params["start_time"].timestamp(),
             end_time=params["end_time"],
-            end_timestamp=params["end_time"].timestamp(),
+            end_timestamp=params["end_time"].timestamp()
+            if params["end_time"]
+            else None,
             date=params.get("date", params["start_time"].strftime("%Y-%m-%d")),
             thumbnail=None,
             thumbnail_path=params["thumbnail_path"],
@@ -625,7 +627,7 @@ class TestAbstractRecorder:
             ) as restartable_thread,
         ):
             shutdown_event.is_set.return_value = shutting_down
-            recorder.stop(create_recording())
+            recorder.stop(create_recording(end_time=None))
 
         assert [
             thread_call.kwargs["daemon"]

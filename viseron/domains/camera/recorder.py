@@ -6,6 +6,7 @@ import datetime
 import errno
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from time import sleep
@@ -39,6 +40,7 @@ from viseron.domains.camera.fragmenter import (
 )
 from viseron.domains.camera.schedule import resolve_timezone
 from viseron.domains.object_detector.detected_object import DetectedObject
+from viseron.domains.camera.recording_run import is_run_directory, recording_run_id
 from viseron.events import EventData
 from viseron.helpers import create_directory, draw_objects, get_utc_offset, utcnow
 from viseron.helpers.validators import UNDEFINED
@@ -124,6 +126,7 @@ class Recording:
     clip_path: str | None
     objects: list[DetectedObject]
     trigger_type: TriggerTypes | None
+    recorder_run_id: str | None = None
     thumbnail_file_id: int | None = None
     clip_file_id: int | None = None
 
@@ -171,6 +174,7 @@ class RecorderBase:
         camera: AbstractCamera | FailedCamera,
     ) -> None:
         self._logger = logging.getLogger(self.__module__ + "." + camera.identifier)
+        self._recording_lock = threading.RLock()
         self._vis = vis
         self._config = config
         self._camera = camera
@@ -349,10 +353,25 @@ class AbstractRecorder(ABC, RecorderBase):
         objects_in_fov: list[DetectedObject],
         trigger_type: TriggerTypes,
     ) -> Recording:
+        """Start one event, serialized with stops from camera and NVR threads."""
+        with self._recording_lock:
+            if self._active_recording is not None:
+                return self._active_recording
+            return self._start_recording(shared_frame, objects_in_fov, trigger_type)
+
+    def _start_recording(
+        self,
+        shared_frame: SharedFrame,
+        objects_in_fov: list[DetectedObject],
+        trigger_type: TriggerTypes,
+    ) -> Recording:
         """Start recording."""
         self._logger.info("Starting recorder")
         self.is_recording = True
         start_time = utcnow()
+        run_id = getattr(self._camera, "recording_run_id", None)
+        if not isinstance(run_id, str) or not is_run_directory(run_id):
+            run_id = None
 
         with self._storage.get_session() as session:
             event_fence(session, self._camera.identifier)
@@ -361,6 +380,7 @@ class AbstractRecorder(ABC, RecorderBase):
                 .values(
                     camera_identifier=self._camera.identifier,
                     trigger_type=trigger_type,
+                    recorder_run_id=run_id,
                     start_time=start_time,
                     adjusted_start_time=start_time
                     - datetime.timedelta(seconds=self.lookback)
@@ -413,6 +433,7 @@ class AbstractRecorder(ABC, RecorderBase):
             objects=objects_in_fov,
             trigger_type=trigger_type,
             thumbnail_file_id=thumbnail_file_id,
+            recorder_run_id=run_id,
         )
 
         self._start(recording, shared_frame, objects_in_fov)
@@ -435,14 +456,23 @@ class AbstractRecorder(ABC, RecorderBase):
     ):
         """Start the recorder."""
 
-    def stop(self, recording: Recording | None) -> None:
-        """Stop recording."""
+    def stop(self, recording: Recording | None, *, end_time=None) -> None:
+        """Stop an observed event once, preserving a requested manual deadline."""
+        with self._recording_lock:
+            if recording is None:
+                self._logger.error("No active recording to stop")
+                return
+            if recording.end_time is not None:
+                return
+            self._stop_recording(recording, end_time=end_time)
+
+    def _stop_recording(self, recording: Recording, *, end_time=None) -> None:
         self._logger.info("Stopping recorder")
         if recording is None:
             self._logger.error("No active recording to stop")
             return
 
-        end_time = utcnow()
+        end_time = min(utcnow(), end_time) if end_time is not None else utcnow()
         recording.end_time = end_time
         recording.end_timestamp = end_time.timestamp()
 
@@ -523,9 +553,26 @@ class AbstractRecorder(ABC, RecorderBase):
             self._storage.get_session,
         )
         fragments = [
-            Fragment(file.filename, file.path, file.duration, file.orig_ctime)
+            Fragment(
+                file.filename,
+                file.path,
+                file.duration,
+                file.orig_ctime,
+                os.path.join(
+                    os.path.dirname(file.path),
+                    f"init-{file.hls_init_hash}.mp4"
+                    if getattr(file, "hls_init_hash", None)
+                    else "init.mp4",
+                ),
+                recording_run_id(file.path),
+            )
             for file in files
         ]
+        if len({recording_run_id(file.path) for file in files}) > 1:
+            self._logger.warning(
+                "Event spans recorder runs; clip export is unavailable"
+            )
+            return None
         num_fragments = len(fragments)
         if num_fragments == 0:
             self._logger.error("No fragments available")

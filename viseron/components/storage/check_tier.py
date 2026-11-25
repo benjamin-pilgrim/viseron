@@ -37,6 +37,7 @@ from viseron.components.storage.util import (
 )
 from viseron.const import CAMERA_SEGMENT_DURATION
 from viseron.domains.camera.schedule import schedule_state_changes
+from viseron.domains.camera.recording_run import recording_run_id
 from viseron.helpers import utcnow
 
 if TYPE_CHECKING:
@@ -520,9 +521,10 @@ class Worker:
 
     def load_recordings(self, item: DataItem):
         """Load the recordings data for the camera."""
-        data = load_recordings(
+        data, self._recording_runs = load_recordings(
             self._get_session,
             item.camera_identifier,
+            include_runs=True,
         )
         LOGGER.debug(
             "Loaded %d recordings into numpy array",
@@ -664,6 +666,7 @@ class Worker:
             max_age_timestamp,
             file_min_age,
             drain=item.drain,
+            recording_runs=getattr(self, "_recording_runs", None),
         )
 
         return rows_to_move
@@ -715,6 +718,8 @@ def load_tier(
 def load_recordings(
     get_session: Callable[..., Session],
     camera_identifier: str,
+    *,
+    include_runs: bool = False,
 ):
     """Load the tier recordings data for the camera."""
     with get_session() as session:
@@ -724,10 +729,11 @@ def load_recordings(
             Recordings.end_time,
             Recordings.adjusted_start_time,
             Recordings.created_at,
+            Recordings.recorder_run_id,
         ).where(
             Recordings.camera_identifier == camera_identifier,
         )
-        result = session.execute(stmt).yield_per(1000)
+        result = list(session.execute(stmt).yield_per(1000))
         data = [
             (
                 row.id,
@@ -739,9 +745,11 @@ def load_recordings(
             for row in result
         ]
 
-    return np.array(
-        data,
-        dtype=RECORDINGS_DTYPE,
+    array = np.array(data, dtype=RECORDINGS_DTYPE)
+    return (
+        (array, {row.id: row.recorder_run_id for row in result if row.recorder_run_id})
+        if include_runs
+        else array
     )
 
 
@@ -895,6 +903,7 @@ def get_recordings_to_move(
     max_age_timestamp: float,
     file_min_age_timestamp: float,
     drain: bool,
+    recording_runs: dict[int, str] | None = None,
 ):
     """Get files to move based on recording grouping."""
     # Sort recordings by adjusted start time (descending)
@@ -921,6 +930,14 @@ def get_recordings_to_move(
                 files_data["orig_ctime"], end_time_search, side="right"
             )
             relevant_files_for_recording = files_data[start_idx:end_idx]
+            run_id = (recording_runs or {}).get(int(recording["id"]))
+            if run_id:
+                relevant_files_for_recording = relevant_files_for_recording[
+                    [
+                        recording_run_id(str(path)) == run_id
+                        for path in relevant_files_for_recording["path"]
+                    ]
+                ]
         else:
             relevant_files_for_recording = np.empty(0, dtype=files_data.dtype)
 

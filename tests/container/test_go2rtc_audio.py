@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from docker.types import LogConfig
 
 from . import _helpers as helpers
 
@@ -77,6 +78,8 @@ def test_recording_with_fresh_database(
     container = docker_client.containers.create(
         image,
         name=name,
+        oom_score_adj=1000,
+        log_config=LogConfig(type="json-file"),
         ports={"8888/tcp": ("127.0.0.1", None)} if keep else {},
         tmpfs={
             "/ram": "rw,size=64m,mode=1777",
