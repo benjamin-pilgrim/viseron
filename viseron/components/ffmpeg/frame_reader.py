@@ -57,6 +57,17 @@ def frame_reader_logger_name(camera_identifier: str) -> str:
     return f"viseron.components.ffmpeg.stream.{camera_identifier}"
 
 
+def _wait_for_stop(capture_frames: Event, timeout: float) -> bool:
+    """Wait for the capture flag to clear without sleeping through shutdown."""
+    deadline = time.monotonic() + timeout
+    while capture_frames.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, 0.1))
+    return True
+
+
 def run_frame_reader(
     config: FrameReaderConfig,
     frame_queue: Queue[bytes],  # pylint: disable=unsubscriptable-object
@@ -84,6 +95,7 @@ def run_frame_reader(
     empty_frames = 0
 
     pipe.start()
+    pipe_closed = False
 
     while capture_frames.is_set():
         if decode_error.is_set():
@@ -94,10 +106,15 @@ def run_frame_reader(
                 "Camera failed to produce frames, restarting in %s seconds",
                 restart_delay,
             )
-            time.sleep(restart_delay)
+            if _wait_for_stop(capture_frames, restart_delay):
+                break
             logger.error("Restarting frame pipe")
             pipe.close()
+            pipe_closed = True
+            if not capture_frames.is_set():
+                break
             pipe.start()
+            pipe_closed = False
             decode_error.clear()
             empty_frames = 0
             restart_delay = min(restart_delay * 2, MAX_RESTART_DELAY)
@@ -121,7 +138,8 @@ def run_frame_reader(
             logger.error("Did not receive a frame")
             decode_error.set()
 
-    pipe.close()
+    if not pipe_closed:
+        pipe.close()
     frame_queue.close()
     logger.debug("Frame reader stopped")
     os.kill(os.getpid(), signal.SIGKILL)

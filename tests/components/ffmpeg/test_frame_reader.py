@@ -5,14 +5,13 @@ from __future__ import annotations
 import logging
 import pickle
 import queue
+import threading
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from viseron.components.ffmpeg import stream
 from viseron.components.ffmpeg.const import (
-    DEFAULT_RESTART_DELAY,
     MAX_EMPTY_FRAMES,
-    MAX_RESTART_DELAY,
 )
 from viseron.components.ffmpeg.frame_reader import (
     FrameReaderConfig,
@@ -66,6 +65,56 @@ def test_config_is_picklable() -> None:
     """The payload crosses a forkserver boundary, so it must pickle."""
     config = _config()
     assert pickle.loads(pickle.dumps(config)) == config  # noqa: S301
+
+
+def test_stop_during_retry_does_not_restart_decoder():
+    """A stop received during camera retry must not launch another decoder."""
+    capture = threading.Event()
+    capture.set()
+    errors = threading.Event()
+    frames = _FakeQueue()
+    with ExitStack() as stack:
+        pipe, _ = _enter_patches(stack)
+        pipe.return_value.read.return_value = None
+        pipe.return_value.poll.return_value = 1
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.sleep",
+                side_effect=lambda _delay: capture.clear(),
+            )
+        )
+        run_frame_reader(_config(), frames, capture, errors)
+    assert pipe.return_value.start.call_count == 1
+    assert frames.closed
+
+
+def test_stop_during_retry_close_does_not_restart_decoder():
+    """Stopping while FFmpeg closes must cancel the replacement decoder too."""
+    capture = threading.Event()
+    capture.set()
+    errors = threading.Event()
+    frames = _FakeQueue()
+    now = [0.0]
+    with ExitStack() as stack:
+        pipe, _ = _enter_patches(stack)
+        pipe.return_value.read.return_value = None
+        pipe.return_value.poll.return_value = 1
+        pipe.return_value.close.side_effect = capture.clear
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.monotonic",
+                side_effect=lambda: now[0],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.sleep",
+                side_effect=lambda delay: now.__setitem__(0, now[0] + delay),
+            )
+        )
+        run_frame_reader(_config(), frames, capture, errors)
+    assert pipe.return_value.start.call_count == 1
+    assert frames.closed
 
 
 def test_frame_reader_logger_name_matches_the_parent_stream_logger() -> None:
@@ -128,73 +177,64 @@ def test_sets_decode_error_after_max_empty_frames() -> None:
     decode_error.set.assert_called_once()
 
 
-def test_decode_error_restarts_the_same_pipe() -> None:
-    """The frame reader remains the sole owner of decode-error retries."""
-    capture_frames = MagicMock()
-    capture_frames.is_set.side_effect = [True, False]
-    decode_error = MagicMock()
-    decode_error.is_set.return_value = True
-    frame_queue = _FakeQueue(maxsize=2)
+def _run_retry_sequence(reads):
+    """Observe decoder starts on a virtual clock while feeding camera outcomes."""
+    capture = threading.Event()
+    capture.set()
+    errors = threading.Event()
+    frames = _FakeQueue(maxsize=2)
+    now = [0.0]
+    starts = []
+    outcomes = iter(reads)
+    remaining = len(reads)
+
+    def read(_size):
+        nonlocal remaining
+        outcome = next(outcomes)
+        remaining -= 1
+        if remaining == 0:
+            capture.clear()
+        return outcome
+
+    def sleep(delay):
+        now[0] += delay
 
     with ExitStack() as stack:
-        ffmpeg_pipe, _ = _enter_patches(stack)
-        stack.enter_context(patch("viseron.components.ffmpeg.frame_reader.time.sleep"))
-        ffmpeg_pipe.return_value.read.return_value = b"1234"
-        run_frame_reader(_config(), frame_queue, capture_frames, decode_error)
+        pipe, _ = _enter_patches(stack)
+        pipe.return_value.start.side_effect = lambda: starts.append(now[0])
+        pipe.return_value.read.side_effect = read
+        pipe.return_value.poll.return_value = 1
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.monotonic",
+                side_effect=lambda: now[0],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "viseron.components.ffmpeg.frame_reader.time.sleep", side_effect=sleep
+            )
+        )
+        run_frame_reader(_config(), frames, capture, errors)
+    return starts, frames
 
-    assert ffmpeg_pipe.return_value.start.call_count == 2
-    assert ffmpeg_pipe.return_value.close.call_count == 2
-    assert frame_queue.get_nowait() == b"1234"
+
+def test_decode_error_recovers_frames() -> None:
+    """A failed decoder is retried and its recovered frame reaches the consumer."""
+    starts, frames = _run_retry_sequence([None, b"1234"])
+    assert starts == [0, 5]
+    assert frames.get_nowait() == b"1234"
+    assert frames.closed
 
 
 def test_restart_delay_backs_off_exponentially() -> None:
-    """A dead camera must retry less often instead of every 5 seconds."""
-    iterations = 8
-    capture_frames = MagicMock()
-    capture_frames.is_set.side_effect = [True] * iterations + [False]
-    decode_error = MagicMock()
-    decode_error.is_set.return_value = True
-    frame_queue = _FakeQueue(maxsize=2)
-
-    with ExitStack() as stack:
-        ffmpeg_pipe, _ = _enter_patches(stack)
-        sleep = stack.enter_context(
-            patch("viseron.components.ffmpeg.frame_reader.time.sleep")
-        )
-        ffmpeg_pipe.return_value.read.return_value = None
-        run_frame_reader(_config(), frame_queue, capture_frames, decode_error)
-
-    assert [call.args[0] for call in sleep.call_args_list] == [
-        DEFAULT_RESTART_DELAY,
-        10,
-        20,
-        40,
-        MAX_RESTART_DELAY,
-        MAX_RESTART_DELAY,
-        MAX_RESTART_DELAY,
-        MAX_RESTART_DELAY,
-    ]
+    """Repeated failures back off from five seconds to a sixty-second cap."""
+    starts, _ = _run_retry_sequence([None] * 9)
+    assert starts == [0, 5, 15, 35, 75, 135, 195, 255, 315]
 
 
 def test_restart_delay_resets_after_a_frame() -> None:
-    """A successful frame must reset the backoff to the base delay."""
-    capture_frames = MagicMock()
-    capture_frames.is_set.side_effect = [True] * 4 + [False]
-    decode_error = MagicMock()
-    # Fail, fail, then recover (frame read), then fail again
-    decode_error.is_set.side_effect = [True, True, False, True]
-    frame_queue = _FakeQueue(maxsize=2)
-
-    with ExitStack() as stack:
-        ffmpeg_pipe, _ = _enter_patches(stack)
-        sleep = stack.enter_context(
-            patch("viseron.components.ffmpeg.frame_reader.time.sleep")
-        )
-        ffmpeg_pipe.return_value.read.side_effect = [None, None, b"1234", None]
-        run_frame_reader(_config(), frame_queue, capture_frames, decode_error)
-
-    assert [call.args[0] for call in sleep.call_args_list] == [
-        DEFAULT_RESTART_DELAY,
-        10,
-        DEFAULT_RESTART_DELAY,
-    ]
+    """A successful frame resets subsequent retries to a five-second delay."""
+    starts, frames = _run_retry_sequence([None, None, b"1234", None, None])
+    assert starts == [0, 5, 15, 20]
+    assert frames.get_nowait() == b"1234"
