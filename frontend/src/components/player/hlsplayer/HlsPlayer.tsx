@@ -28,6 +28,7 @@ import {
   startLoadAtBeginning,
   startLoadAtCurrentTime,
 } from "components/player/hlsplayer/utils";
+import { usePlaybackRotation } from "components/player/usePlaybackRotation";
 import { useAuthContext } from "context/AuthContext";
 import { ViseronContext } from "context/ViseronContext";
 import { BASE_PATH } from "lib/api/client";
@@ -343,6 +344,9 @@ interface HlsPlayerProps {
 
 export function HlsPlayer({ camera }: HlsPlayerProps) {
   const theme = useTheme();
+  const { containerRef, videoStyle } = usePlaybackRotation(
+    camera.playback_rotation,
+  );
   const hlsRef = useRef<Hls | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsClientIdRef = useRef<string>(uuidv4());
@@ -396,6 +400,7 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
 
   return (
     <div
+      ref={containerRef}
       style={{
         position: "relative",
         width: "100%",
@@ -408,8 +413,7 @@ export function HlsPlayer({ camera }: HlsPlayerProps) {
         ref={videoRef}
         poster={BLANK_IMAGE}
         style={{
-          width: "100%",
-          height: "100%",
+          ...videoStyle,
           objectFit: "contain",
           backgroundColor: theme.palette.background.default,
         }}

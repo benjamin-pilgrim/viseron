@@ -53,6 +53,7 @@ from .const import (
     CONFIG_MJPEG_STREAMS,
     CONFIG_NAME,
     CONFIG_PASSWORD,
+    CONFIG_PLAYBACK_ROTATION,
     CONFIG_REFRESH_INTERVAL,
     CONFIG_STILL_IMAGE,
     CONFIG_STILL_IMAGE_HEIGHT,
@@ -60,6 +61,7 @@ from .const import (
     CONFIG_STORAGE,
     CONFIG_URL,
     DEFAULT_OUTPUT_FPS,
+    DEFAULT_PLAYBACK_ROTATION,
     EVENT_CAMERA_STARTED,
     EVENT_CAMERA_STATUS,
     EVENT_CAMERA_STATUS_CONNECTED,
@@ -242,6 +244,9 @@ class AbstractCamera(AbstractDomain):
             "name": self.name,
             "width": self.resolution[0],
             "height": self.resolution[1],
+            "playback_rotation": self.config.get(
+                CONFIG_PLAYBACK_ROTATION, DEFAULT_PLAYBACK_ROTATION
+            ),
             "access_token": self.access_token,
             "mainstream": {
                 "width": self.mainstream_resolution[0],

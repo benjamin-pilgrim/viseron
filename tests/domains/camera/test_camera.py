@@ -391,3 +391,10 @@ class TestNotificationsPause:
         assert camera.notifications_paused is False
         assert camera.notifications_paused_until is None
         assert _sensor_state(camera) == "off"
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_camera_exposes_playback_rotation(rotation):
+    """The public camera payload supplies the configured display orientation."""
+    camera = MagicMock(config={"playback_rotation": rotation})
+    assert AbstractCamera.as_dict(camera)["playback_rotation"] == rotation

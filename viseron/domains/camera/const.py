@@ -264,14 +264,21 @@ AUTHENTICATION_DIGEST = "digest"
 
 # BASE_CONFIG_SCHEMA constants
 CONFIG_NAME = "name"
+CONFIG_PLAYBACK_ROTATION = "playback_rotation"
 CONFIG_MJPEG_STREAMS = "mjpeg_streams"
 CONFIG_RECORDER = "recorder"
 
 DEFAULT_NAME: Final = None
+DEFAULT_PLAYBACK_ROTATION: Final = 0
 DEFAULT_MJPEG_STREAMS: Final = None
 DEFAULT_RECORDER: Final = None
 
 DESC_NAME = "Camera friendly name."
+DESC_PLAYBACK_ROTATION = (
+    "Clockwise rotation of recorded video in the browser: 0, 90, 180 or 270 degrees. "
+    "This changes timeline and event playback only. Saved video and live/detection "
+    "filters are unchanged."
+)
 DESC_MJPEG_STREAMS = "MJPEG streams config."
 DESC_RECORDER = "Recorder config."
 DESC_MJPEG_STREAM = (

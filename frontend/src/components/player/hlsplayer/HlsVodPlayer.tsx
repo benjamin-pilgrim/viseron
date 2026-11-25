@@ -15,6 +15,7 @@ import {
   createHlsInstance,
   setupHlsErrorHandling,
 } from "components/player/hlsplayer/utils";
+import { usePlaybackRotation } from "components/player/usePlaybackRotation";
 import { useAuthContext } from "context/AuthContext";
 import { BLANK_IMAGE } from "lib/helpers";
 import { useCanHover } from "lib/hooks/useCanHover";
@@ -180,6 +181,9 @@ export function HlsVodPlayer({
   loop = false,
 }: HlsVodPlayerProps) {
   const theme = useTheme();
+  const { containerRef, videoStyle } = usePlaybackRotation(
+    camera.playback_rotation,
+  );
   const canHover = useCanHover();
   const hlsRef = useRef<Hls | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -209,7 +213,10 @@ export function HlsVodPlayer({
   } = useHlsPlayerControls(videoRef, hlsRef);
 
   const { isFullscreen, isFullscreenSupported, toggleFullscreen } =
-    useFullscreen(videoRef);
+    useFullscreen(
+      videoRef,
+      camera.playback_rotation ? containerRef : undefined,
+    );
 
   useInitializePlayer(hlsRef, hlsClientIdRef, videoRef);
   const { playPressed } = useLoadSourceOnPlay(
@@ -224,6 +231,7 @@ export function HlsVodPlayer({
 
   return (
     <div
+      ref={containerRef}
       data-testid="hls-vod-player"
       style={{
         position: "relative",
@@ -240,10 +248,9 @@ export function HlsVodPlayer({
       {/* Always render video-element */}
       <video
         ref={videoRef}
-        poster={poster}
+        poster={camera.playback_rotation ? BLANK_IMAGE : poster}
         style={{
-          width: "100%",
-          height: "100%",
+          ...videoStyle,
           objectFit: "contain",
           backgroundColor: theme.palette.background.default,
         }}
@@ -252,6 +259,22 @@ export function HlsVodPlayer({
         playsInline
         muted
       />
+
+      {/* Keep the existing thumbnail orientation independent of video rotation. */}
+      {camera.playback_rotation && !playPressed && poster !== BLANK_IMAGE ? (
+        <img
+          src={poster}
+          alt="Recording thumbnail"
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            pointerEvents: "none",
+          }}
+        />
+      ) : null}
 
       <CustomControls
         isPlaying={isPlaying}

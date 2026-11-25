@@ -32,6 +32,31 @@
                 "default": null
               },
               {
+                "type": "select",
+                "options": [
+                  {
+                    "type": "constant",
+                    "value": 0
+                  },
+                  {
+                    "type": "constant",
+                    "value": 90
+                  },
+                  {
+                    "type": "constant",
+                    "value": 180
+                  },
+                  {
+                    "type": "constant",
+                    "value": 270
+                  }
+                ],
+                "name": "playback_rotation",
+                "description": "Clockwise rotation of recorded video in the browser: 0, 90, 180 or 270 degrees. This changes timeline and event playback only. Saved video and live/detection filters are unchanged.",
+                "optional": true,
+                "default": 0
+              },
+              {
                 "type": "string",
                 "lengthMin": 1,
                 "name": "name",

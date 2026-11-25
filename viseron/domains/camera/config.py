@@ -54,6 +54,7 @@ from .const import (
     CONFIG_MJPEG_WIDTH,
     CONFIG_NAME,
     CONFIG_PASSWORD,
+    CONFIG_PLAYBACK_ROTATION,
     CONFIG_RECORDER,
     CONFIG_REFRESH_INTERVAL,
     CONFIG_RETAIN,
@@ -92,6 +93,7 @@ from .const import (
     DEFAULT_MJPEG_WIDTH,
     DEFAULT_NAME,
     DEFAULT_PASSWORD,
+    DEFAULT_PLAYBACK_ROTATION,
     DEFAULT_RECORDER,
     DEFAULT_REFRESH_INTERVAL,
     DEFAULT_SAVE_TO_DISK,
@@ -131,6 +133,7 @@ from .const import (
     DESC_MJPEG_WIDTH,
     DESC_NAME,
     DESC_PASSWORD,
+    DESC_PLAYBACK_ROTATION,
     DESC_RECORDER,
     DESC_REFRESH_INTERVAL,
     DESC_RETAIN,
@@ -378,6 +381,11 @@ STILL_IMAGE_SCHEMA = vol.Schema(
 
 BASE_CONFIG_SCHEMA = vol.Schema(
     {
+        vol.Optional(
+            CONFIG_PLAYBACK_ROTATION,
+            default=DEFAULT_PLAYBACK_ROTATION,
+            description=DESC_PLAYBACK_ROTATION,
+        ): vol.In([0, 90, 180, 270]),
         vol.Optional(CONFIG_NAME, default=DEFAULT_NAME, description=DESC_NAME): vol.All(
             str, vol.Length(min=1)
         ),

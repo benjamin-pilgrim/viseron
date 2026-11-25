@@ -58,3 +58,17 @@ def test_storage_timelapse(
     """Cameras can override the timelapse tiers."""
     config = BASE_CONFIG_SCHEMA({"name": "Camera", "storage": storage})
     assert config["storage"]["timelapse"] == expected_timelapse
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_playback_rotation_accepts_quarter_turns(rotation):
+    """Recorded video can be oriented in the browser without encoding it."""
+    config = BASE_CONFIG_SCHEMA({"name": "test", "playback_rotation": rotation})
+    assert config["playback_rotation"] == rotation
+
+
+@pytest.mark.parametrize("rotation", [-90, 45, 360])
+def test_playback_rotation_rejects_unsupported_angles(rotation):
+    """Reject ambiguous display orientations."""
+    with pytest.raises(vol.Invalid):
+        BASE_CONFIG_SCHEMA({"name": "test", "playback_rotation": rotation})

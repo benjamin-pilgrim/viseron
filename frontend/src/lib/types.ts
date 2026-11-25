@@ -190,6 +190,7 @@ export interface RecordingsCamera {
 }
 
 export interface Camera {
+  playback_rotation?: 0 | 90 | 180 | 270;
   identifier: string;
   name: string;
   width: number;
@@ -226,6 +227,7 @@ export interface Cameras {
 }
 
 export interface FailedCamera {
+  playback_rotation?: 0 | 90 | 180 | 270;
   identifier: string;
   name: string;
   width: number;
