@@ -62,6 +62,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Do not stop/remove the container on teardown (debug aid)",
     )
+    parser.addoption(
+        "--run-model-acceptance",
+        action="store_true",
+        default=False,
+        help="Run the recorder-run layout and manual restart acceptance gate",
+    )
 
 
 # Every test is tagged with the container fixture it ultimately depends on, so

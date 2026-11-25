@@ -130,3 +130,27 @@ If you would like to run tests outside of `tox` you can build and run this conta
 docker compose --file azure-pipelines/docker-compose-build.yaml --env-file azure-pipelines/.env build amd64-viseron-tests
 docker compose --file azure-pipelines/docker-compose-build.yaml --env-file azure-pipelines/.env run --rm amd64-viseron-tests
 ```
+
+#### Recorder restart acceptance
+
+To check the recorder-run requirements, use a built candidate image and a
+reachable Docker-compatible daemon. Install `requirements_container_test.txt`
+in your Python environment and set `VISERON_SMOKE_IMAGE` to the candidate image
+name, then run from the repository root:
+
+```shell
+python -m pytest -n 0 -o addopts= tests/container/test_recorder_runs.py \
+  --confcutdir=tests/container --image="$VISERON_SMOKE_IMAGE" \
+  --run-model-acceptance
+```
+
+The test creates a fresh database and synthetic camera, kills only its FFmpeg
+process, and checks the stored run directories and recording API before and
+after recovery. Each run
+must be independently playable, the active manual event must split and resume,
+and the resumed event must retain its original deadline within two seconds.
+Logs and a JSON observation file are written to `smoke-artifacts`, or to
+`VISERON_SMOKE_ARTIFACT_DIR` when set. No production camera or storage is used.
+
+This gate is opt-in; the default smoke suite skips it. The current flat segment
+layout with hash-addressed init sidecars does not satisfy the run-directory gate.
