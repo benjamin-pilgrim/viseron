@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - storage-cifs-hardening
+      - storage-cifs-rebased
   workflow_dispatch:
 
 permissions:
@@ -18,8 +19,6 @@ env:
     --file azure-pipelines/docker-compose-build.yaml
     --env-file azure-pipelines/.env
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/viseron
-  BRANCH_TAG: storage-cifs-hardening
-  SHA_TAG: storage-cifs-hardening-${{ github.sha }}
 
 jobs:
   build-test-publish:
@@ -34,9 +33,15 @@ jobs:
         with:
           install: true
 
+      - name: Set candidate tags
+        run: |
+          BRANCH_TAG="${GITHUB_REF_NAME//\//-}"
+          echo "BRANCH_TAG=${BRANCH_TAG}" >> "$GITHUB_ENV"
+          echo "SHA_TAG=${BRANCH_TAG}-${GITHUB_SHA}" >> "$GITHUB_ENV"
+
       - name: Build amd64 Viseron image
         run: |
-          docker compose ${{ env.DOCKER_COMPOSE_CI_FILES }} build amd64-viseron
+          docker compose ${{ env.DOCKER_COMPOSE_CI_FILES }} build --build-arg VISERON_GIT_COMMIT="$GITHUB_SHA" amd64-viseron
           docker tag roflcoopter/amd64-viseron:dev "${IMAGE_NAME}:${SHA_TAG}"
           docker tag roflcoopter/amd64-viseron:dev "${IMAGE_NAME}:${BRANCH_TAG}"
 
@@ -63,6 +68,7 @@ jobs:
             --confcutdir=tests/container \
             --image="${IMAGE_NAME}:${SHA_TAG}" \
             --arch=amd64 \
+            --run-model-acceptance \
             --boot-timeout=240 \
             --timeout=300 \
             -v
