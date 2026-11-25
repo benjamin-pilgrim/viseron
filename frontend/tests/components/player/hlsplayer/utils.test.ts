@@ -35,10 +35,21 @@ describe("HLS playback mode config", () => {
 });
 
 describe("seekMediaAndStartLoad", () => {
-  it("seeks the media element and starts loading at the same media time", () => {
+  it("keeps an active loader running while seeking", () => {
     const startLoad = vi.fn();
     const media = { currentTime: 0 } as HTMLMediaElement;
-    const hls = { startLoad } as unknown as Hls;
+    const hls = { startLoad, loadingEnabled: true } as unknown as Hls;
+
+    seekMediaAndStartLoad(hls, media, 42.25);
+
+    expect(media.currentTime).toBe(42.25);
+    expect(startLoad).not.toHaveBeenCalled();
+  });
+
+  it("seeks the media element and resumes a stopped loader", () => {
+    const startLoad = vi.fn();
+    const media = { currentTime: 0 } as HTMLMediaElement;
+    const hls = { startLoad, loadingEnabled: false } as unknown as Hls;
 
     seekMediaAndStartLoad(hls, media, 42.25);
 

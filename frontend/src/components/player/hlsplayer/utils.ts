@@ -116,7 +116,11 @@ export function seekMediaAndStartLoad(
     return;
   }
   media.currentTime = boundedMediaTime;
-  hls.startLoad(boundedMediaTime);
+  // Native seeking steers an active loader. Restarting it can abort the init
+  // segment fetched by the first playlist before buffering has started.
+  if (!hls.loadingEnabled) {
+    hls.startLoad(boundedMediaTime);
+  }
 }
 
 export function seekHlsByOffset(hls: Hls, offsetSeconds: number): void {
