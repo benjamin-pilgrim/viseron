@@ -606,7 +606,7 @@ class TimelapseConfig(ConfigModel):
 class StorageConfig(ConfigModel):
     """Storage configuration."""
 
-    tier_check_cpu_limit: int = Field(
+    tier_check_cpu_limit: int | None = Field(
         default=DEFAULT_TIER_CHECK_CPU_LIMIT, description=DESC_TIER_CHECK_CPU_LIMIT
     )
     tier_check_workers: int = Field(

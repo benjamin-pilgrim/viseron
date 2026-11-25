@@ -298,14 +298,15 @@ def test_restart_replays_commands_lost_with_the_child(monkeypatch) -> None:
     assert child_queue.empty()
 
 
+@pytest.mark.parametrize("cpu_limit", [None, 100])
 def test_storage_child_restart_processes_pending_copy(
-    vis, tmp_path, monkeypatch
+    vis, tmp_path, monkeypatch, cpu_limit
 ) -> None:
     """The watchdog can start a new child and deliver work through the manager."""
     monkeypatch.setattr(
         "viseron.components.storage.storage_subprocess.MAX_PENDING_CALLBACKS", 1
     )
-    worker = TierCheckWorker(vis, 100, 1)
+    worker = TierCheckWorker(vis, cpu_limit, 1)
     source, destination = tmp_path / "init.mp4", tmp_path / "copied.mp4"
     source.write_bytes(b"init")
     complete = Event()

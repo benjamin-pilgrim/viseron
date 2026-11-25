@@ -346,6 +346,14 @@ def test_defaults() -> None:
     }
 
 
+def test_tier_cpu_limiter_can_be_disabled() -> None:
+    """Network storage can opt out of signal-based CPU throttling."""
+    validated = validate_config(
+        CONFIG_SCHEMA, {"storage": {"tier_check_cpu_limit": None}}
+    )
+    assert validated.storage.tier_check_cpu_limit is None
+
+
 def test_check_interval_null_is_zero() -> None:
     """A check_interval without keys is zero, not the default of one minute."""
     validated: StorageRoot = validate_config(

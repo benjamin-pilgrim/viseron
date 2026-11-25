@@ -176,11 +176,10 @@ DEFAULT_EVENTS: Final = None
 DEFAULT_INTERVAL: dict[str, Any] = {}
 
 DESC_TIER_CHECK_CPU_LIMIT = (
-    "CPU limit for the tier check process. "
-    "This is used to limit the CPU usage of the process that checks for files to move "
-    "or delete. "
-    "This is useful to not overload the system with the tier check process. "
-    "The value is an integer between 1 and 100, where 100 is 100% CPU usage. "
+    "CPU limit for the tier check process, as a percentage of one CPU core. "
+    "Set to null to disable signal-based CPU throttling. Use null with CIFS tiers "
+    "because stop/continue signals can interrupt network filesystem writes. "
+    "The process remains low priority; batch size and sleeps still apply."
 )
 DESC_TIER_CHECK_WORKERS = (
     "The number of worker threads to use for checking tiers. "
