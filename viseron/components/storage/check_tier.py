@@ -60,13 +60,14 @@ FILE_LOCK_SHARDS = 256
 # up and letting the full check decide.
 MAX_SCHEDULE_CHANGES = 100
 
+# Keep string references instead of reserving 4 KiB of Unicode per file.
 FILES_DTYPE = np.dtype(
     [
         ("id", np.int64),
         ("size", np.int64),
         ("orig_ctime", np.int64),
-        ("path", "U512"),
-        ("tier_path", "U512"),
+        ("path", object),
+        ("tier_path", object),
     ]
 )
 
@@ -86,8 +87,8 @@ RECORDINGS_FILES_DTYPE = np.dtype(
         ("id", np.int64),
         ("size", np.int64),
         ("orig_ctime", np.int64),
-        ("path", "U512"),
-        ("tier_path", "U512"),
+        ("path", object),
+        ("tier_path", object),
     ]
 )
 
@@ -271,8 +272,13 @@ class Worker:
             )
             files = self.check_tier_files(item)
 
+        # Joint rules can only evict rows selected by both retention checks.
         recordings = np.empty(0, dtype=RECORDINGS_DTYPE)
-        if item.cmd == "check_tier" and item.events_enabled:
+        if (
+            item.cmd == "check_tier"
+            and item.events_enabled
+            and (not item.files_enabled or files.size > 0)
+        ):
             LOGGER.debug(
                 "Received check_tier command for recordings "
                 "for %s tier %s category %s subcategory %s",
@@ -1065,7 +1071,11 @@ def get_recordings_to_move(
 
     # Remove any files that are not m4s
     stripped_files_to_move = stripped_files_to_move[
-        np.char.endswith(stripped_files_to_move["path"], ".m4s")
+        np.fromiter(
+            (path.endswith(".m4s") for path in stripped_files_to_move["path"]),
+            dtype=bool,
+            count=len(stripped_files_to_move),
+        )
     ]
     return stripped_files_to_move
 
