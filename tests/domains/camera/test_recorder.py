@@ -428,13 +428,19 @@ def fixture_add_segment_to_session(
 
 
 @pytest.fixture(name="recorder")
-def fixture_patched_recorder(vis: Viseron):
+def fixture_patched_recorder(vis: Viseron, tmp_path):
     """Fixture to create a test recorder with mocked vis.add_entity."""
     with patch.object(vis, "add_entity") as mock_add_entity:
         config = MagicMock()
         nested_dict = {"filename_pattern": "%H-%M-%S"}
         config.__getitem__.return_value.__getitem__.side_effect = nested_dict.get
-        recorder = ConcreteTestRecorder(vis, config, MockCamera())
+        camera = MockCamera(
+            event_clips_folder=str(tmp_path / "event_clips"),
+            segments_folder=str(tmp_path / "segments"),
+            temp_segments_folder=str(tmp_path / "staging"),
+            thumbnails_folder=str(tmp_path / "thumbnails"),
+        )
+        recorder = ConcreteTestRecorder(vis, config, camera)
         # pylint: disable=protected-access
         recorder._logger = MagicMock()
         assert mock_add_entity.call_count == 2
