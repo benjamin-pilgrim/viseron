@@ -41,7 +41,7 @@ jobs:
 
       - name: Build amd64 Viseron image
         run: |
-          docker compose ${{ env.DOCKER_COMPOSE_CI_FILES }} build --build-arg VISERON_GIT_COMMIT="$GITHUB_SHA" amd64-viseron
+          docker compose ${{ env.DOCKER_COMPOSE_CI_FILES }} build --pull --build-arg VISERON_GIT_COMMIT="$GITHUB_SHA" amd64-viseron
           docker tag roflcoopter/amd64-viseron:dev "${IMAGE_NAME}:${SHA_TAG}"
           docker tag roflcoopter/amd64-viseron:dev "${IMAGE_NAME}:${BRANCH_TAG}"
 

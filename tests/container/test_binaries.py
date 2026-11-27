@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from ._helpers import REPO_ROOT
 from .binary_expectations import GO2RTC_BINARY, VAINFO_BINARY, binary_expected_for_arch
 
 if TYPE_CHECKING:
@@ -127,6 +128,25 @@ def test_nginx_version(image_host: testinfra.host.Host) -> None:
     cmd = image_host.run("nginx -v")
     output = cmd.stdout + cmd.stderr
     assert "nginx version" in output, output
+
+
+def test_tornado_matches_production_requirement(
+    image_host: testinfra.host.Host,
+) -> None:
+    """The packaged webserver must match the pinned production dependency."""
+    expected = next(
+        line.removeprefix("tornado==")
+        for line in (REPO_ROOT / "requirements.txt").read_text().splitlines()
+        if line.startswith("tornado==")
+    )
+    cmd = image_host.run(
+        "python3 -c 'from importlib.metadata import version; "
+        'print(version("tornado"))\''
+    )
+    assert cmd.rc == 0, cmd.stderr
+    assert cmd.stdout.strip() == expected, (
+        f"packaged Tornado {cmd.stdout.strip()!r} does not match {expected!r}"
+    )
 
 
 def test_vainfo_runs(image_host: testinfra.host.Host, arch: str) -> None:
